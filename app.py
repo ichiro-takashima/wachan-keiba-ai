@@ -14,73 +14,92 @@ TARGET_MODEL = "gemini-2.5-flash"
 API_KEY = os.getenv("GEMINI_API_KEY")
 if API_KEY is None:
     st.sidebar.error("⚠️ APIキーが読み込めていません。再度 setx コマンドを実行し、PCを再起動してください。")
+
+# --- 分析用ヘルパー関数 ---
+def analyze_running_style(corner_pos_series):
+    """通過順位のデータから脚質を判定する"""
+    if corner_pos_series.empty or corner_pos_series.isnull().all():
+        return "不明"
     
+    # 直近5走のデータを使用
+    last_5_races = corner_pos_series.dropna().head(5)
+    if last_5_races.empty:
+        return "不明"
+
+    avg_positions = []
+    for pos_str in last_5_races:
+        try:
+            # '1-2-3-4' -> 最初のコーナー位置を脚質の指標として使う
+            first_corner_pos = int(str(pos_str).split('-')[0])
+            avg_positions.append(first_corner_pos)
+        except (ValueError, IndexError):
+            continue
+            
+    if not avg_positions:
+        return "不明"
+        
+    # 平均コーナー位置
+    avg_pos = sum(avg_positions) / len(avg_positions)
+    
+    if avg_pos <= 2.5:
+        return "逃げ"
+    elif avg_pos <= 5.5:
+        return "先行"
+    elif avg_pos <= 10.5:
+        return "差し"
+    else:
+        return "追込"
+
+def analyze_track_preference(results_df):
+    """戦績から馬場適性を分析する"""
+    if results_df.empty or '馬場' not in results_df.columns or '着順' not in results_df.columns:
+        return "データなし"
+    
+    results_df['着順_num'] = pd.to_numeric(results_df['着順'], errors='coerce')
+    good_track = results_df[results_df['馬場'] == '良']
+    good_track_in_money = good_track[good_track['着順_num'] <= 3].shape[0]
+    heavy_track = results_df[results_df['馬場'].isin(['稍', '重', '不'])]
+    heavy_track_in_money = heavy_track[heavy_track['着順_num'] <= 3].shape[0]
+    
+    if good_track.shape[0] == 0 and heavy_track.shape[0] == 0: return "経験なし"
+    if good_track_in_money > heavy_track_in_money: return f"良馬場巧者({good_track_in_money}回)"
+    elif heavy_track_in_money > good_track_in_money: return f"道悪巧者({heavy_track_in_money}回)"
+    elif good_track_in_money > 0: return "馬場不問"
+    else: return "傾向なし"
+
 def scrape_horse_ped(horse_id):
-
     url = f"https://db.netkeiba.com/horse/ped/{horse_id}/"
-
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-
     try:
-
         time.sleep(1)
-
         response = requests.get(url, headers=headers, timeout=10)
-
         response.encoding = 'euc-jp'
-
         soup = BeautifulSoup(response.text, 'html.parser')
 
-
-
         # 馬名のクリーンアップ取得
-
         try:
-
             raw_title = soup.title.text
-
             horse_name = raw_title.split(" | ")[0].split(" (")[0].strip()
-
         except: horse_name = "不明"
 
-
-
         def get_clean_name(td_element):
-
             if not td_element: return "不明"
-
             a_tag = td_element.find('a')
-
             raw_text = a_tag.text if a_tag else td_element.text
-
             return raw_text.strip().split('\n')[0].strip()
 
-
-
         sire, dam, bms = "不明", "不明", "不明"
-
         blood_table = soup.find("table", class_="blood_table")
-
         if blood_table:
-
             parents_16 = blood_table.find_all("td", rowspan="16")
-
             grandparents_8 = blood_table.find_all("td", rowspan="8")
-
             if len(parents_16) >= 2:
-
                 sire = get_clean_name(parents_16[0]); dam = get_clean_name(parents_16[1])
-
             if len(grandparents_8) >= 3:
-
                 bms = get_clean_name(grandparents_8[2])
-
-
-
         return {"horse_id": horse_id, "name": horse_name, "sire": sire, "dam": dam, "broodmare_sire": bms}
 
     except Exception as e:
-
         return {"horse_id": horse_id, "name": "不明", "sire": "不明", "dam": "不明", "broodmare_sire": "不明"}
 
 def scrape_race_results_dedicated(horse_id):
@@ -254,112 +273,67 @@ if st.session_state.all_horse_data:
 
     # ③ Geminiによる分析
     st.subheader("🤖 Geminiによるレース分析と買い目予想")
-    # すでに分析結果がある場合は再送しない工夫（オプション）もできますが、まずは表示
     with st.spinner("AIが分析中..."):
         genai.configure(api_key=API_KEY)
         model = genai.GenerativeModel(TARGET_MODEL)
         
-        # プロンプト作成（st.session_state.all_horse_data を使用）
-        prompt = f"あなたはプロの競馬予想家です。レースID: {race_id} の予想をしてください。\n予算: {budget}円\n\n"
+        # --- プロンプト生成ロジック ---
+        all_running_styles = []
+        for horse in st.session_state.all_horse_data:
+            if not horse['results'].empty and '通過' in horse['results'].columns:
+                style = analyze_running_style(horse['results']['通過'])
+                all_running_styles.append(style)
+
+        num_front_runners = all_running_styles.count('逃げ')
+        num_leaders = all_running_styles.count('先行')
+        if num_front_runners >= 2 or (num_front_runners == 1 and num_leaders >= 3):
+            race_pace_prediction = "ハイペース予想。複数の逃げ・先行馬が競り合い、前方の争いが激化しそうです。これにより、後半に脚を溜められる差し・追込馬に有利な展開となる可能性があります。"
+        elif num_front_runners == 0 and num_leaders <= 2:
+            race_pace_prediction = "スローペース予想。明確な逃げ馬がおらず、牽制しあって落ち着いた流れになりそうです。瞬発力や決め手のある馬が有利で、前残りの展開も考えられます。"
+        else:
+            race_pace_prediction = "ミドルペース予想。平均的なペース構成で、各馬の実力がストレートに反映されやすいでしょう。"
+
+        prompt = f"""あなたはプロの競馬予想家です。
+以下の出走馬データとレース展開予想を元に、レースID: {race_id} の最終的な予想をしてください。
+
+# レース展開予想
+{race_pace_prediction}
+
+# 出走馬 詳細分析"""
+
         for horse in st.session_state.all_horse_data:
             p = horse['pedigree']
-            prompt += f"■ {p['name']} (父: {p['sire']}, 母父: {p['broodmare_sire']})\n"
-            if not horse['results'].empty:
-                recent = horse['results'].head(3)
-                prompt += recent.to_string(index=False) + "\n"
-            prompt += "\n"
+            results_df = horse['results']
+            prompt += f"\n---\n## 馬名: {p['name']} (父: {p['sire']}, 母父: {p['broodmare_sire']})\n"
+            
+            if results_df.empty:
+                prompt += "戦績データがありません（新馬戦など）。\n"
+                continue
+
+            running_style = analyze_running_style(results_df['通過'] if '通過' in results_df.columns else pd.Series())
+            track_pref = analyze_track_preference(results_df)
+            prompt += f"- **脚質**: {running_style}\n- **馬場適性**: {track_pref}\n"
+
+            if '馬体重' in results_df.columns and results_df['馬体重'].notna().any():
+                latest_weight_str = results_df['馬体重'].dropna().iloc[0]
+                weight = re.match(r'(\d+)', str(latest_weight_str))
+                if weight: prompt += f"- **近走馬体重**: {weight.group(1)}kg前後\n"
+
+            prompt += "- **直近戦績サマリー**:\n"
+            summary_cols = ['日付', 'レース名', '着順', '距離', '馬場', 'タイム', '上り', '通過']
+            existing_cols = [col for col in summary_cols if col in results_df.columns]
+            prompt += results_df[existing_cols].head(3).to_string(index=False) + "\n"
+
+        prompt += f"""
+# 最終的な指示
+上記の詳細な分析とレース展開予想を踏まえ、予算{budget}円の範囲で、以下の形式で回答してください。
+1. **レースの総括**: 展開予想を元に、どの脚質の馬が有利になるか簡潔に説明。
+2. **有力馬3頭の評価**: 最も有力と考える馬を3頭挙げ、その理由を分析内容と関連付けて説明。
+3. **買い目提案**: 予算内で、単勝(狙い4-10倍)・馬連(狙い10-30倍)・ワイド(狙い5-15倍)を各1点ずつ組み合わせた具体的な買い目と金額配分を提案。オッズはAIが推測すること。
+"""
         
         try:
             response = model.generate_content(prompt)
             st.write(response.text)
         except Exception as e:
             st.error(f"分析エラー: {e}")
-if st.button("AI予想を開始"):
-    if not API_KEY:
-        st.error("環境変数 GEMINI_API_KEY が設定されていません。")
-    elif not race_id:
-        st.warning("Race IDを入力してください。")
-    else:
-        with st.spinner("出走馬の全データを収集中..."):
-            h_ids = get_horse_ids_from_race(race_id)
-            if not h_ids:
-                st.error("出走馬が見つかりませんでした。IDが正しいか確認してください。")
-            else:
-                st.success(f"{len(h_ids)}頭の出走馬情報を取得開始します...")
-                
-                all_horse_data = []
-                pedigree_list = []
-                
-                # プログレスバー（進捗状況の表示）
-                progress_bar = st.progress(0)
-                
-                for i, hid in enumerate(h_ids):
-                    # 1. 血統取得
-                    ped_data = scrape_horse_ped(hid)
-                    pedigree_list.append(ped_data)
-                    
-                    # 2. 戦績取得
-                    results_df = scrape_race_results_dedicated(hid)
-                    
-                    all_horse_data.append({
-                        "id": hid,
-                        "pedigree": ped_data,
-                        "results": results_df
-                    })
-                    
-                    # プログレスバー更新
-                    progress_bar.progress((i + 1) / len(h_ids))
-                
-                # --- 画面表示①：出馬表（血統サマリー） ---
-                st.subheader("📋 出馬表（血統情報）")
-                df_pedigree = pd.DataFrame(pedigree_list)
-                df_pedigree = df_pedigree.rename(columns={
-                    "horse_id": "馬ID", "name": "馬名", "sire": "父", "dam": "母", "broodmare_sire": "母父"
-                })
-                st.dataframe(df_pedigree, use_container_width=True)
-                
-                # --- 画面表示②：各馬の戦績 ---
-                st.subheader("🐎 各馬の血統と直近戦績")
-                for horse in all_horse_data:
-                    name = horse['pedigree']['name']
-                    # expanderを使って、クリックで開閉できるようにする
-                    with st.expander(f"{name} (ID: {horse['id']})"):
-                        st.write(f"**父:** {horse['pedigree']['sire']} / **母:** {horse['pedigree']['dam']} / **母父:** {horse['pedigree']['broodmare_sire']}")
-                        if not horse['results'].empty:
-                            # 直近5レースを表示
-                            st.dataframe(horse['results'].head(5), use_container_width=True)
-                        else:
-                            st.write("戦績データが見つかりません（新馬戦など）。")
-                            
-                # --- 画面表示③：Geminiによる分析と買い目予想 ---
-                st.subheader("🤖 Geminiによるレース分析と買い目予想")
-                with st.spinner("AIが血統・戦績からレース展開を分析中... (少し時間がかかります)"):
-                    genai.configure(api_key=API_KEY)
-                    # モデルは比較的高速・安価な flash を利用
-                    model = genai.GenerativeModel(TARGET_MODEL)
-                    
-                    prompt = f"あなたはプロの競馬予想家です。\nレースID: {race_id} の出走馬{len(h_ids)}頭の血統および直近戦績データを提供します。\n予算は{budget}円です。\n\n"
-                    prompt += "【指示】\n"
-                    prompt += "1. 有力馬の血統・戦績からの簡単な評価\n"
-                    prompt += "2. レース全体の展開予想（血統や実績をもとに推測）\n"
-                    prompt += f"3. 予算{budget}円に合わせた具体的な買い目（馬連、3連複、単勝など）と資金配分\n\n"
-                    prompt += "【出走馬データ】\n"
-                    
-                    for horse in all_horse_data:
-                        p = horse['pedigree']
-                        prompt += f"■ {p['name']} (父: {p['sire']}, 母父: {p['broodmare_sire']})\n"
-                        if not horse['results'].empty:
-                            # トークン節約のため、直近3レースのみテキスト化して渡す
-                            recent = horse['results'].head(3)
-                            cols = [c for c in ['日付', '開催', 'レース名', '着順', '距離', 'タイム'] if c in recent.columns]
-                            if cols:
-                                prompt += recent[cols].to_string(index=False) + "\n"
-                        else:
-                            prompt += "戦績なし(新馬等)\n"
-                        prompt += "\n"
-                        
-                    try:
-                        response = model.generate_content(prompt)
-                        st.write(response.text)
-                    except Exception as e:
-                        st.error(f"AIの分析中にエラーが発生しました: {e}")
