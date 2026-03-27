@@ -9,6 +9,7 @@ import os
 import re
 
 # --- 設定 ---
+TARGET_MODEL = "gemini-2.5-flash"
 # コマンドプロンプトで setx した値を取得
 API_KEY = os.getenv("GEMINI_API_KEY")
 if API_KEY is None:
@@ -176,11 +177,103 @@ def get_horse_ids_from_race(race_id):
         return []
 
 # --- Streamlit UI ---
-st.title("🏇 Gemini 競馬予想アプリ (自動取得版)")
+st.title("🏇 わーちゃんのレース予想AI")
 
 race_id = st.text_input("Race IDを入力 (例: 202405020811)")
+prediction_date = st.date_input(
+    "予想の基準日（この日より前のデータのみ使用）", 
+    value=pd.Timestamp.now()
+)
 budget = st.number_input("予算 (円)", value=1000)
 
+# --- データの保存場所を準備（コードの上のほう、ボタンより前に書いておく） ---
+if "all_horse_data" not in st.session_state:
+    st.session_state.all_horse_data = None
+if "pedigree_list" not in st.session_state:
+    st.session_state.pedigree_list = None
+
+# --- AI予想開始ボタン ---
+if st.button("AI予想を開始"):
+    if not API_KEY:
+        st.error("APIキーがありません")
+    elif not race_id:
+        st.warning("Race IDを入力してください")
+    else:
+        with st.spinner("出走馬データを収集中..."):
+            h_ids = get_horse_ids_from_race(race_id)
+            if not h_ids:
+                st.error("出走馬が見つかりませんでした。")
+            else:
+                temp_horse_data = []
+                temp_pedigree_list = []
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                for i, hid in enumerate(h_ids):
+                    status_text.write(f"🔍 {i+1}/{len(h_ids)}頭目 (ID: {hid}) を取得中...")
+                    
+                    ped_data = scrape_horse_ped(hid)
+                    temp_pedigree_list.append(ped_data)
+                    
+                    results_df = scrape_race_results_dedicated(hid)
+                    
+                    if not results_df.empty:
+                        results_df['日付'] = pd.to_datetime(results_df['日付'], errors='coerce')
+                        cutoff_date = pd.Timestamp(prediction_date)
+                        results_df = results_df[results_df['日付'] < cutoff_date]
+                        results_df['日付'] = results_df['日付'].dt.strftime('%Y/%m/%d')
+                    
+                    temp_horse_data.append({"id": hid, "pedigree": ped_data, "results": results_df})
+                    progress_bar.progress((i + 1) / len(h_ids))
+
+                # データをセッションに保存して再起動
+                st.session_state.all_horse_data = temp_horse_data
+                st.session_state.pedigree_list = temp_pedigree_list
+                st.rerun()
+
+# --- ここから表示フェーズ（データがあるときだけ自動で表示される） ---
+if st.session_state.all_horse_data:
+    # ① 出馬表
+    st.subheader("📋 出馬表（血統情報）")
+    df_pedigree = pd.DataFrame(st.session_state.pedigree_list)
+    df_pedigree = df_pedigree.rename(columns={
+        "horse_id": "馬ID", "name": "馬名", "sire": "父", "dam": "母", "broodmare_sire": "母父"
+    })
+    st.dataframe(df_pedigree, use_container_width=True)
+
+    # ② 各馬の戦績
+    st.subheader("🐎 各馬の血統と直近戦績")
+    for horse in st.session_state.all_horse_data:
+        name = horse['pedigree']['name']
+        with st.expander(f"{name} (ID: {horse['id']})"):
+            st.write(f"**父:** {horse['pedigree']['sire']} / **母:** {horse['pedigree']['dam']} / **母父:** {horse['pedigree']['broodmare_sire']}")
+            if not horse['results'].empty:
+                st.dataframe(horse['results'].head(5), use_container_width=True)
+            else:
+                st.write("戦績データがありません。")
+
+    # ③ Geminiによる分析
+    st.subheader("🤖 Geminiによるレース分析と買い目予想")
+    # すでに分析結果がある場合は再送しない工夫（オプション）もできますが、まずは表示
+    with st.spinner("AIが分析中..."):
+        genai.configure(api_key=API_KEY)
+        model = genai.GenerativeModel(TARGET_MODEL)
+        
+        # プロンプト作成（st.session_state.all_horse_data を使用）
+        prompt = f"あなたはプロの競馬予想家です。レースID: {race_id} の予想をしてください。\n予算: {budget}円\n\n"
+        for horse in st.session_state.all_horse_data:
+            p = horse['pedigree']
+            prompt += f"■ {p['name']} (父: {p['sire']}, 母父: {p['broodmare_sire']})\n"
+            if not horse['results'].empty:
+                recent = horse['results'].head(3)
+                prompt += recent.to_string(index=False) + "\n"
+            prompt += "\n"
+        
+        try:
+            response = model.generate_content(prompt)
+            st.write(response.text)
+        except Exception as e:
+            st.error(f"分析エラー: {e}")
 if st.button("AI予想を開始"):
     if not API_KEY:
         st.error("環境変数 GEMINI_API_KEY が設定されていません。")
@@ -243,7 +336,7 @@ if st.button("AI予想を開始"):
                 with st.spinner("AIが血統・戦績からレース展開を分析中... (少し時間がかかります)"):
                     genai.configure(api_key=API_KEY)
                     # モデルは比較的高速・安価な flash を利用
-                    model = genai.GenerativeModel('gemini-2.5-flash')
+                    model = genai.GenerativeModel(TARGET_MODEL)
                     
                     prompt = f"あなたはプロの競馬予想家です。\nレースID: {race_id} の出走馬{len(h_ids)}頭の血統および直近戦績データを提供します。\n予算は{budget}円です。\n\n"
                     prompt += "【指示】\n"
