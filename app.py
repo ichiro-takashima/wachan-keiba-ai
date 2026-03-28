@@ -3,6 +3,8 @@ import google.generativeai as genai
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+import openai
+from openai import OpenAI
 import time
 import io
 import os
@@ -11,11 +13,29 @@ import re
 # --- 設定 ---
 TARGET_MODEL = "gemini-2.5-flash"
 # コマンドプロンプトで setx した値を取得
-API_KEY = os.getenv("GEMINI_API_KEY")
-if API_KEY is None:
+API_KEY_GEMINI = os.getenv("GEMINI_API_KEY")
+if API_KEY_GEMINI is None:
+    st.sidebar.error("⚠️ APIキーが読み込めていません。再度 setx コマンドを実行し、PCを再起動してください。")
+API_KEY_OPENAI = os.getenv("OPENAI_API_KEY")
+if API_KEY_OPENAI is None:
     st.sidebar.error("⚠️ APIキーが読み込めていません。再度 setx コマンドを実行し、PCを再起動してください。")
 
+ai_choice = st.radio("使用するAIを選択", ["Gemini", "ChatGPT", "両方で比較"], horizontal=True)
 # --- 分析用ヘルパー関数 ---
+def ask_gemini(prompt):
+    genai.configure(api_key=API_KEY_GEMINI)
+    model = genai.GenerativeModel(TARGET_MODEL)
+    response = model.generate_content(prompt)
+    return response.text
+
+def ask_chatgpt(prompt):
+    client = OpenAI(api_key=API_KEY_OPENAI)
+    response = client.chat.completions.create(
+        model="gpt-4o", # または gpt-3.5-turbo
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message.content
+
 def analyze_running_style(corner_pos_series):
     """通過順位のデータから脚質を判定する"""
     if corner_pos_series.empty or corner_pos_series.isnull().all():
@@ -68,38 +88,71 @@ def analyze_track_preference(results_df):
     else: return "傾向なし"
 
 def scrape_horse_ped(horse_id):
+
     url = f"https://db.netkeiba.com/horse/ped/{horse_id}/"
+
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+
     try:
+
         time.sleep(1)
+
         response = requests.get(url, headers=headers, timeout=10)
+
         response.encoding = 'euc-jp'
+
         soup = BeautifulSoup(response.text, 'html.parser')
 
+
+
         # 馬名のクリーンアップ取得
+
         try:
+
             raw_title = soup.title.text
+
             horse_name = raw_title.split(" | ")[0].split(" (")[0].strip()
+
         except: horse_name = "不明"
 
+
+
         def get_clean_name(td_element):
+
             if not td_element: return "不明"
+
             a_tag = td_element.find('a')
+
             raw_text = a_tag.text if a_tag else td_element.text
+
             return raw_text.strip().split('\n')[0].strip()
 
+
+
         sire, dam, bms = "不明", "不明", "不明"
+
         blood_table = soup.find("table", class_="blood_table")
+
         if blood_table:
+
             parents_16 = blood_table.find_all("td", rowspan="16")
+
             grandparents_8 = blood_table.find_all("td", rowspan="8")
+
             if len(parents_16) >= 2:
+
                 sire = get_clean_name(parents_16[0]); dam = get_clean_name(parents_16[1])
+
             if len(grandparents_8) >= 3:
+
                 bms = get_clean_name(grandparents_8[2])
+
+
+
         return {"horse_id": horse_id, "name": horse_name, "sire": sire, "dam": dam, "broodmare_sire": bms}
 
     except Exception as e:
+
         return {"horse_id": horse_id, "name": "不明", "sire": "不明", "dam": "不明", "broodmare_sire": "不明"}
 
 def scrape_race_results_dedicated(horse_id):
@@ -195,6 +248,46 @@ def get_horse_ids_from_race(race_id):
         st.error(f"データの抽出中にエラーが発生しました: {e}")
         return []
 
+def scrape_shutuba_table(race_id):
+    """
+    指定されたURLから出馬表データ（馬番、斤量、騎手、馬体重など）をスクレイピングする
+    """
+    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}&rf=race_submenu"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        time.sleep(1)
+        response = requests.get(url, headers=headers, timeout=10)
+        response.encoding = 'euc-jp'
+        
+        # PandasでHTML内の表を一括取得
+        dfs = pd.read_html(io.StringIO(response.text))
+        
+        for df in dfs:
+            # 列名がマルチインデックス（複数行）になっている場合、一番下の行を列名にする
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [str(col[-1]) for col in df.columns]
+            
+            # 「馬名」列が含まれている表を出馬表とみなす
+            if '馬名' in df.columns:
+                # 空行などを削除
+                df = df.dropna(subset=['馬名'])
+                
+                # 取得したい主要な列（サイトの表記揺れに対応するため部分一致で探す）
+                target_cols = ['枠', '馬番', '馬名', '性齢', '斤量', '騎手', '厩舎', '馬体重']
+                keep_cols = []
+                for actual_col in df.columns:
+                    for tc in target_cols:
+                        if tc in actual_col.replace(" ", "") and actual_col not in keep_cols:
+                            keep_cols.append(actual_col)
+                            break
+                if keep_cols:
+                    return df[keep_cols]
+        return pd.DataFrame()
+    except Exception as e:
+        return pd.DataFrame()
+
 # --- Streamlit UI ---
 st.title("🏇 わーちゃんのレース予想AI")
 
@@ -210,10 +303,12 @@ if "all_horse_data" not in st.session_state:
     st.session_state.all_horse_data = None
 if "pedigree_list" not in st.session_state:
     st.session_state.pedigree_list = None
+if "shutuba_table" not in st.session_state:
+    st.session_state.shutuba_table = None
 
 # --- AI予想開始ボタン ---
 if st.button("AI予想を開始"):
-    if not API_KEY:
+    if not API_KEY_GEMINI:
         st.error("APIキーがありません")
     elif not race_id:
         st.warning("Race IDを入力してください")
@@ -245,15 +340,25 @@ if st.button("AI予想を開始"):
                     temp_horse_data.append({"id": hid, "pedigree": ped_data, "results": results_df})
                     progress_bar.progress((i + 1) / len(h_ids))
 
+                # 出馬表のスクレイピングを実行
+                status_text.write("📊 出馬表（レース情報）を取得中...")
+                shutuba_df = scrape_shutuba_table(race_id)
+
                 # データをセッションに保存して再起動
                 st.session_state.all_horse_data = temp_horse_data
                 st.session_state.pedigree_list = temp_pedigree_list
+                st.session_state.shutuba_table = shutuba_df
                 st.rerun()
 
 # --- ここから表示フェーズ（データがあるときだけ自動で表示される） ---
 if st.session_state.all_horse_data:
-    # ① 出馬表
-    st.subheader("📋 出馬表（血統情報）")
+    # 🆕 取得した公式出馬表の表示
+    if st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:
+        st.subheader("📊 本レース出馬表（馬番・騎手・斤量など）")
+        st.dataframe(st.session_state.shutuba_table, use_container_width=True)
+
+    # ① 出馬表（血統情報）
+    st.subheader("� 出馬表（血統情報）")
     df_pedigree = pd.DataFrame(st.session_state.pedigree_list)
     df_pedigree = df_pedigree.rename(columns={
         "horse_id": "馬ID", "name": "馬名", "sire": "父", "dam": "母", "broodmare_sire": "母父"
@@ -271,69 +376,95 @@ if st.session_state.all_horse_data:
             else:
                 st.write("戦績データがありません。")
 
-    # ③ Geminiによる分析
-    st.subheader("🤖 Geminiによるレース分析と買い目予想")
-    with st.spinner("AIが分析中..."):
-        genai.configure(api_key=API_KEY)
-        model = genai.GenerativeModel(TARGET_MODEL)
-        
-        # --- プロンプト生成ロジック ---
-        all_running_styles = []
-        for horse in st.session_state.all_horse_data:
-            if not horse['results'].empty and '通過' in horse['results'].columns:
-                style = analyze_running_style(horse['results']['通過'])
-                all_running_styles.append(style)
+    # ③ AIによる分析
+    st.subheader(f"🤖 {ai_choice} によるレース分析")
+    
+    # --- プロンプト生成ロジック ---
+    all_running_styles = []
+    for horse in st.session_state.all_horse_data:
+        if not horse['results'].empty and '通過' in horse['results'].columns:
+            style = analyze_running_style(horse['results']['通過'])
+            all_running_styles.append(style)
 
-        num_front_runners = all_running_styles.count('逃げ')
-        num_leaders = all_running_styles.count('先行')
-        if num_front_runners >= 2 or (num_front_runners == 1 and num_leaders >= 3):
-            race_pace_prediction = "ハイペース予想。複数の逃げ・先行馬が競り合い、前方の争いが激化しそうです。これにより、後半に脚を溜められる差し・追込馬に有利な展開となる可能性があります。"
-        elif num_front_runners == 0 and num_leaders <= 2:
-            race_pace_prediction = "スローペース予想。明確な逃げ馬がおらず、牽制しあって落ち着いた流れになりそうです。瞬発力や決め手のある馬が有利で、前残りの展開も考えられます。"
-        else:
-            race_pace_prediction = "ミドルペース予想。平均的なペース構成で、各馬の実力がストレートに反映されやすいでしょう。"
+    num_front_runners = all_running_styles.count('逃げ')
+    num_leaders = all_running_styles.count('先行')
+    if num_front_runners >= 2 or (num_front_runners == 1 and num_leaders >= 3):
+        race_pace_prediction = "ハイペース予想。複数の逃げ・先行馬が競り合い、前方の争いが激化しそうです。これにより、後半に脚を溜められる差し・追込馬に有利な展開となる可能性があります。"
+    elif num_front_runners == 0 and num_leaders <= 2:
+        race_pace_prediction = "スローペース予想。明確な逃げ馬がおらず、牽制しあって落ち着いた流れになりそうです。瞬発力や決め手のある馬が有利で、前残りの展開も考えられます。"
+    else:
+        race_pace_prediction = "ミドルペース予想。平均的なペース構成で、各馬の実力がストレートに反映されやすいでしょう。"
 
-        prompt = f"""あなたはプロの競馬予想家です。
-以下の出走馬データとレース展開予想を元に、レースID: {race_id} の最終的な予想をしてください。
+    prompt = f"""あなたはJRAのレース予想スペシャリストです。
+「レース情報（レースID: {race_id}）」、「出走馬リスト」を参照し、このレースについて最も精度の高い予想を行ってください。
+データに不足がある場合は、最新のデータを検索してください。
 
-# レース展開予想
+以下の順序で思考し、最終的な買い目を導き出してください：
+
+1. レース波乱度の判定: ハンデ、頭数、馬場状態から「堅い・標準・荒れる」を判定。
+
+2. 上位人気馬の死角チェック: 1〜3番人気の近走成績と今回のコース適性を比較し、飛ぶ（馬券外になる）可能性を数値化。
+
+3. 展開予想: 逃げ・先行馬の数から、ハイペースかスローペースかを予測。
+
+4. 穴馬（10番人気以下）の抽出: 展開や馬場、血統背景から激走の可能性がある馬を1頭選定。
+
+5. 買い方： 予算{budget}円の範囲で、
+・判定が「堅い」場合：上位2頭を軸にした三連複2頭軸流しを提案せよ。
+・判定が「標準」場合：馬連4頭BOX（6点）と、それに対応する三連複フォーメーションを提案せよ。
+・判定が「荒れる」場合：単勝2点と、その穴馬から上位人気へのワイド流しを提案せよ。
+
+---
+以下は、システムが事前分析した出走馬データと簡易的なレース展開予想です。分析の参考にしてください。
+
+# システムによるレース展開予想
 {race_pace_prediction}
 
 # 出走馬 詳細分析"""
 
-        for horse in st.session_state.all_horse_data:
-            p = horse['pedigree']
-            results_df = horse['results']
-            prompt += f"\n---\n## 馬名: {p['name']} (父: {p['sire']}, 母父: {p['broodmare_sire']})\n"
-            
-            if results_df.empty:
-                prompt += "戦績データがありません（新馬戦など）。\n"
-                continue
+    # 取得した出馬表（騎手や斤量）のデータをAIプロンプトに追加
+    if st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:
+        prompt += "\n# 本レースの出馬表データ（馬番、騎手、斤量など）\n"
+        prompt += st.session_state.shutuba_table.to_string(index=False) + "\n"
 
-            running_style = analyze_running_style(results_df['通過'] if '通過' in results_df.columns else pd.Series())
-            track_pref = analyze_track_preference(results_df)
-            prompt += f"- **脚質**: {running_style}\n- **馬場適性**: {track_pref}\n"
-
-            if '馬体重' in results_df.columns and results_df['馬体重'].notna().any():
-                latest_weight_str = results_df['馬体重'].dropna().iloc[0]
-                weight = re.match(r'(\d+)', str(latest_weight_str))
-                if weight: prompt += f"- **近走馬体重**: {weight.group(1)}kg前後\n"
-
-            prompt += "- **直近戦績サマリー**:\n"
-            summary_cols = ['日付', 'レース名', '着順', '距離', '馬場', 'タイム', '上り', '通過']
-            existing_cols = [col for col in summary_cols if col in results_df.columns]
-            prompt += results_df[existing_cols].head(3).to_string(index=False) + "\n"
-
-        prompt += f"""
-# 最終的な指示
-上記の詳細な分析とレース展開予想を踏まえ、予算{budget}円の範囲で、以下の形式で回答してください。
-1. **レースの総括**: 展開予想を元に、どの脚質の馬が有利になるか簡潔に説明。
-2. **有力馬3頭の評価**: 最も有力と考える馬を3頭挙げ、その理由を分析内容と関連付けて説明。
-3. **買い目提案**: 予算内で、単勝(狙い4-10倍)・馬連(狙い10-30倍)・ワイド(狙い5-15倍)を各1点ずつ組み合わせた具体的な買い目と金額配分を提案。オッズはAIが推測すること。
-"""
+    for horse in st.session_state.all_horse_data:
+        p = horse['pedigree']
+        results_df = horse['results']
+        prompt += f"\n---\n## 馬名: {p['name']} (父: {p['sire']}, 母父: {p['broodmare_sire']})\n"
         
-        try:
-            response = model.generate_content(prompt)
-            st.write(response.text)
-        except Exception as e:
-            st.error(f"分析エラー: {e}")
+        if results_df.empty:
+            prompt += "戦績データがありません（新馬戦など）。\n"
+            continue
+
+        running_style = analyze_running_style(results_df['通過'] if '通過' in results_df.columns else pd.Series())
+        track_pref = analyze_track_preference(results_df)
+        prompt += f"- **脚質**: {running_style}\n- **馬場適性**: {track_pref}\n"
+
+        if '馬体重' in results_df.columns and results_df['馬体重'].notna().any():
+            latest_weight_str = results_df['馬体重'].dropna().iloc[0]
+            weight = re.match(r'(\d+)', str(latest_weight_str))
+            if weight: prompt += f"- **近走馬体重**: {weight.group(1)}kg前後\n"
+
+        prompt += "- **直近戦績サマリー**:\n"
+        summary_cols = ['日付', 'レース名', '着順', '距離', '馬場', 'タイム', '上り', '通過']
+        existing_cols = [col for col in summary_cols if col in results_df.columns]
+        prompt += results_df[existing_cols].head(3).to_string(index=False) + "\n"
+    
+    if st.button("AI分析を実行"):
+        if ai_choice == "Gemini" or ai_choice == "両方で比較":
+            with st.spinner("Geminiが分析中..."):
+                try:
+                    res = ask_gemini(prompt)
+                    st.markdown("### 🟦 Geminiの予想")
+                    st.write(res)
+                except Exception as e:
+                    st.error(f"Gemini分析エラー: {e}")
+
+        if ai_choice == "ChatGPT" or ai_choice == "両方で比較":
+            with st.spinner("ChatGPTが分析中..."):
+                try:
+                    res = ask_chatgpt(prompt)
+                    st.markdown("### 🟩 ChatGPTの予想")
+                    st.write(res)
+                except Exception as e:
+                    st.error(f"ChatGPT分析エラー: {e}")
