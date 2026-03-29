@@ -87,72 +87,59 @@ def analyze_track_preference(results_df):
     elif good_track_in_money > 0: return "馬場不問"
     else: return "傾向なし"
 
+# 1頭分のデータをAI用の短い1行テキストにする関数（トークン節約）
+def compact_for_ai(horse):
+    p = horse['pedigree']
+    if horse['results'].empty:
+        return f"・{p['name']}({p['sire']}/{p['broodmare_sire']}): データなし"
+        
+    # 必要な列だけ抽出
+    cols = ['日付', '着順', '距離']
+    existing_cols = [c for c in cols if c in horse['results'].columns]
+    res = horse['results'][existing_cols].head(3).copy()
+    
+    # 着順から数字だけ抽出（「1着」→「1」）
+    if '着順' in res.columns:
+        res['着順'] = res['着順'].astype(str).str.extract(r'(\d+)')[0].fillna(res['着順'])
+        
+    # データをギュッと凝縮（改行を消して | 区切りに）
+    res_text = res.to_string(index=False, header=False).replace('\n', ' | ')
+    res_text = re.sub(r'\s+', ' ', res_text) # 連続する空白を圧縮
+    return f"・{p['name']}({p['sire']}/{p['broodmare_sire']}): {res_text}"
+
 def scrape_horse_ped(horse_id):
-
     url = f"https://db.netkeiba.com/horse/ped/{horse_id}/"
-
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-
     try:
-
         time.sleep(1)
-
         response = requests.get(url, headers=headers, timeout=10)
-
         response.encoding = 'euc-jp'
-
         soup = BeautifulSoup(response.text, 'html.parser')
 
-
-
         # 馬名のクリーンアップ取得
-
         try:
-
             raw_title = soup.title.text
-
             horse_name = raw_title.split(" | ")[0].split(" (")[0].strip()
-
         except: horse_name = "不明"
 
-
-
         def get_clean_name(td_element):
-
             if not td_element: return "不明"
-
             a_tag = td_element.find('a')
-
             raw_text = a_tag.text if a_tag else td_element.text
-
             return raw_text.strip().split('\n')[0].strip()
 
-
-
         sire, dam, bms = "不明", "不明", "不明"
-
         blood_table = soup.find("table", class_="blood_table")
-
         if blood_table:
-
             parents_16 = blood_table.find_all("td", rowspan="16")
-
             grandparents_8 = blood_table.find_all("td", rowspan="8")
-
             if len(parents_16) >= 2:
-
                 sire = get_clean_name(parents_16[0]); dam = get_clean_name(parents_16[1])
-
             if len(grandparents_8) >= 3:
-
                 bms = get_clean_name(grandparents_8[2])
-
-
-
         return {"horse_id": horse_id, "name": horse_name, "sire": sire, "dam": dam, "broodmare_sire": bms}
 
     except Exception as e:
-
         return {"horse_id": horse_id, "name": "不明", "sire": "不明", "dam": "不明", "broodmare_sire": "不明"}
 
 def scrape_race_results_dedicated(horse_id):
@@ -379,130 +366,52 @@ if st.session_state.all_horse_data:
     # ③ AIによる分析
     st.subheader(f"🤖 {ai_choice} によるレース分析")
     
-    # --- プロンプト生成ロジック ---
-    all_running_styles = []
+    # --- トークン節約のためのデータ圧縮 ---
+    ai_data_text = ""
     for horse in st.session_state.all_horse_data:
-        if not horse['results'].empty and '通過' in horse['results'].columns:
-            style = analyze_running_style(horse['results']['通過'])
-            all_running_styles.append(style)
-
-    num_front_runners = all_running_styles.count('逃げ')
-    num_leaders = all_running_styles.count('先行')
-    if num_front_runners >= 2 or (num_front_runners == 1 and num_leaders >= 3):
-        race_pace_prediction = "ハイペース予想。複数の逃げ・先行馬が競り合い、前方の争いが激化しそうです。これにより、後半に脚を溜められる差し・追込馬に有利な展開となる可能性があります。"
-    elif num_front_runners == 0 and num_leaders <= 2:
-        race_pace_prediction = "スローペース予想。明確な逃げ馬がおらず、牽制しあって落ち着いた流れになりそうです。瞬発力や決め手のある馬が有利で、前残りの展開も考えられます。"
-    else:
-        race_pace_prediction = "ミドルペース予想。平均的なペース構成で、各馬の実力がストレートに反映されやすいでしょう。"
-
-    # --- プロンプト用データコンテキスト生成 ---
-    data_context = f"""---
-【レース基本情報】
-・対象レースID: {race_id}
-
-以下は、システムが事前分析した出走馬データと簡易的なレース展開予想です。分析の参考にしてください。
-
-# システムによるレース展開予想
-{race_pace_prediction}
-
-# 出走馬 詳細分析"""
-
-    # 取得した出馬表（騎手や斤量）のデータをAIプロンプトに追加
-    if st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:
-        data_context += "\n# 本レースの出馬表データ（馬番、騎手、斤量など）\n"
-        data_context += st.session_state.shutuba_table.to_string(index=False) + "\n"
-
-    for horse in st.session_state.all_horse_data:
-        p = horse['pedigree']
-        results_df = horse['results']
-        data_context += f"\n---\n## 馬名: {p['name']} (父: {p['sire']}, 母父: {p['broodmare_sire']})\n"
+        ai_data_text += compact_for_ai(horse) + "\n"
         
-        if results_df.empty:
-            data_context += "戦績データがありません（新馬戦など）。\n"
-            continue
+    prompt = f"""あなたはプロの競馬予想家です。以下の制約を厳守し、簡潔に回答してください。
 
-        running_style = analyze_running_style(results_df['通過'] if '通過' in results_df.columns else pd.Series())
-        track_pref = analyze_track_preference(results_df)
-        data_context += f"- **脚質**: {running_style}\n- **馬場適性**: {track_pref}\n"
+【制約】
+・挨拶、前置き、結びの言葉は一切不要。
+・各馬の評価は1行（50文字以内）にまとめる。
+・的中率と回収率のバランスを重視した買い目を出す。
 
-        if '馬体重' in results_df.columns and results_df['馬体重'].notna().any():
-            latest_weight_str = results_df['馬体重'].dropna().iloc[0]
-            weight = re.match(r'(\d+)', str(latest_weight_str))
-            if weight: data_context += f"- **近走馬体重**: {weight.group(1)}kg前後\n"
+【レース情報】
+レースID: {race_id} / 予算: {budget}円
 
-        data_context += "- **直近戦績サマリー**:\n"
-        summary_cols = ['日付', 'レース名', '着順', '距離', '馬場', 'タイム', '上り', '通過']
-        existing_cols = [col for col in summary_cols if col in results_df.columns]
-        data_context += results_df[existing_cols].head(3).to_string(index=False) + "\n"
-    
-    if st.button("AI多角分析を実行"):
-        def run_multi_perspective(ai_name, ask_func, context):
-            perspectives = [
-                ("🩸 血統重視", "「血統（父、母、母父の傾向や血統背景）」を最重視"),
-                ("📊 指数・データ重視", "「過去の戦績、着順、タイム、馬場適性、近走馬体重」を最重視"),
-                ("🏇 展開重視", "「脚質、枠順、システムによる展開予想、今回のメンバー構成（逃げ先行馬の数）」を最重視")
-            ]
-            
-            results_dict = {}
-            st.markdown(f"#### 🔍 {ai_name} による多角分析プロセス")
-            
-            # 各視点からの予想を実行
-            for title, focus in perspectives:
-                with st.spinner(f"{ai_name} が {title} で予想中..."):
-                    p = f"""あなたはプロの競馬予想家です。
-以下の出走馬データとレース情報を元に、{focus}してレースを予想してください。
+【出走馬データ（馬名/父/母父/直近3走成績）】
+{ai_data_text}
 
-【出力要件】
-1. この視点から見たレースの見解
-2. 上位5頭の予想印（◎, ○, ▲, △, ☆）とその明確な根拠
+【出力フォーマット】
+■有力馬評価
+・[馬名]: 評価理由
+（以下、注目馬のみ数頭）
 
-{context}
+■展開予想
+（1行で記述）
+
+■推奨買い目
+・[券種]: [組み合わせ] (金額)
+（予算内に収めること）
 """
-                    try:
-                        res = ask_func(p)
-                        results_dict[title] = res
-                        with st.expander(f"👁️ {title} の予想結果表示"):
-                            st.write(res)
-                    except Exception as e:
-                        st.error(f"{title} 分析エラー: {e}")
-                        results_dict[title] = "エラーのため取得できませんでした。"
-                        
-            # 共通項抽出と最終結論の生成
-            with st.spinner(f"{ai_name} が共通項を抽出し、最終結論を生成中..."):
-                summary_prompt = f"""あなたは総合競馬予想のスペシャリストです。
-以下の3つの異なる視点からの予想結果を分析し、共通項を抽出して最終的な予想と買い目を出力してください。
 
-【3つの視点からの予想結果】
-■ 血統重視の予想
-{results_dict['🩸 血統重視']}
-
-■ 指数・データ重視の予想
-{results_dict['📊 指数・データ重視']}
-
-■ 展開重視の予想
-{results_dict['🏇 展開重視']}
-
-【最終出力要件】
-1. 分析の共通項（どの馬が複数の視点で高く評価されているか、その理由）
-2. 最終的な総合予想印（◎, ○, ▲, △, 注, 消）と総合評価の根拠
-3. レースの波乱度判定（「堅い」「標準」「荒れる」のいずれか）とその理由
-4. 予算{budget}円の範囲での具体的な買い目（馬券種、組み合わせ（すべて馬番で書くこと）、金額配分）と、その買い方を選んだ理由
-
-【買い目構築ルール】
-波乱度の判定に基づき、必ず以下のルールで買い目を構築してください。
-・判定が「堅い」場合：上位2頭を軸にした三連複2頭軸流しを提案せよ。
-・判定が「標準」場合：馬連4頭BOX（6点）と、それに対応する三連複フォーメーションを提案せよ。
-・判定が「荒れる」場合：単勝2点と、その穴馬から上位人気へのワイド流しを提案せよ。
-"""
-                try:
-                    final_res = ask_func(summary_prompt)
-                    st.markdown(f"### 🏆 {ai_name} の最終結論（共通項抽出）")
-                    st.write(final_res)
-                except Exception as e:
-                    st.error(f"最終結論 生成エラー: {e}")
-
+    if st.button("AI予想を実行 (節約・高精度版)"):
         if ai_choice == "Gemini" or ai_choice == "両方で比較":
-            run_multi_perspective("Gemini", ask_gemini, data_context)
+            with st.spinner("Geminiが分析中..."):
+                try:
+                    res = ask_gemini(prompt)
+                    st.markdown("### 🟦 Geminiの予想")
+                    st.write(res)
+                except Exception as e:
+                    st.error(f"Gemini分析エラー: {e}")
 
         if ai_choice == "ChatGPT" or ai_choice == "両方で比較":
-            run_multi_perspective("ChatGPT", ask_chatgpt, data_context)
+            with st.spinner("ChatGPTが分析中..."):
+                try:
+                    res = ask_chatgpt(prompt)
+                    st.markdown("### 🟩 ChatGPTの予想")
+                    st.write(res)
+                except Exception as e:
+                    st.error(f"ChatGPT分析エラー: {e}")
