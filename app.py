@@ -10,6 +10,8 @@ import io
 import os
 import re
 import json
+import csv
+import scraper
 from datetime import datetime
 
 # --- 設定 ---
@@ -88,6 +90,44 @@ def analyze_track_preference(results_df):
     elif heavy_track_in_money > good_track_in_money: return f"道悪巧者({heavy_track_in_money}回)"
     elif good_track_in_money > 0: return "馬場不問"
     else: return "傾向なし"
+
+def calculate_base_score(results_df, pace_prediction):
+    """脚質、馬場適性、近走着順から100点満点の基礎スコアを算出する"""
+    if results_df.empty:
+        return 0, "データなし"
+    
+    score = 0
+    details = []
+
+    # 1. 近走着順スコア (Max 50点)
+    recent_score = 0
+    if '着順' in results_df.columns:
+        recent_5 = results_df['着順'].head(5)
+        for rank in recent_5:
+            try:
+                r = int(re.search(r'(\d+)', str(rank)).group(1))
+                if r == 1: recent_score += 10
+                elif r == 2: recent_score += 8
+                elif r == 3: recent_score += 6
+                elif r == 4: recent_score += 4
+                elif r == 5: recent_score += 2
+            except: pass
+    recent_score = min(recent_score, 50)
+    score += recent_score; details.append(f"近走:{recent_score}")
+
+    # 2. 馬場実績スコア (Max 20点)
+    track_score = 0
+    if '着順' in results_df.columns:
+        track_score = min(sum(1 for r in results_df['着順'] if re.search(r'(\d+)', str(r)) and int(re.search(r'(\d+)', str(r)).group(1)) <= 3) * 5, 20)
+    score += track_score; details.append(f"馬場:{track_score}")
+
+    # 3. 展開マッチスコア (Max 30点)
+    style = analyze_running_style(results_df['通過']) if '通過' in results_df.columns else "不明"
+    pace_score = 30 if ("ハイペース" in pace_prediction and style in ["差し", "追込"]) or ("スローペース" in pace_prediction and style in ["逃げ", "先行"]) else (20 if "ミドルペース" in pace_prediction and style in ["先行", "差し"] else 10)
+    if style == "不明": pace_score = 0
+    score += pace_score; details.append(f"展開:{pace_score}")
+
+    return score, f"{score}点 ({', '.join(details)})"
 
 def scrape_horse_ped(horse_id):
 
@@ -301,43 +341,11 @@ st.sidebar.title("🏇 メニュー")
 app_mode = st.sidebar.radio("モード選択", ["単一レース予想", "バックテスト"], index=0)
 
 if app_mode == "バックテスト":
-    def scrape_payouts(race_id):
-        url = f"https://db.netkeiba.com/race/{race_id}/"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        try:
-            time.sleep(1)
-            response = requests.get(url, headers=headers, timeout=10)
-            response.encoding = 'euc-jp'
-            soup = BeautifulSoup(response.text, 'html.parser')
-            payouts = {}
-            for table in soup.find_all('table', class_='pay_table_01'):
-                for tr in table.find_all('tr'):
-                    th = tr.find('th')
-                    tds = tr.find_all('td')
-                    if th and len(tds) >= 2:
-                        ticket_type = th.text.strip()
-                        combos = list(tds[0].stripped_strings)
-                        pays = list(tds[1].stripped_strings)
-                        if ticket_type not in payouts:
-                            payouts[ticket_type] = []
-                        for c, p in zip(combos, pays):
-                            pay_val = p.replace(',', '').replace('円', '')
-                            if pay_val.isdigit():
-                                payouts[ticket_type].append({"combo": c, "pay": int(pay_val)})
-            return payouts
-        except: return {}
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def scrape_payouts(race_id): return scraper.scrape_payouts(race_id)
 
-    def get_race_date(race_id):
-        url = f"https://db.netkeiba.com/race/{race_id}/"
-        try:
-            res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-            res.encoding = 'euc-jp'
-            soup = BeautifulSoup(res.text, 'html.parser')
-            title = soup.title.text
-            match = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', title)
-            if match: return f"{match.group(1)}/{match.group(2).zfill(2)}/{match.group(3).zfill(2)}"
-        except: pass
-        return pd.Timestamp.now().strftime('%Y/%m/%d')
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def get_race_date(race_id): return scraper.get_race_date(race_id)
 
     def normalize_combo(c, b_type):
         c = str(c).replace('ー', '-').replace(' ', '')
@@ -562,24 +570,7 @@ if st.session_state.all_horse_data:
     })
     st.dataframe(df_pedigree, use_container_width=True)
 
-    # ② 各馬の戦績
-    st.subheader("🐎 各馬の血統と直近戦績")
-    for horse in st.session_state.all_horse_data:
-        name = horse['pedigree']['name']
-        with st.expander(f"{name} (ID: {horse['id']})"):
-            st.write(f"**父:** {horse['pedigree']['sire']} / **母:** {horse['pedigree']['dam']} / **母父:** {horse['pedigree']['broodmare_sire']}")
-            if not horse['results'].empty:
-                st.dataframe(horse['results'].head(5), use_container_width=True)
-            else:
-                st.write("戦績データがありません。")
-
-    # ③ AIによる分析
-    st.subheader(f"🤖 {ai_choice} によるレース分析")
-    
-    # ユーザーの意見を入力するボックスを追加
-    user_opinion = st.text_area("✍️ あなたの予想・注目馬（AIへの指示や意見があれば入力してください）", placeholder="例: 1番の馬の逃げ残りに期待。雨が降っているので外枠有利。")
-
-    # --- プロンプト生成ロジック ---
+    # --- 展開予想ロジック（表示とAIプロンプトで共通使用） ---
     all_running_styles = []
     for horse in st.session_state.all_horse_data:
         if not horse['results'].empty and '通過' in horse['results'].columns:
@@ -594,6 +585,28 @@ if st.session_state.all_horse_data:
         race_pace_prediction = "スローペース予想。明確な逃げ馬がおらず、牽制しあって落ち着いた流れになりそうです。瞬発力や決め手のある馬が有利で、前残りの展開も考えられます。"
     else:
         race_pace_prediction = "ミドルペース予想。平均的なペース構成で、各馬の実力がストレートに反映されやすいでしょう。"
+
+    st.info(f"🏁 **システム展開予想:** {race_pace_prediction}")
+
+    # ② 各馬の戦績と基礎スコア
+    st.subheader("🐎 各馬の血統と直近戦績")
+    for horse in st.session_state.all_horse_data:
+        name = horse['pedigree']['name']
+        results_df = horse['results']
+        score, score_details = calculate_base_score(results_df, race_pace_prediction)
+        with st.expander(f"{name} (ID: {horse['id']}) - 基礎スコア: {score}点"):
+            st.write(f"**父:** {horse['pedigree']['sire']} / **母:** {horse['pedigree']['dam']} / **母父:** {horse['pedigree']['broodmare_sire']}")
+            st.write(f"**📊 ルールベース基礎スコア:** {score_details}")
+            if not results_df.empty:
+                st.dataframe(results_df.head(5), use_container_width=True)
+            else:
+                st.write("戦績データがありません。")
+
+    # ③ AIによる分析
+    st.subheader(f"🤖 {ai_choice} によるレース分析")
+    
+    # ユーザーの意見を入力するボックスを追加
+    user_opinion = st.text_area("✍️ あなたの予想・注目馬（AIへの指示や意見があれば入力してください）", placeholder="例: 1番の馬の逃げ残りに期待。雨が降っているので外枠有利。")
 
     # --- プロンプト用データコンテキスト生成 ---
     data_context = f"""---
@@ -627,6 +640,7 @@ if st.session_state.all_horse_data:
 
         running_style = analyze_running_style(results_df['通過'] if '通過' in results_df.columns else pd.Series())
         track_pref = analyze_track_preference(results_df)
+        score, score_details = calculate_base_score(results_df, race_pace_prediction)
         
         weight_info = ""
         if '馬体重' in results_df.columns and results_df['馬体重'].notna().any():
@@ -634,8 +648,8 @@ if st.session_state.all_horse_data:
             weight = re.match(r'(\d+)', str(latest_weight_str))
             if weight: weight_info = f" 体重:{weight.group(1)}"
 
-        data_context += f"脚質:{running_style} 馬場:{track_pref}{weight_info}\n"
-
+        data_context += f"脚質:{running_style} 馬場:{track_pref}{weight_info} 基礎スコア:{score_details}\n"
+        
         summary_cols = ['日付', 'レース名', '着順', '距離', '馬場', 'タイム', '上り', '通過']
         existing_cols = [col for col in summary_cols if col in results_df.columns]
         data_context += results_df[existing_cols].head(3).to_csv(index=False, sep='|')
@@ -714,6 +728,24 @@ if st.session_state.all_horse_data:
 """
                 try:
                     final_res = ask_func(summary_prompt)
+
+                    # 予想結果ログ保存機能
+                    log_file = "prediction_log.csv"
+                    log_exists = os.path.exists(log_file)
+                    log_data = [
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        race_id,
+                        ai_name,
+                        budget,
+                        summary_prompt,
+                        final_res
+                    ]
+                    with open(log_file, 'a', newline='', encoding='utf-8-sig') as f:
+                        writer = csv.writer(f)
+                        if not log_exists:
+                            writer.writerow(["Timestamp", "RaceID", "Model", "Budget", "Prompt", "Response"])
+                        writer.writerow(log_data)
+
                     st.markdown(f"### 🏆 {ai_name} の最終結論（共通項抽出）")
                     st.write(final_res)
                 except Exception as e:
