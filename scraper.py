@@ -80,6 +80,9 @@ def scrape_race_results_dedicated(horse_id):
             # 通常、ページ内の最初の表(インデックス0)が戦績表です
             df = dfs[0]
             
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [str(col[-1]) for col in df.columns]
+
             # 念のため、取得した表が本当に戦績表か（「日付」や「レース名」の列があるか）確認
             if '日付' in df.columns or 'レース名' in df.columns:
                 # 誰の戦績かわかるように、表の左端に「馬ID」と「馬名」の列を追加
@@ -106,21 +109,28 @@ def get_horse_ids_from_race(race_id):
         horse_list = []
         table = soup.find('table', class_='race_table_01')
         if table:
+            # 過去レース結果ページから馬番、人気、馬IDをタプルで取得
             for tr in table.find_all('tr')[1:]:
                 tds = tr.find_all('td')
-                if len(tds) > 3:
+                # 人気(tds[1]), 馬番(tds[2]), 馬名(tds[3]) が存在することを確認
+                if len(tds) > 3: 
                     try:
+                        # 人気がない場合(取消など)を考慮し、99番人気として扱う
+                        pop_text = tds[1].text.strip()
+                        popularity = int(pop_text) if pop_text.isdigit() else 99
                         umaban = int(tds[2].text.strip())
                         a_tag = tds[3].find('a')
                         if a_tag and 'href' in a_tag.attrs:
                             match = re.search(r'/horse/(\d{10})', a_tag['href'])
                             if match:
-                                horse_list.append((umaban, match.group(1)))
+                                # 人気、馬番、馬IDの辞書をリストに追加
+                                horse_list.append({'pop': popularity, 'umaban': umaban, 'id': match.group(1)})
                     except:
                         pass
             if horse_list:
-                horse_list.sort(key=lambda x: x[0])
-                return [h[1] for h in horse_list]
+                # 人気順にソートして、馬IDのリストを返す
+                horse_list.sort(key=lambda x: x['pop'])
+                return [h['id'] for h in horse_list]
         
         url_future = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
         time.sleep(1)
