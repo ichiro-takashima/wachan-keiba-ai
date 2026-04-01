@@ -54,16 +54,24 @@ def _rename_columns(df, alias_map):
 
 
 def _infer_special_columns(df):
+    """
+    列名が不正確な場合、データの中身のパターンから
+    「通過順位」と「ペース」の列を特定してリネームする
+    """
     inference_patterns = {
-        "通過": r"^[\d\*]+(?:-[\d\*]+)+$",
-        "ペース": r"^\d{2}\.\d(?:-\d{2}\.\d){1,2}$",
+        # 通過: "9-9-12-12" や "11-10-9-6" など
+        "通過": r"^(\d{1,2}-)+\d{1,2}$",
+        # ペース: "36.5-36.6" など
+        "ペース": r"^\d{2}\.\d-\d{2}\.\d$"
     }
+    
     for target_col, pattern in inference_patterns.items():
-        if target_col in df.columns:
-            continue
         for col in df.columns:
             sample_data = df[col].dropna().astype(str).head(10)
             if not sample_data.empty and any(re.match(pattern, value.strip()) for value in sample_data):
+                # 重複回避：既に存在するターゲット列名がある場合はリネーム
+                if target_col in df.columns and col != target_col:
+                    df = df.rename(columns={target_col: f"old_{target_col}"})
                 df = df.rename(columns={col: target_col})
                 break
     return df
@@ -87,14 +95,13 @@ def _prepare_race_result_df(df):
         "斤量": ["斤量"],
         "距離": ["距離"],
         "馬場": ["馬場"],
-        "馬場指数": ["馬場指数"],
         "タイム": ["タイム"],
         "着差": ["着差"],
-        "通過": ["通過", "コーナー通過", "コーナー通過順", "コーナー"],
+        "通過": ["通過", "コーナー通過順位", "コーナー"],
         "ペース": ["ペース", "ﾍﾟｰｽ"],
-        "上り": ["上り", "上がり", "上り3F", "上がり3F"],
-        "馬体重": ["馬体重", "馬体重(増減)"],
-        "勝ち馬(2着馬)": ["勝ち馬(2着馬)", "勝ち馬"],
+        "上り": ["上り", "上がり", "上り3F"],
+        "馬体重": ["馬体重"],
+        "勝ち馬(2着馬)": ["勝ち馬(2着馬)"],
         "賞金": ["賞金"],
     }
     df = _flatten_columns(df)
@@ -148,29 +155,16 @@ def scrape_horse_ped(horse_id):
             "broodmare_sire": bms,
         }
     except Exception:
-        return {
-            "horse_id": horse_id,
-            "name": "不明",
-            "sire": "不明",
-            "dam": "不明",
-            "broodmare_sire": "不明",
-        }
+        return {"horse_id": horse_id, "name": "不明", "sire": "不明", "dam": "不明", "broodmare_sire": "不明"}
 
 
 def scrape_race_results_dedicated(horse_id):
     url = f"https://db.netkeiba.com/horse/result/{horse_id}/"
-
     try:
         time.sleep(1)
         response = session.get(url, headers=HEADERS, timeout=10)
         response.encoding = "euc-jp"
         soup = BeautifulSoup(response.text, "html.parser")
-
-        try:
-            raw_title = soup.title.text
-            horse_name = raw_title.split("の競走成績")[0].split(" | ")[0].strip()
-        except Exception:
-            horse_name = "不明"
 
         dfs = pd.read_html(io.StringIO(response.text))
         result_df = None
@@ -180,15 +174,11 @@ def scrape_race_results_dedicated(horse_id):
                 break
 
         if result_df is None:
-            print(f"  -> {horse_name} の戦績表が見つかりませんでした。")
             return pd.DataFrame()
 
         result_df.insert(0, "horse_id", horse_id)
-        result_df.insert(1, "horse_name", horse_name)
         return result_df
-
-    except Exception as e:
-        print(f"  -> {horse_id} の取得中にエラーが発生しました: {e}")
+    except Exception:
         return pd.DataFrame()
 
 
@@ -214,31 +204,23 @@ def get_horse_ids_from_race(race_id):
                         if a_tag and "href" in a_tag.attrs:
                             match = re.search(r"/horse/(\d{10})", a_tag["href"])
                             if match:
-                                horse_list.append(
-                                    {"pop": popularity, "umaban": umaban, "id": match.group(1)}
-                                )
-                    except Exception:
-                        pass
+                                horse_list.append({"pop": popularity, "umaban": umaban, "id": match.group(1)})
+                    except Exception: pass
             if horse_list:
                 horse_list.sort(key=lambda x: x["pop"])
                 return [h["id"] for h in horse_list]
-
+        
+        # データベースにない場合は出馬表から
         url_future = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
-        time.sleep(1)
         res_future = session.get(url_future, headers=HEADERS, timeout=10)
         res_future.encoding = "euc-jp"
         soup_future = BeautifulSoup(res_future.text, "html.parser")
-
         horse_ids = []
         for link in soup_future.find_all("a", href=True):
             match = re.search(r"/horse/(\d{10})", link["href"])
-            if match:
-                horse_ids.append(match.group(1))
-        unique_ids = list(dict.fromkeys(horse_ids))
-        return unique_ids[:18]
-
-    except Exception as e:
-        print(f"データの取得中にエラーが発生しました: {e}")
+            if match: horse_ids.append(match.group(1))
+        return list(dict.fromkeys(horse_ids))[:18]
+    except Exception:
         return []
 
 
@@ -248,8 +230,10 @@ def scrape_shutuba_table(race_id):
         time.sleep(1)
         response = session.get(url, headers=HEADERS, timeout=10)
         response.encoding = "euc-jp"
-        dfs = pd.read_html(io.StringIO(response.text))
-
+        html_content = response.text
+        soup = BeautifulSoup(html_content, "html.parser")
+        
+        dfs = pd.read_html(io.StringIO(html_content))
         alias_map = {
             "枠": ["枠", "枠番"],
             "馬番": ["馬番"],
@@ -263,16 +247,47 @@ def scrape_shutuba_table(race_id):
             "オッズ": ["オッズ"],
         }
 
+        final_df = pd.DataFrame()
         for df in dfs:
             df = _flatten_columns(df)
             df = _rename_columns(df, alias_map)
             if "馬名" in df.columns:
                 df = df.dropna(subset=["馬名"])
-                target_cols = ["枠", "馬番", "馬名", "性齢", "斤量", "騎手", "厩舎", "馬体重", "人気", "オッズ"]
-                keep_cols = [col for col in target_cols if col in df.columns]
-                if keep_cols:
-                    return df[keep_cols]
-        return pd.DataFrame()
+                final_df = df
+                break
+        
+        if final_df.empty:
+            return pd.DataFrame()
+
+        # 「人気」が ** の場合、HTMLから直接取得を試みる
+        if "人気" in final_df.columns:
+            # 人気列を文字列型に変換
+            final_df["人気"] = final_df["人気"].astype(str)
+            
+            # 馬名と人気の対応表をスクレイピング
+            pop_map = {}
+            # 人気は <span class="Popularity_Idx">1</span> などのクラスに入っていることが多い
+            rows = soup.find_all("tr", class_="HorseList")
+            for row in rows:
+                name_tag = row.find("span", class_="Horse_Name")
+                pop_tag = row.find("span", class_=re.compile(r"Popularity_Idx|Popularity"))
+                if name_tag and pop_tag:
+                    name = name_tag.text.strip()
+                    pop = pop_tag.text.strip()
+                    if pop.isdigit():
+                        pop_map[name] = pop
+            
+            # データフレームの「**」を置換
+            for i, row in final_df.iterrows():
+                if "**" in row["人気"] or row["人気"] == "nan":
+                    mamei = row["馬名"]
+                    if mamei in pop_map:
+                        final_df.at[i, "人気"] = pop_map[mamei]
+        
+        target_cols = ["枠", "馬番", "馬名", "性齢", "斤量", "騎手", "厩舎", "馬体重", "人気", "オッズ"]
+        keep_cols = [col for col in target_cols if col in final_df.columns]
+        return final_df[keep_cols]
+
     except Exception:
         return pd.DataFrame()
 
@@ -293,15 +308,13 @@ def scrape_payouts(race_id):
                     ticket_type = th.text.strip()
                     combos = list(tds[0].stripped_strings)
                     pays = list(tds[1].stripped_strings)
-                    if ticket_type not in payouts:
-                        payouts[ticket_type] = []
+                    if ticket_type not in payouts: payouts[ticket_type] = []
                     for combo, pay in zip(combos, pays):
                         pay_val = pay.replace(",", "").replace("円", "")
                         if pay_val.isdigit():
                             payouts[ticket_type].append({"combo": combo, "pay": int(pay_val)})
         return payouts
-    except Exception:
-        return {}
+    except Exception: return {}
 
 
 def get_race_date(race_id):
@@ -310,10 +323,7 @@ def get_race_date(race_id):
         res = session.get(url, headers=HEADERS, timeout=10)
         res.encoding = "euc-jp"
         soup = BeautifulSoup(res.text, "html.parser")
-        title = soup.title.text
-        match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", title)
-        if match:
-            return f"{match.group(1)}/{match.group(2).zfill(2)}/{match.group(3).zfill(2)}"
-    except Exception:
-        pass
+        match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", soup.title.text)
+        if match: return f"{match.group(1)}/{match.group(2).zfill(2)}/{match.group(3).zfill(2)}"
+    except Exception: pass
     return pd.Timestamp.now().strftime("%Y/%m/%d")

@@ -70,12 +70,25 @@ def _find_matching_column(df, candidates):
 
 
 def _get_available_columns(df, candidate_map):
-    """候補名の中から実在する列だけを重複なく返す。"""
+    """
+    候補名の中から実在する列だけを重複なく返す。
+    「Unnamed」列であっても、中身が重要そうな場合は予備として含める。
+    """
     selected_cols = []
     for candidates in candidate_map:
         col = _find_matching_column(df, candidates)
         if col and col not in selected_cols:
             selected_cols.append(col)
+    
+    # もし「通過」や「ペース」がまだ見つかっておらず、Unnamed列が存在する場合の救済処置
+    # (scraper.py側の修正で解決するはずですが、二段構えにします)
+    for col in df.columns:
+        col_str = str(col)
+        if "Unnamed" in col_str and col not in selected_cols:
+            # 中身が空でない列は念のためAIに渡す候補に入れる
+            if df[col].notna().any():
+                selected_cols.append(col)
+                
     return selected_cols
 
 def analyze_running_style(results_df):
