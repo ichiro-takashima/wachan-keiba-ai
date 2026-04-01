@@ -68,12 +68,25 @@ def _find_matching_column(df, candidates):
                 return actual_col
     return None
 
+
+def _get_available_columns(df, candidate_map):
+    """候補名の中から実在する列だけを重複なく返す。"""
+    selected_cols = []
+    for candidates in candidate_map:
+        col = _find_matching_column(df, candidates)
+        if col and col not in selected_cols:
+            selected_cols.append(col)
+    return selected_cols
+
 def analyze_running_style(results_df):
     """通過順位のデータから脚質を判定する"""
     if results_df is None or results_df.empty:
         return "不明"
-    corner_col = _find_matching_column(results_df, ['通過', 'コーナー通過順位'])
+    # 'コーナー'も検索候補に追加し、列名の揺れに対応
+    corner_col = _find_matching_column(results_df, ['通過', 'コーナー通過順位', 'コーナー'])
     if not corner_col:
+        # 列が見つからない場合にデバッグ情報をUIに表示
+        st.warning(f"脚質判定に必要な「通過」列が見つかりませんでした。取得された列名を確認してください: {results_df.columns.tolist()}")
         return "不明"
 
     corner_pos_series = results_df[corner_col].dropna()
@@ -317,6 +330,17 @@ if app_mode == "バックテスト":
                     if res_df.empty: ctx += "-\n"
                     else:
                         cols = [c for c in ['日付', 'レース名', '着順', '距離', '馬場', 'タイム', '通過'] if c in res_df.columns]
+                        cols = _get_available_columns(res_df, [
+                            ['日付'],
+                            ['レース名', 'レース'],
+                            ['着順', '着'],
+                            ['距離'],
+                            ['馬場'],
+                            ['タイム'],
+                            ['上り', '上がり', '上り3F', '上がり3F'],
+                            ['ペース', 'ﾍﾟｰｽ'],
+                            ['通過', 'コーナー通過順', 'コーナー'],
+                        ])
                         ctx += res_df[cols].head(3).to_csv(index=False, sep='|') + "\n"
                         # ③過去データを「数値のみ」に圧縮
                         short_df = res_df.copy()
@@ -329,6 +353,17 @@ if app_mode == "バックテスト":
                             
                         cols = [c for c in ['日付', 'レース名', '着順', '距離', '馬場', 'タイム', '通過'] if c in short_df.columns]
                         # ヘッダーなし、カンマ区切りで究極まで圧縮
+                        cols = _get_available_columns(short_df, [
+                            ['日付'],
+                            ['レース名', 'レース'],
+                            ['着順', '着'],
+                            ['距離'],
+                            ['馬場'],
+                            ['タイム'],
+                            ['上り', '上がり', '上り3F', '上がり3F'],
+                            ['ペース', 'ﾍﾟｰｽ'],
+                            ['通過', 'コーナー通過順', 'コーナー'],
+                        ])
                         ctx += short_df[cols].head(5).to_csv(index=False, header=False, sep=',') + "\n"
 
                 prompt = f"""あなたはプロの競馬予想家です。出走馬データから総合的な予想を行い買い目を出力してください。予算:{bt_budget}円。
@@ -489,13 +524,24 @@ if st.session_state.all_horse_data:
                 shutuba_info = entry.iloc[0].to_dict()
 
         score_info = horse["base_score"]
+
+        last_corner = "-"
+        results_df = horse['results']
+        if results_df is not None and not results_df.empty:
+            corner_col = _find_matching_column(results_df, ['通過', 'コーナー通過順位', 'コーナー'])
+            if corner_col:
+                corner_pos_series = results_df[corner_col].dropna()
+                if not corner_pos_series.empty:
+                    last_corner = str(corner_pos_series.iloc[0])
+
         score_data.append({
             "馬番": shutuba_info.get("馬番", "-"),
             "馬名": horse['pedigree']['name'],
             "スコア": score_info['score'],
             "詳細": score_info['detail'],
             "脚質": score_info['running_style'],
-            "馬場適性": score_info['track_preference']
+            "馬場適性": score_info['track_preference'],
+            "前走通過順": last_corner
         })
 
     if score_data:
@@ -561,8 +607,18 @@ if st.session_state.all_horse_data:
 
         data_context += f"脚質:{score_info['running_style']} 馬場:{score_info['track_preference']}{weight_info} 基礎スコア:{score_info['detail']}\n"
         
-        summary_cols = ['日付', 'レース名', '着順', '距離', '馬場', 'タイム', '上り', '通過']
-        existing_cols = [col for col in summary_cols if col in results_df.columns]
+        existing_cols = _get_available_columns(results_df, [
+            ['日付'],
+            ['レース名', 'レース'],
+            ['着順', '着'],
+            ['距離'],
+            ['馬場'],
+            ['タイム'],
+            ['上り', '上がり', '上り3F', '上がり3F'],
+            ['ペース', 'ﾍﾟｰｽ'],
+            ['通過', 'コーナー通過順', 'コーナー'],
+            ['馬体重']
+        ])
         data_context += results_df[existing_cols].head(3).to_csv(index=False, sep='|')
         
         # ③過去データを「数値のみ」に圧縮（単発予想時）
