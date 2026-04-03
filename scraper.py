@@ -2,12 +2,15 @@ import io
 import re
 import time
 import unicodedata
-
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 
 session = requests.Session()
@@ -225,71 +228,91 @@ def get_horse_ids_from_race(race_id):
 
 
 def scrape_shutuba_table(race_id):
-    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}&rf=race_submenu"
+    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
+
+    options = Options()
+    options.add_argument('--headless')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+
     try:
-        time.sleep(1)
-        response = session.get(url, headers=HEADERS, timeout=10)
-        response.encoding = "euc-jp"
-        html_content = response.text
-        soup = BeautifulSoup(html_content, "html.parser")
-        
-        dfs = pd.read_html(io.StringIO(html_content))
-        alias_map = {
-            "枠": ["枠", "枠番"],
-            "馬番": ["馬番"],
-            "馬名": ["馬名"],
-            "性齢": ["性齢"],
-            "斤量": ["斤量"],
-            "騎手": ["騎手"],
-            "厩舎": ["厩舎"],
-            "馬体重": ["馬体重"],
-            "人気": ["人気"],
-            "オッズ": ["オッズ"],
-        }
+        driver.get(url)
+        # JavaScriptがオッズと人気を描画するまで待機
+        time.sleep(3)
 
-        final_df = pd.DataFrame()
-        for df in dfs:
-            df = _flatten_columns(df)
-            df = _rename_columns(df, alias_map)
-            if "馬名" in df.columns:
-                df = df.dropna(subset=["馬名"])
-                final_df = df
-                break
-        
-        if final_df.empty:
-            return pd.DataFrame()
+        html = driver.page_source
+        soup = BeautifulSoup(html, "lxml")
 
-        # 「人気」が ** の場合、HTMLから直接取得を試みる
-        if "人気" in final_df.columns:
-            # 人気列を文字列型に変換
-            final_df["人気"] = final_df["人気"].astype(str)
+        data = []
+        table_rows = soup.find_all("tr", class_="HorseList")
+
+        for row in table_rows:
+            # --- 1. 馬番の取得 ---
+            umaban_tag = row.find("td", class_=re.compile(r"Umaban\d"))
+            umaban = umaban_tag.get_text(strip=True) if umaban_tag else ""
             
-            # 馬名と人気の対応表をスクレイピング
-            pop_map = {}
-            # 人気は <span class="Popularity_Idx">1</span> などのクラスに入っていることが多い
-            rows = soup.find_all("tr", class_="HorseList")
-            for row in rows:
-                name_tag = row.find("span", class_="Horse_Name")
-                pop_tag = row.find("span", class_=re.compile(r"Popularity_Idx|Popularity"))
-                if name_tag and pop_tag:
-                    name = name_tag.text.strip()
-                    pop = pop_tag.text.strip()
-                    if pop.isdigit():
-                        pop_map[name] = pop
-            
-            # データフレームの「**」を置換
-            for i, row in final_df.iterrows():
-                if "**" in row["人気"] or row["人気"] == "nan":
-                    mamei = row["馬名"]
-                    if mamei in pop_map:
-                        final_df.at[i, "人気"] = pop_map[mamei]
-        
-        target_cols = ["枠", "馬番", "馬名", "性齢", "斤量", "騎手", "厩舎", "馬体重", "人気", "オッズ"]
-        keep_cols = [col for col in target_cols if col in final_df.columns]
-        return final_df[keep_cols]
+            if not umaban:
+                continue
 
-    except Exception:
+            # --- 2. 枠番 ---
+            waku_tag = row.find("td", class_=re.compile(r"Waku\d"))
+            waku = waku_tag.get_text(strip=True) if waku_tag else ""
+
+            # --- 3. 馬名 ---
+            horse_td = row.find("td", class_="HorseInfo")
+            horse_name = horse_td.get_text(strip=True) if horse_td else ""
+
+            # --- 4. 性齢と斤量 ---
+            seirei_td = row.find("td", class_="Barei")
+            seirei = seirei_td.get_text(strip=True) if seirei_td else ""
+
+            tds = row.find_all("td")
+            weight = tds[5].get_text(strip=True) if len(tds) > 5 else ""
+
+            # --- 5. 騎手 ---
+            jockey_td = row.select_one(".Jockey")
+            jockey = jockey_td.get_text(strip=True) if jockey_td else ""
+
+            # --- 6. オッズと人気 ---
+            # オッズの抽出
+            odds_span = row.find("span", id=re.compile(r"odds[-_]"))
+            if odds_span:
+                odds = odds_span.get_text(strip=True)
+            else:
+                odds_td = row.find("td", class_=re.compile(r"Odds|txt_r", re.IGNORECASE))
+                odds = odds_td.get_text(strip=True) if odds_td else ""
+
+            # 人気の抽出
+            ninki_span = row.find("span", id=re.compile(r"ninki[-_]"))
+            if not ninki_span:
+                ninki_span = row.find("span", class_=re.compile(r"Popularity|Popular|Ninki", re.IGNORECASE))
+                
+            if ninki_span:
+                ninki = ninki_span.get_text(strip=True)
+            else:
+                ninki_td = row.find("td", class_=re.compile(r"Popularity|r3ml", re.IGNORECASE))
+                ninki = ninki_td.get_text(strip=True) if ninki_td else ""
+
+            data.append({
+                "枠": waku,
+                "馬番": umaban,
+                "馬名": horse_name,
+                "性齢": seirei,
+                "斤量": weight,
+                "騎手": jockey,
+                "オッズ": odds,
+                "人気": ninki
+            })
+
+        return pd.DataFrame(data)
+    except Exception as e:
+        print(f"Error: {e}")
         return pd.DataFrame()
+    finally:
+        driver.quit()
 
 
 def scrape_payouts(race_id):
