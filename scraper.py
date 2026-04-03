@@ -262,8 +262,8 @@ def scrape_shutuba_table(race_id):
             waku = waku_tag.get_text(strip=True) if waku_tag else ""
 
             # --- 3. 馬名 ---
-            horse_td = row.find("td", class_="HorseInfo")
-            horse_name = horse_td.get_text(strip=True) if horse_td else ""
+            horse_a = row.find("a", href=re.compile(r"/horse/"))
+            horse_name = re.sub(r'\s+', '', horse_a.text) if horse_a else ""
 
             # --- 4. 性齢と斤量 ---
             seirei_td = row.find("td", class_="Barei")
@@ -338,6 +338,37 @@ def scrape_payouts(race_id):
                             payouts[ticket_type].append({"combo": combo, "pay": int(pay_val)})
         return payouts
     except Exception: return {}
+
+
+def scrape_race_result_page(race_id):
+    url = f"https://db.netkeiba.com/race/{race_id}/"
+    try:
+        time.sleep(1)
+        response = session.get(url, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        response.encoding = "euc-jp"
+
+        payouts = {}
+        soup = BeautifulSoup(response.text, "html.parser")
+        for table in soup.find_all("table", class_="pay_table_01"):
+            for tr in table.find_all("tr"):
+                th = tr.find("th")
+                tds = tr.find_all("td")
+                if not th or len(tds) < 2:
+                    continue
+                ticket_type = th.text.strip()
+                combos = list(tds[0].stripped_strings)
+                pays = list(tds[1].stripped_strings)
+                if ticket_type not in payouts:
+                    payouts[ticket_type] = []
+                for combo, pay in zip(combos, pays):
+                    pay_val = pay.replace(",", "").replace("円", "")
+                    if pay_val.isdigit():
+                        payouts[ticket_type].append({"combo": combo, "pay": int(pay_val)})
+
+        return {"ok": True, "url": url, "payouts": payouts}
+    except Exception:
+        return {"ok": False, "url": url, "payouts": {}}
 
 
 def get_race_date(race_id):

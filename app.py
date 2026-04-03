@@ -227,6 +227,110 @@ def calculate_base_score(results_df, pace_prediction):
         st.warning(f"基礎スコアの計算中にエラーが発生しました: {e}")
         return default_return
 
+
+def normalize_ticket_type(t):
+    return str(t).replace("三連", "3連").strip()
+
+def normalize_combo(combo, ticket_type):
+    normalized = str(combo).replace('ー', '-').replace(' ', '')
+    if ticket_type in ["馬連", "ワイド", "三連複"]:
+        return "-".join(sorted(normalized.split('-')))
+    normalized = str(combo).replace('ー', '-').replace(' ', '').replace('→', '-').replace('>', '-')
+    t_type = normalize_ticket_type(ticket_type)
+    if t_type in ["馬連", "ワイド", "3連複"]:
+        parts = [p for p in normalized.split('-') if p]
+        try: return "-".join(sorted(parts, key=int))
+        except: return "-".join(sorted(parts))
+    return normalized
+
+
+def calculate_return(bets, payouts):
+    total_bet, total_return, hits = 0, 0, 0
+    ticket_stats = {}
+    # 払戻しのキー表記揺れを吸収 (三連複 -> 3連複)
+    norm_payouts = {normalize_ticket_type(k): v for k, v in payouts.items()}
+
+    for bet in bets:
+        raw_type = bet.get("type", "")
+        t_type = normalize_ticket_type(raw_type)
+        bet_combo = str(bet.get("combo", ""))
+        try:
+            amount = int(bet.get("amount", 0))
+        except Exception:
+            continue
+
+        if raw_type not in ticket_stats:
+            ticket_stats[raw_type] = {"bet": 0, "return": 0, "hits": 0}
+        ticket_stats[raw_type]["bet"] += amount
+        total_bet += amount
+
+        is_hit = False
+        if t_type in norm_payouts:
+            for payout in norm_payouts[t_type]:
+                if normalize_combo(bet_combo, t_type) == normalize_combo(payout["combo"], t_type):
+                    return_amount = int((amount / 100) * payout["pay"])
+                    total_return += return_amount
+                    ticket_stats[raw_type]["return"] += return_amount
+                    is_hit = True
+                    break
+
+        if is_hit:
+            hits += 1
+            ticket_stats[raw_type]["hits"] += 1
+
+    return total_bet, total_return, hits, ticket_stats
+
+
+def extract_bets_from_text(ai_text):
+    if not ai_text:
+        return []
+    try:
+        match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', ai_text, re.DOTALL | re.IGNORECASE)
+        if not match:
+            return []
+        payload = json.loads(match.group(1))
+        bets = payload.get("bets", [])
+        return bets if isinstance(bets, list) else []
+    except Exception:
+        return []
+
+
+def build_reflection_text(predicted_bets, payouts):
+    predicted_ticket_types = {bet.get("type", "") for bet in predicted_bets if bet.get("type")}
+    payout_ticket_types = set(payouts.keys())
+    missing_ticket_types = sorted(list(payout_ticket_types - predicted_ticket_types))
+
+    hit_combos = set()
+    predicted_combos_by_type = {}
+    for bet in predicted_bets:
+        ticket_type = bet.get("type", "")
+        combo = bet.get("combo", "")
+        if not ticket_type or not combo:
+            continue
+        predicted_combos_by_type.setdefault(ticket_type, set()).add(normalize_combo(combo, ticket_type))
+
+    uncovered_examples = []
+    for ticket_type, payout_list in payouts.items():
+        predicted_set = predicted_combos_by_type.get(ticket_type, set())
+        for payout in payout_list:
+            payout_combo = normalize_combo(payout.get("combo", ""), ticket_type)
+            if payout_combo in predicted_set:
+                hit_combos.add(f"{ticket_type}:{payout_combo}")
+            elif len(uncovered_examples) < 5:
+                uncovered_examples.append(f"{ticket_type} {payout.get('combo', '')}")
+
+    reflection_lines = []
+    if missing_ticket_types:
+        reflection_lines.append("・今回買っていないのに的中が出ていた券種: " + "、".join(missing_ticket_types))
+    if uncovered_examples:
+        reflection_lines.append("・買い目に入っていなかった主な的中組み合わせ: " + " / ".join(uncovered_examples))
+
+    if not reflection_lines:
+        reflection_lines.append("・券種と組み合わせの観点では、予想は結果に近い構成でした。")
+
+    reflection_lines.append("・次回改善案: ◎○の軸は維持しつつ、ワイド/三連複の保険を1〜2点追加して取りこぼしを減らす。")
+    return "\n".join(reflection_lines)
+
 # --- Streamlit UI ---
 st.sidebar.title("🏇 メニュー")
 app_mode = st.sidebar.radio("モード選択", ["単一レース予想", "バックテスト"], index=0)
@@ -242,33 +346,42 @@ if app_mode == "バックテスト":
         c = str(c).replace('ー', '-').replace(' ', '')
         if b_type in ["馬連", "ワイド", "三連複"]:
             return "-".join(sorted(c.split('-')))
+        c = str(c).replace('ー', '-').replace(' ', '').replace('→', '-').replace('>', '-')
+        norm_type = str(b_type).replace("三連", "3連").strip()
+        if norm_type in ["馬連", "ワイド", "3連複"]:
+            parts = [p for p in c.split('-') if p]
+            try: return "-".join(sorted(parts, key=int))
+            except: return "-".join(sorted(parts))
         return c
 
     def calculate_return(bets, payouts):
         total_bet, total_ret, hits = 0, 0, 0
         tk_stats = {}
+        norm_payouts = {str(k).replace("三連", "3連").strip(): v for k, v in payouts.items()}
+
         for bet in bets:
-            b_type = bet.get("type", "")
+            b_type_orig = bet.get("type", "")
+            b_type = str(b_type_orig).replace("三連", "3連").strip()
             b_combo = str(bet.get("combo", ""))
             try: b_amount = int(bet.get("amount", 0))
             except: continue
             
-            if b_type not in tk_stats: tk_stats[b_type] = {"bet": 0, "return": 0, "hits": 0}
-            tk_stats[b_type]["bet"] += b_amount
+            if b_type_orig not in tk_stats: tk_stats[b_type_orig] = {"bet": 0, "return": 0, "hits": 0}
+            tk_stats[b_type_orig]["bet"] += b_amount
             total_bet += b_amount
             
             is_hit = False
-            if b_type in payouts:
-                for p in payouts[b_type]:
+            if b_type in norm_payouts:
+                for p in norm_payouts[b_type]:
                     if normalize_combo(b_combo, b_type) == normalize_combo(p["combo"], b_type):
                         ret_amt = int((b_amount / 100) * p["pay"])
                         total_ret += ret_amt
-                        tk_stats[b_type]["return"] += ret_amt
+                        tk_stats[b_type_orig]["return"] += ret_amt
                         is_hit = True
                         break
             if is_hit:
                 hits += 1
-                tk_stats[b_type]["hits"] += 1
+                tk_stats[b_type_orig]["hits"] += 1
         return total_bet, total_ret, hits, tk_stats
 
     st.title("🔄 AIバックテスト機能")
@@ -443,6 +556,10 @@ if "pedigree_list" not in st.session_state:
     st.session_state.pedigree_list = None
 if "shutuba_table" not in st.session_state:
     st.session_state.shutuba_table = None
+if "latest_predictions" not in st.session_state:
+    st.session_state.latest_predictions = {}
+if "result_check_cache" not in st.session_state:
+    st.session_state.result_check_cache = {}
 
 # --- AI予想開始ボタン ---
 if st.button("AI予想を開始"):
@@ -699,6 +816,10 @@ if st.session_state.all_horse_data:
 2. 最終的な総合予想印（◎, ○, ▲, △, 注, 消）と総合評価の根拠
 3. レースの波乱度判定（「堅い」「標準」「荒れる」のいずれか）とその理由
 4. 予算{budget}円の範囲での具体的な買い目（馬券種、組み合わせ（すべて馬番で書くこと）、金額配分）と、その買い方を選んだ理由
+5. 買い目データ（※システムの自動集計用。必ず以下のJSONフォーマットでテキストの最後に記述すること）
+```json
+{{ "bets": [ {{"type": "馬連", "combo": "1-2", "amount": 500}} ] }}
+```
 
 【買い目構築ルール】
 波乱度の判定に基づき、必ず以下のルールで買い目を構築してください。
@@ -728,6 +849,14 @@ if st.session_state.all_horse_data:
 
                     st.markdown(f"### 🏆 {ai_name} の最終結論（共通項抽出）")
                     st.write(final_res)
+
+                    parsed_bets = extract_bets_from_text(final_res)
+                    st.session_state.latest_predictions[ai_name] = {
+                        "race_id": race_id,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "bets": parsed_bets,
+                        "response": final_res
+                    }
                 except Exception as e:
                     st.error(f"最終結論 生成エラー: {e}")
 
@@ -736,3 +865,45 @@ if st.session_state.all_horse_data:
 
         if ai_choice == "ChatGPT" or ai_choice == "両方で比較":
             run_multi_perspective("ChatGPT", ask_chatgpt, data_context)
+
+    st.subheader("💴 結果照合（過去レース限定・任意実行）")
+    st.caption("予想後にボタンを押すと、結果・払戻ページを参照して的中と回収金額を計算します。")
+    if st.button("結果ページで的中チェックを実行"):
+        if not race_id:
+            st.warning("Race IDを入力してください。")
+        else:
+            result_payload = scraper.scrape_race_result_page(race_id)
+            if not result_payload.get("ok"):
+                st.error("結果ページの取得に失敗しました。過去レースIDかどうかを確認してください。")
+            else:
+                payouts = result_payload.get("payouts", {})
+                if not payouts:
+                    st.warning("払戻情報を取得できませんでした。")
+                else:
+                    st.success(f"結果ページを確認しました: {result_payload.get('url')}")
+
+                    for model_name, pred in st.session_state.latest_predictions.items():
+                        if pred.get("race_id") != race_id:
+                            continue
+
+                        bets = pred.get("bets", [])
+                        if not bets:
+                            st.info(f"{model_name}: 買い目JSONが見つからないため、金額集計をスキップしました。")
+                            continue
+
+                        total_bet, total_return, hits, ticket_stats = calculate_return(bets, payouts)
+                        hit_rate = (hits / len(bets) * 100) if bets else 0
+                        return_rate = (total_return / total_bet * 100) if total_bet > 0 else 0
+                        reflection = build_reflection_text(bets, payouts)
+
+                        st.markdown(f"#### {model_name} 的中結果")
+                        st.write(f"購入合計: {total_bet}円 / 払戻合計: {total_return}円 / 回収率: {return_rate:.1f}% / 的中率: {hit_rate:.1f}%")
+                        if ticket_stats:
+                            ticket_df = pd.DataFrame.from_dict(ticket_stats, orient='index').reset_index().rename(
+                                columns={"index": "券種", "bet": "購入額", "return": "払戻額", "hits": "的中数"}
+                            )
+                            ticket_df["回収率"] = (ticket_df["払戻額"] / ticket_df["購入額"] * 100).fillna(0).round(1).astype(str) + "%"
+                            st.dataframe(ticket_df, use_container_width=True)
+
+                        st.markdown("**次回予想に活かす振り返り**")
+                        st.write(reflection)
