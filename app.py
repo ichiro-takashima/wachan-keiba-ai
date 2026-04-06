@@ -675,6 +675,8 @@ if "custom_ticket_requests" not in st.session_state:
     st.session_state.custom_ticket_requests = [create_ticket_request()]
 if "analysis_results" not in st.session_state:
     st.session_state.analysis_results = {}
+if "past_trend_df" not in st.session_state:
+    st.session_state.past_trend_df = None
 
 # --- AI予想開始ボタン ---
 if st.button("データ取得開始"):
@@ -714,12 +716,14 @@ if st.button("データ取得開始"):
                 status_text.write("📊 出馬表（レース情報）を取得中...")
                 shutuba_df = scraper.scrape_shutuba_table(race_id)
                 race_info = scraper.scrape_race_info(race_id)
+                past_trend_df = scraper.scrape_past_top3_trend(race_id, years=5)
 
                 # データをセッションに保存して再起動
                 st.session_state.all_horse_data = temp_horse_data
                 st.session_state.pedigree_list = temp_pedigree_list
                 st.session_state.shutuba_table = shutuba_df
                 st.session_state.race_info = race_info
+                st.session_state.past_trend_df = past_trend_df
                 st.session_state.chat_messages = [] # 別のレースを予想する際にチャット履歴をリセット
                 st.session_state.analysis_results = {}
                 st.rerun()
@@ -737,6 +741,11 @@ if st.session_state.all_horse_data:
     if st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:
         st.subheader("📊 本レース出馬表（馬番・騎手・斤量など）")
         st.dataframe(st.session_state.shutuba_table, use_container_width=True)
+
+    if st.session_state.past_trend_df is not None and not st.session_state.past_trend_df.empty:
+        st.subheader("🕰️ 同レース過去5年（1〜3着の傾向）")
+        st.caption("馬番・騎手・コーナー通過順・人気を重点表示")
+        st.dataframe(st.session_state.past_trend_df, use_container_width=True)
 
     # ① 出馬表（血統情報）
     st.subheader("🧬 出馬表（血統情報）")
@@ -842,6 +851,27 @@ if st.session_state.all_horse_data:
 {race_pace_prediction}
 
 【出走馬詳細】"""
+
+    if st.session_state.past_trend_df is not None and not st.session_state.past_trend_df.empty:
+        trend_df = st.session_state.past_trend_df.copy()
+        trend_df["着順_num"] = pd.to_numeric(trend_df["着順"].astype(str).str.extract(r"(\d+)")[0], errors="coerce")
+        trend_df["人気_num"] = pd.to_numeric(trend_df["人気"].astype(str).str.extract(r"(\d+)")[0], errors="coerce")
+
+        win_df = trend_df[trend_df["着順_num"] == 1]
+        avg_win_pop = win_df["人気_num"].dropna().mean() if not win_df.empty else None
+        common_umaban = trend_df["馬番"].value_counts().head(3).to_dict()
+
+        trend_summary = []
+        if avg_win_pop is not None:
+            trend_summary.append(f"過去5年の勝ち馬人気平均: {avg_win_pop:.2f}")
+        if common_umaban:
+            trend_summary.append(f"馬番出現上位: {common_umaban}")
+
+        data_context += "\n\n【同レース過去5年（1〜3着）】\n"
+        data_context += trend_df[["年", "着順", "馬番", "騎手", "通過", "人気"]].to_csv(index=False, sep='|')
+        if trend_summary:
+            data_context += "要約: " + " / ".join(trend_summary) + "\n"
+        data_context += "この過去傾向（馬番・騎手・通過・人気）を今回予想の根拠として優先的に評価してください。\n"
 
     # 取得した出馬表（騎手や斤量）のデータをAIプロンプトに追加
     if st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:

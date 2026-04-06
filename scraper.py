@@ -421,3 +421,102 @@ def get_race_date(race_id):
         if match: return f"{match.group(1)}/{match.group(2).zfill(2)}/{match.group(3).zfill(2)}"
     except Exception: pass
     return pd.Timestamp.now().strftime("%Y/%m/%d")
+
+
+def scrape_past_top3_trend(race_id, years=5):
+    """
+    race.netkeiba の「過去10年」ページから、直近 years 年分の
+    1〜3着馬データ（馬番・騎手・通過・人気）を抽出する。
+    """
+    if not race_id:
+        return pd.DataFrame()
+
+    target_url = f"https://race.netkeiba.com/race/past10.html?race_id={race_id}&rf=race_submenu"
+    fallback_url = f"https://db.netkeiba.com/race/{race_id}/"
+
+    candidate_dfs = []
+    try:
+        time.sleep(1)
+        response = session.get(target_url, headers=HEADERS, timeout=12)
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or "utf-8"
+        candidate_dfs = pd.read_html(io.StringIO(response.text))
+    except Exception:
+        candidate_dfs = []
+
+    # past10ページ取得に失敗した場合は、対象レースIDを基準に過去年の同レースを補完収集
+    if not candidate_dfs:
+        try:
+            year = int(str(race_id)[:4])
+            rest_id = str(race_id)[4:]
+        except Exception:
+            return pd.DataFrame()
+
+        rows = []
+        for y in range(year - 1, year - years - 1, -1):
+            hist_race_id = f"{y}{rest_id}"
+            try:
+                time.sleep(0.7)
+                res = session.get(fallback_url.replace(race_id, hist_race_id), headers=HEADERS, timeout=12)
+                res.encoding = "euc-jp"
+                dfs = pd.read_html(io.StringIO(res.text))
+                if not dfs:
+                    continue
+                race_df = _prepare_race_result_df(dfs[0])
+                for place in [1, 2, 3]:
+                    rank_df = race_df[race_df["着順"].astype(str).str.extract(r"(\d+)")[0] == str(place)]
+                    if rank_df.empty:
+                        continue
+                    r = rank_df.iloc[0]
+                    rows.append({
+                        "年": y,
+                        "着順": place,
+                        "馬番": str(r.get("馬番", "")),
+                        "騎手": str(r.get("騎手", "")),
+                        "通過": str(r.get("通過", "")),
+                        "人気": str(r.get("人気", "")),
+                    })
+            except Exception:
+                continue
+        return pd.DataFrame(rows)
+
+    target_df = None
+    for df in candidate_dfs:
+        prepared = _prepare_race_result_df(df)
+        has_cols = {"着順", "馬番", "騎手", "通過", "人気"}
+        if has_cols.issubset(set(prepared.columns)):
+            target_df = prepared.copy()
+            break
+    if target_df is None:
+        return pd.DataFrame()
+
+    # 年情報の特定（「年」「日付」等の揺れに対応）
+    year_col = None
+    for c in target_df.columns:
+        n = _normalize_label(c)
+        if n in {"年", "年度", "日付", "開催日"}:
+            year_col = c
+            break
+    if year_col is None:
+        # 年列が無い場合は入力レースIDの前年から逆算
+        try:
+            base_year = int(str(race_id)[:4])
+            target_df["年"] = [base_year - 1 - i for i in range(len(target_df))]
+            year_col = "年"
+        except Exception:
+            return pd.DataFrame()
+
+    work = target_df.copy()
+    work["年"] = work[year_col].astype(str).str.extract(r"(\d{4})")[0]
+    work = work.dropna(subset=["年"])
+    work["年"] = work["年"].astype(int)
+
+    work["着順_num"] = pd.to_numeric(work["着順"].astype(str).str.extract(r"(\d+)")[0], errors="coerce")
+    work = work[work["着順_num"].isin([1, 2, 3])]
+
+    latest_years = sorted(work["年"].unique(), reverse=True)[: max(1, int(years))]
+    work = work[work["年"].isin(latest_years)]
+
+    result = work[["年", "着順", "馬番", "騎手", "通過", "人気"]].copy()
+    result = result.sort_values(["年", "着順"], ascending=[False, True]).reset_index(drop=True)
+    return result
