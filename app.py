@@ -13,6 +13,14 @@ import csv
 import scraper
 from datetime import datetime
 
+# --- カスタムCSSの読み込み ---
+def load_css(file_name):
+    if os.path.exists(file_name):
+        with open(file_name, "r", encoding="utf-8") as f:
+            st.markdown(f'<style>{f.read()}</style>', unsafe_allow_html=True)
+
+load_css("style.css")
+
 # --- 設定 ---
 TARGET_MODEL = "gemini-2.5-flash"
 # コマンドプロンプトで setx した値を取得
@@ -545,7 +553,8 @@ st.title("🏇 わーちゃんのレース予想AI")
 race_id = st.text_input("Race IDを入力 (例: 202405020811)")
 prediction_date = st.date_input(
     "予想の基準日（この日より前のデータのみ使用）", 
-    value=pd.Timestamp.now()
+    value=pd.Timestamp.now(),
+    min_value=pd.Timestamp("1980-01-01")
 )
 budget = st.number_input("予算 (円)", value=1000)
 
@@ -560,6 +569,8 @@ if "latest_predictions" not in st.session_state:
     st.session_state.latest_predictions = {}
 if "result_check_cache" not in st.session_state:
     st.session_state.result_check_cache = {}
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = []
 
 # --- AI予想開始ボタン ---
 if st.button("AI予想を開始"):
@@ -603,6 +614,7 @@ if st.button("AI予想を開始"):
                 st.session_state.all_horse_data = temp_horse_data
                 st.session_state.pedigree_list = temp_pedigree_list
                 st.session_state.shutuba_table = shutuba_df
+                st.session_state.chat_messages = [] # 別のレースを予想する際にチャット履歴をリセット
                 st.rerun()
 
 # --- ここから表示フェーズ（データがあるときだけ自動で表示される） ---
@@ -865,6 +877,40 @@ if st.session_state.all_horse_data:
 
         if ai_choice == "ChatGPT" or ai_choice == "両方で比較":
             run_multi_perspective("ChatGPT", ask_chatgpt, data_context)
+
+    # --- 💬 AIと相談機能の追加 ---
+    st.markdown("---")
+    st.subheader("💬 AIアシスタントと相談して決める")
+    st.caption("集めたデータや予想結果をもとに、AIアシスタントと対話しながら最終的な買い目を検討できます。")
+    
+    for msg in st.session_state.chat_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            
+    if chat_prompt := st.chat_input(""):
+        st.session_state.chat_messages.append({"role": "user", "content": chat_prompt})
+        with st.chat_message("user"):
+            st.markdown(chat_prompt)
+            
+        with st.chat_message("assistant"):
+            with st.spinner("考え中..."):
+                chat_context = "あなたは優秀な競馬予想アシスタントです。ユーザーの質問に答え、相談に乗りながら最適な買い目を検討してください。\n\n"
+                chat_context += f"【対象レースのデータ・コンテキスト】\n{data_context}\n\n"
+                chat_context += "【これまでの会話】\n"
+                for m in st.session_state.chat_messages[:-1]:
+                    role_name = "ユーザー" if m["role"] == "user" else "アシスタント"
+                    chat_context += f"{role_name}: {m['content']}\n"
+                chat_context += f"ユーザー: {chat_prompt}\nアシスタント:"
+                
+                try:
+                    # 「両方で比較」を選んでいる場合はGeminiが応答します
+                    chat_ai = "ChatGPT" if ai_choice == "ChatGPT" else "Gemini"
+                    response = ask_chatgpt(chat_context) if chat_ai == "ChatGPT" else ask_gemini(chat_context)
+                        
+                    st.markdown(response)
+                    st.session_state.chat_messages.append({"role": "assistant", "content": response})
+                except Exception as e:
+                    st.error(f"返答の生成中にエラーが発生しました: {e}")
 
     st.subheader("💴 結果照合（過去レース限定・任意実行）")
     st.caption("予想後にボタンを押すと、結果・払戻ページを参照して的中と回収金額を計算します。")

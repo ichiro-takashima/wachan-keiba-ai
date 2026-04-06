@@ -1,0 +1,51 @@
+/* アプリ全体の背景色やフォント設定 */
+.stApp {
+    font-family: 'Helvetica Neue', Arial, 'Hiragino Kaku Gothic ProN', 'Hiragino Sans', Meiryo, sans-serif;
+    background-color: #F8F9FA;
+    color: #2C3E50;
+}
+
+/* ボタンのデザインをモダンにする */
+.stButton > button {
+    background-color: #2980B9;
+    color: white;
+    border-radius: 8px;
+    border: none;
+    padding: 10px 24px;
+    font-weight: bold;
+    transition: all 0.2s ease-in-out;
+}
+
+.stButton > button:hover {
+    background-color: #1A5276;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+    transform: translateY(-2px);
+    color: white;
+}
+
+/* データフレーム（表）の周りに影をつけて浮き上がらせる */
+[data-testid="stDataFrame"] {
+    background-color: white;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+    padding: 10px;
+}
+
+/* サイドバーのデザイン */
+[data-testid="stSidebar"] {
+    background-color: #ffffff;
+    border-right: 1px solid #e1e4e8;
+}
+
+/* エクスパンダー（折りたたみ）の見出し */
+.streamlit-expanderHeader {
+    font-weight: bold;
+    color: #2c3e50;
+    background-color: #f8f9fa;
+    border-radius: 6px;
+}
+
+/* テキスト入力枠などのデザイン調整 */
+.stTextInput > div > div > input {
+    border-radius: 6px;
+}
