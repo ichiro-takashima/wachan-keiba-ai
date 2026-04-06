@@ -252,6 +252,77 @@ def normalize_combo(combo, ticket_type):
     return normalized
 
 
+TICKET_TYPE_OPTIONS = ["単勝", "複勝", "枠連", "馬連", "ワイド", "馬単", "3連複", "3連単"]
+COMBO_COUNT_REQUIRED_TYPES = {"枠連", "馬連", "ワイド", "馬単", "3連複", "3連単"}
+
+
+def create_ticket_request():
+    return {"ticket_type": "ワイド", "budget": 500, "combo_count": 3}
+
+
+def ticket_type_requires_combo_count(ticket_type):
+    return ticket_type in COMBO_COUNT_REQUIRED_TYPES
+
+
+def build_ticket_plan_text(plan_mode, ticket_requests, fallback_budget):
+    if plan_mode != "カスタム":
+        return (
+            "波乱度の判定に基づき、必ず以下のルールで買い目を構築してください。\n"
+            "・判定が「堅い」の場合: 上位2頭を軸にした3連複2頭軸流しを提案すること。\n"
+            "・判定が「標準」の場合: 馬連4頭BOX（6点）と、それに対応する3連複フォーメーションを提案すること。\n"
+            "・判定が「荒れる」の場合: 単勝2点と、その穴馬から上位人気へのワイド流しを提案すること。\n"
+            "・金額配分は100円単位で、合計は予算以内に収めること。"
+        ), fallback_budget
+
+    valid_requests = []
+    for req in ticket_requests:
+        ticket_type = req.get("ticket_type")
+        request_budget = int(req.get("budget", 0) or 0)
+        combo_count = int(req.get("combo_count", 0) or 0)
+        if not ticket_type or request_budget <= 0:
+            continue
+        valid_requests.append({
+            "ticket_type": ticket_type,
+            "budget": request_budget,
+            "combo_count": combo_count
+        })
+
+    total_budget = sum(req["budget"] for req in valid_requests)
+    lines = ["ユーザーの買い方希望に従って、以下の条件を満たす買い目を提案してください。"]
+    for idx, req in enumerate(valid_requests, start=1):
+        line = f"・条件{idx}: {req['ticket_type']}を{req['budget']}円分"
+        if ticket_type_requires_combo_count(req["ticket_type"]):
+            line += f"、組数は{req['combo_count']}点ちょうど"
+        lines.append(line)
+    lines.extend([
+        "・上記で指定された券種以外は提案しないこと。",
+        "・各条件の予算を超えないこと。",
+        "・組数指定がある券種は、指定された組数ちょうどで買い目を構成すること。",
+        "・金額配分は100円単位にすること。"
+    ])
+    return "\n".join(lines), total_budget
+
+
+def format_ticket_plan_for_context(plan_mode, ticket_requests, fallback_budget):
+    if plan_mode != "カスタム":
+        return f"買い方希望: なし（おまかせ）。全体予算{fallback_budget}円で、現在の予想モデルに基づいて提案。"
+
+    valid_requests = []
+    for req in ticket_requests:
+        ticket_type = req.get("ticket_type")
+        request_budget = int(req.get("budget", 0) or 0)
+        combo_count = int(req.get("combo_count", 0) or 0)
+        if not ticket_type or request_budget <= 0:
+            continue
+        line = f"・{ticket_type}: {request_budget}円"
+        if ticket_type_requires_combo_count(ticket_type):
+            line += f" / {combo_count}点"
+        valid_requests.append(line)
+
+    total_budget = sum(int(req.get("budget", 0) or 0) for req in ticket_requests)
+    return "買い方希望:\n" + "\n".join(valid_requests) + f"\n合計予算: {total_budget}円"
+
+
 def calculate_return(bets, payouts):
     total_bet, total_return, hits = 0, 0, 0
     ticket_stats = {}
@@ -443,12 +514,14 @@ if app_mode == "バックテスト":
                 prog_text.write(f"検証中: レースID {r_id} ({i+1}/{len(bt_race_ids)})")
                 race_date = get_race_date(r_id)
                 payouts = scrape_payouts(r_id)
+                race_info = scraper.scrape_race_info(r_id)
                 h_ids = scraper.get_horse_ids_from_race(r_id)
                 if not h_ids: continue
                 
                 h_ids = h_ids[:bt_max_horses] # トークン節約のため頭数を絞る
                     
                 ctx = f"【レースID】{r_id} 【レース日】{race_date}\n"
+                ctx += f"【レース名】{race_info['name']} 【条件】{race_info['data']}\n"
                 shutuba_df = scraper.scrape_shutuba_table(r_id)
                 if not shutuba_df.empty: ctx += "[出馬表]\n" + shutuba_df.to_csv(index=False, sep='|') + "\n"
                     
@@ -571,9 +644,15 @@ if "result_check_cache" not in st.session_state:
     st.session_state.result_check_cache = {}
 if "chat_messages" not in st.session_state:
     st.session_state.chat_messages = []
+if "race_info" not in st.session_state:
+    st.session_state.race_info = None
+if "bet_plan_mode" not in st.session_state:
+    st.session_state.bet_plan_mode = "おまかせ"
+if "custom_ticket_requests" not in st.session_state:
+    st.session_state.custom_ticket_requests = [create_ticket_request()]
 
 # --- AI予想開始ボタン ---
-if st.button("AI予想を開始"):
+if st.button("データ取得開始"):
     if not API_KEY_GEMINI:
         st.error("APIキーがありません")
     elif not race_id:
@@ -609,16 +688,25 @@ if st.button("AI予想を開始"):
                 # 出馬表のスクレイピングを実行
                 status_text.write("📊 出馬表（レース情報）を取得中...")
                 shutuba_df = scraper.scrape_shutuba_table(race_id)
+                race_info = scraper.scrape_race_info(race_id)
 
                 # データをセッションに保存して再起動
                 st.session_state.all_horse_data = temp_horse_data
                 st.session_state.pedigree_list = temp_pedigree_list
                 st.session_state.shutuba_table = shutuba_df
+                st.session_state.race_info = race_info
                 st.session_state.chat_messages = [] # 別のレースを予想する際にチャット履歴をリセット
                 st.rerun()
 
 # --- ここから表示フェーズ（データがあるときだけ自動で表示される） ---
 if st.session_state.all_horse_data:
+    # 🆕 レース情報の表示
+    if st.session_state.race_info:
+        r_info = st.session_state.race_info
+        st.markdown(f"## 🏆 {r_info['name']}")
+        st.markdown(f"**{r_info['data']}**")
+        st.markdown("---")
+
     # 🆕 取得した公式出馬表の表示
     if st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:
         st.subheader("📊 本レース出馬表（馬番・騎手・斤量など）")
@@ -704,22 +792,108 @@ if st.session_state.all_horse_data:
             else:
                 st.write("戦績データがありません。")
 
-    # ③ AIによる分析
     st.subheader(f"🤖 {ai_choice} によるレース分析")
-    
-    # ユーザーの意見を入力するボックスを追加
-    user_opinion = st.text_area("✍️ あなたの予想・注目馬（AIへの指示や意見があれば入力してください）", placeholder="例: 1番の馬の逃げ残りに期待。雨が降っているので外枠有利。")
+    st.markdown("#### 買い方設定")
+    bet_plan_mode = st.radio(
+        "買い方を選んでください",
+        ["おまかせ", "カスタム"],
+        key="bet_plan_mode",
+        horizontal=True
+    )
 
-    # --- プロンプト用データコンテキスト生成 ---
+    if bet_plan_mode == "カスタム":
+        st.caption("券種ごとの条件を追加できます。枠連・馬連・ワイド・馬単・3連複・3連単は組数も指定できます。")
+        remove_request_index = None
+        for idx, req in enumerate(st.session_state.custom_ticket_requests):
+            st.markdown(f"**条件 {idx + 1}**")
+            cols = st.columns([1.7, 1.1, 1.1, 0.8])
+            default_type = req.get("ticket_type", "ワイド")
+            ticket_type = cols[0].selectbox(
+                "券種",
+                TICKET_TYPE_OPTIONS,
+                index=TICKET_TYPE_OPTIONS.index(default_type) if default_type in TICKET_TYPE_OPTIONS else 0,
+                key=f"ticket_type_{idx}"
+            )
+            request_budget = cols[1].number_input(
+                "予算 (円)",
+                min_value=100,
+                step=100,
+                value=int(req.get("budget", 500) or 500),
+                key=f"ticket_budget_{idx}"
+            )
+            if ticket_type_requires_combo_count(ticket_type):
+                combo_count = cols[2].number_input(
+                    "組数",
+                    min_value=1,
+                    step=1,
+                    value=int(req.get("combo_count", 3) or 3),
+                    key=f"ticket_combo_{idx}"
+                )
+            else:
+                cols[2].markdown("組数指定なし")
+                combo_count = 0
+            if cols[3].button("削除", key=f"remove_ticket_{idx}"):
+                remove_request_index = idx
+
+            st.session_state.custom_ticket_requests[idx] = {
+                "ticket_type": ticket_type,
+                "budget": int(request_budget),
+                "combo_count": int(combo_count)
+            }
+
+        action_cols = st.columns(2)
+        if action_cols[0].button("条件を追加", key="add_ticket_request"):
+            st.session_state.custom_ticket_requests.append(create_ticket_request())
+            st.rerun()
+        if action_cols[1].button("最後の条件を削除", key="remove_last_ticket_request"):
+            if len(st.session_state.custom_ticket_requests) > 1:
+                st.session_state.custom_ticket_requests.pop()
+                st.rerun()
+
+        if remove_request_index is not None:
+            st.session_state.custom_ticket_requests.pop(remove_request_index)
+            if not st.session_state.custom_ticket_requests:
+                st.session_state.custom_ticket_requests = [create_ticket_request()]
+            st.rerun()
+
+        custom_total_budget = sum(req.get("budget", 0) for req in st.session_state.custom_ticket_requests)
+        st.info(f"カスタム条件の合計予算: {custom_total_budget}円")
+        if custom_total_budget != budget:
+            st.caption(f"上の全体予算は {budget}円ですが、カスタム条件の合計 {custom_total_budget}円 を優先して買い目提案に使います。")
+    else:
+        st.caption("買い方希望がない場合はこちら。現状の予想モデルで券種と配分をおまかせ提案します。")
+
+    user_opinion = st.text_area(
+        "✍️ あなたの予想・注目馬（AIへの指示や意見があれば入力してください）",
+        placeholder="例: 1番の馬の逃げ残りに期待。雨が降っているので外枠有利。"
+    )
+
+    ticket_plan_text, effective_budget = build_ticket_plan_text(
+        bet_plan_mode,
+        st.session_state.custom_ticket_requests,
+        budget
+    )
+    ticket_plan_context = format_ticket_plan_for_context(
+        bet_plan_mode,
+        st.session_state.custom_ticket_requests,
+        budget
+    )
+
+    r_info = st.session_state.race_info or {"name": "不明", "data": "不明"}
     data_context = f"""---
 【レース基本情報】
 ・対象レースID: {race_id}
+・レース名: {r_info['name']}
+・コース・天候等: {r_info['data']}
 """
 
     if user_opinion.strip():
         data_context += f"\n【ユーザーからの特記事項・予想意見】\n{user_opinion}\n※上記のユーザー意見を、今回の予想の重要な根拠の一つとして加味してください。\n"
 
     data_context += f"""
+
+【買い方希望】
+{ticket_plan_context}
 
 【システム展開予想】
 {race_pace_prediction}
@@ -776,7 +950,11 @@ if st.session_state.all_horse_data:
             
         data_context += short_df.head(5).to_csv(index=False, header=False, sep=',')
     
-    if st.button("AI多角分析を実行"):
+    if st.button("AI予想を実行"):
+        if bet_plan_mode == "カスタム" and effective_budget <= 0:
+            st.warning("カスタムの買い方条件を1件以上、予算ありで設定してください。")
+            st.stop()
+
         def run_multi_perspective(ai_name, ask_func, context):
             perspectives = [
                 ("🩸 血統重視", "「血統（父、母、母父の傾向や血統背景）」を最重視"),
@@ -827,17 +1005,14 @@ if st.session_state.all_horse_data:
 1. 分析の共通項（どの馬が複数の視点で高く評価されているか、その理由）
 2. 最終的な総合予想印（◎, ○, ▲, △, 注, 消）と総合評価の根拠
 3. レースの波乱度判定（「堅い」「標準」「荒れる」のいずれか）とその理由
-4. 予算{budget}円の範囲での具体的な買い目（馬券種、組み合わせ（すべて馬番で書くこと）、金額配分）と、その買い方を選んだ理由
+4. 予算{effective_budget}円の範囲での具体的な買い目（馬券種、組み合わせ（すべて馬番で書くこと）、金額配分）と、その買い方を選んだ理由
 5. 買い目データ（※システムの自動集計用。必ず以下のJSONフォーマットでテキストの最後に記述すること）
 ```json
 {{ "bets": [ {{"type": "馬連", "combo": "1-2", "amount": 500}} ] }}
 ```
 
 【買い目構築ルール】
-波乱度の判定に基づき、必ず以下のルールで買い目を構築してください。
-・判定が「堅い」場合：上位2頭を軸にした三連複2頭軸流しを提案せよ。
-・判定が「標準」場合：馬連4頭BOX（6点）と、それに対応する三連複フォーメーションを提案せよ。
-・判定が「荒れる」場合：単勝2点と、その穴馬から上位人気へのワイド流しを提案せよ。
+{ticket_plan_text}
 """
                 try:
                     final_res = ask_func(summary_prompt)
@@ -849,7 +1024,7 @@ if st.session_state.all_horse_data:
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         race_id,
                         ai_name,
-                        budget,
+                        effective_budget,
                         summary_prompt,
                         final_res
                     ]
