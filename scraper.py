@@ -79,6 +79,42 @@ def _infer_special_columns(df):
                 break
     return df
 
+def _repair_shifted_finish_columns(df):
+    """
+    netkeibaの一部テーブルで、列見出しが1～2列分ずれて
+    「上り」「馬体重」が「勝ち馬(2着馬)」「賞金」に入ることがあるため補正する。
+    """
+    required_cols = ["上り", "馬体重", "勝ち馬(2着馬)", "賞金"]
+    if not all(col in df.columns for col in required_cols):
+        return df
+
+    up_col = df["上り"].astype(str).str.strip()
+    winner_col = df["勝ち馬(2着馬)"].astype(str).str.strip()
+    body_col = df["馬体重"].astype(str).str.strip()
+    prize_col = df["賞金"].astype(str).str.strip()
+
+    # 上りは通常「34.1」のような小数、勝ち馬(2着馬)は通常文字列（馬名）
+    up_pattern = r"^\d{2}\.\d$"
+    winner_shifted = winner_col.str.match(up_pattern, na=False).mean() >= 0.6
+    up_missing = (~up_col.str.match(up_pattern, na=False)).mean() >= 0.6
+
+    # 馬体重は通常「516(+6)」の形式、賞金は整数/小数が多い
+    body_pattern = r"^\d{3,4}\([+-]?\d+\)$"
+    body_shifted = prize_col.str.match(body_pattern, na=False).mean() >= 0.6
+    body_missing = (~body_col.str.match(body_pattern, na=False)).mean() >= 0.6
+
+    if winner_shifted and up_missing:
+        df = df.copy()
+        df["上り"] = df["勝ち馬(2着馬)"]
+        # 馬名列だった元カラムは不明値に戻す
+        df["勝ち馬(2着馬)"] = pd.NA
+
+    if body_shifted and body_missing:
+        df = df.copy()
+        df["馬体重"] = df["賞金"]
+        df["賞金"] = pd.NA
+
+    return df
 
 def _prepare_race_result_df(df):
     alias_map = {
@@ -110,6 +146,7 @@ def _prepare_race_result_df(df):
     df = _flatten_columns(df)
     df = _rename_columns(df, alias_map)
     df = _infer_special_columns(df)
+    df = _repair_shifted_finish_columns(df)
     return df
 
 

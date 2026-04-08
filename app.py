@@ -165,77 +165,6 @@ def analyze_track_preference(results_df):
     elif good_track_in_money > 0: return "馬場不問"
     else: return "傾向なし"
 
-def calculate_base_score(results_df, pace_prediction):
-    """脚質、過去実績、近走着順から基礎スコアと関連情報を算出する"""
-    default_return = {
-        "score": 0.0,
-        "detail": "0点 (データなし)",
-        "running_style": "不明",
-        "track_preference": "データなし"
-    }
-    if results_df is None or results_df.empty:
-        return default_return
-
-    try:
-        style = analyze_running_style(results_df)
-        track_pref = analyze_track_preference(results_df)
-
-        score = 0
-        details = []
-
-        # 1. 近走着順スコア (Max 50点)
-        recent_score = 0
-        rank_col = _find_matching_column(results_df, ['着順', '着'])
-        if rank_col:
-            recent_5 = results_df[rank_col].dropna().head(5)
-            for rank in recent_5:
-                match = re.search(r'(\d+)', str(rank))
-                if match:
-                    r = int(match.group(1))
-                    if r == 1: recent_score += 10
-                    elif r == 2: recent_score += 8
-                    elif r == 3: recent_score += 6
-                    elif r == 4: recent_score += 4
-                    elif r == 5: recent_score += 2
-        recent_score = min(recent_score, 50)
-        score += recent_score
-        details.append(f"近走:{recent_score}")
-
-        # 2. 通算実績スコア (Max 20点)
-        track_score = 0
-        if rank_col:
-            in_money = 0
-            for rank in results_df[rank_col]:
-                match = re.search(r'(\d+)', str(rank))
-                if match and int(match.group(1)) <= 3:
-                    in_money += 1
-            track_score = min(in_money * 5, 20)
-        score += track_score
-        details.append(f"実績:{track_score}")
-
-        # 3. 展開マッチスコア (Max 30点)
-        pace_score = 0
-        if style != "不明":
-            if "ハイペース" in pace_prediction:
-                pace_score = 30 if style in ["差し", "追込"] else 10
-            elif "スローペース" in pace_prediction:
-                pace_score = 30 if style in ["逃げ", "先行"] else 10
-            else: # ミドルペース
-                pace_score = 20
-        score += pace_score
-        details.append(f"展開:{pace_score}")
-
-        return {
-            "score": float(score),
-            "detail": f"{score}点 ({', '.join(details)})",
-            "running_style": style,
-            "track_preference": track_pref
-        }
-    except Exception as e:
-        st.warning(f"基礎スコアの計算中にエラーが発生しました: {e}")
-        return default_return
-
-
 def normalize_ticket_type(t):
     return str(t).replace("三連", "3連").strip()
 
@@ -529,23 +458,8 @@ if app_mode == "バックテスト":
                         res_df = res_df[res_df['日付'] < pd.Timestamp(race_date)]
                     horses_data.append({"id": hid, "pedigree": ped, "results": res_df})
                 
-                all_running_styles = []
-                for horse in horses_data:
-                    if not horse['results'].empty:
-                        style = analyze_running_style(horse['results'])
-                        all_running_styles.append(style)
-
-                num_front_runners = all_running_styles.count('逃げ')
-                num_leaders = all_running_styles.count('先行')
-                if num_front_runners >= 2 or (num_front_runners == 1 and num_leaders >= 3):
-                    race_pace_prediction = "ハイペース予想。複数の逃げ・先行馬が競り合い、前方の争いが激化しそうです。これにより、後半に脚を溜められる差し・追込馬に有利な展開となる可能性があります。"
-                elif num_front_runners == 0 and num_leaders <= 2:
-                    race_pace_prediction = "スローペース予想。明確な逃げ馬がおらず、牽制しあって落ち着いた流れになりそうです。瞬発力や決め手のある馬が有利で、前残りの展開も考えられます。"
-                else:
-                    race_pace_prediction = "ミドルペース予想。平均的なペース構成で、各馬の実力がストレートに反映されやすいでしょう。"
-
                 ctx = f"--- \n【レース基本情報】\n・対象レースID: {r_id}\n・レース名: {race_info['name']}\n・コース・天候等: {race_info['data']}\n\n"
-                ctx += f"【システム展開予想】\n{race_pace_prediction}\n\n【出走馬詳細】\n"
+                ctx += "【出走馬詳細】\n"
 
                 shutuba_df = scraper.scrape_shutuba_table(r_id)
                 if not shutuba_df.empty:
@@ -554,8 +468,6 @@ if app_mode == "バックテスト":
                 for horse in horses_data:
                     ped = horse['pedigree']
                     res_df = horse['results']
-                    score_info = calculate_base_score(res_df, race_pace_prediction)
-                    
                     ctx += f"\n[{ped['name']}] 父:{ped['sire']} 母父:{ped['broodmare_sire']}\n"
                     if res_df.empty:
                         ctx += "データなし\n"
@@ -567,7 +479,9 @@ if app_mode == "バックテスト":
                         weight = re.match(r'(\d+)', str(latest_weight_str))
                         if weight: weight_info = f" 体重:{weight.group(1)}"
 
-                    ctx += f"脚質:{score_info['running_style']} 馬場:{score_info['track_preference']}{weight_info} 基礎スコア:{score_info['detail']}\n"
+                    running_style = analyze_running_style(res_df)
+                    track_preference = analyze_track_preference(res_df)
+                    ctx += f"脚質:{running_style} 馬場:{track_preference}{weight_info}\n"
                     
                     existing_cols = _get_available_columns(res_df, [
                         ['日付'],
@@ -746,73 +660,14 @@ if st.session_state.all_horse_data:
     })
     st.dataframe(df_pedigree, use_container_width=True)
 
-    # --- 展開予想ロジック（表示とAIプロンプトで共通使用） ---
-    all_running_styles = []
-    for horse in st.session_state.all_horse_data:
-        if not horse['results'].empty:
-            style = analyze_running_style(horse['results'])
-            all_running_styles.append(style)
-
-    num_front_runners = all_running_styles.count('逃げ')
-    num_leaders = all_running_styles.count('先行')
-    if num_front_runners >= 2 or (num_front_runners == 1 and num_leaders >= 3):
-        race_pace_prediction = "ハイペース予想。複数の逃げ・先行馬が競り合い、前方の争いが激化しそうです。これにより、後半に脚を溜められる差し・追込馬に有利な展開となる可能性があります。"
-    elif num_front_runners == 0 and num_leaders <= 2:
-        race_pace_prediction = "スローペース予想。明確な逃げ馬がおらず、牽制しあって落ち着いた流れになりそうです。瞬発力や決め手のある馬が有利で、前残りの展開も考えられます。"
-    else:
-        race_pace_prediction = "ミドルペース予想。平均的なペース構成で、各馬の実力がストレートに反映されやすいでしょう。"
-
-    st.info(f"🏁 **システム展開予想:** {race_pace_prediction}")
-
-    # ② 基礎スコアの計算と補完
-    for horse in st.session_state.all_horse_data:
-        if "base_score" not in horse or not isinstance(horse.get("base_score"), dict):
-            horse["base_score"] = calculate_base_score(horse['results'], race_pace_prediction)
-
-    # ③ 基礎スコア一覧表の表示
-    score_data = []
-    for horse in st.session_state.all_horse_data:
-        shutuba_info = {}
-        if st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:
-            horse_name = horse['pedigree']['name']
-            entry = st.session_state.shutuba_table[st.session_state.shutuba_table['馬名'] == horse_name]
-            if not entry.empty:
-                shutuba_info = entry.iloc[0].to_dict()
-
-        score_info = horse["base_score"]
-
-        last_corner = "-"
-        results_df = horse['results']
-        if results_df is not None and not results_df.empty:
-            corner_col = _find_matching_column(results_df, ['通過', 'コーナー通過順位', 'コーナー'])
-            if corner_col:
-                corner_pos_series = results_df[corner_col].dropna()
-                if not corner_pos_series.empty:
-                    last_corner = str(corner_pos_series.iloc[0])
-
-        score_data.append({
-            "馬番": shutuba_info.get("馬番", "-"),
-            "馬名": horse['pedigree']['name'],
-            "スコア": score_info['score'],
-            "詳細": score_info['detail'],
-            "脚質": score_info['running_style'],
-            "馬場適性": score_info['track_preference'],
-            "前走通過順": last_corner
-        })
-
-    if score_data:
-        st.subheader("📊 全馬基礎スコア一覧")
-        score_df = pd.DataFrame(score_data)
-        score_df['スコア'] = pd.to_numeric(score_df['スコア'], errors='coerce').fillna(0)
-        st.dataframe(score_df.sort_values("スコア", ascending=False), use_container_width=True)
-
-    # ④ 各馬の詳細情報
+    # 各馬の詳細情報
     st.subheader("🐎 各馬の詳細情報と直近戦績")
     for horse in st.session_state.all_horse_data:
-        score_info = horse["base_score"]
-        with st.expander(f"{horse['pedigree']['name']} (ID: {horse['id']}) - 基礎スコア: {score_info['score']:.0f}点"):
+        with st.expander(f"{horse['pedigree']['name']} (ID: {horse['id']})"):
+            running_style = analyze_running_style(horse['results'])
+            track_preference = analyze_track_preference(horse['results'])
             st.write(f"**父:** {horse['pedigree']['sire']} / **母:** {horse['pedigree']['dam']} / **母父:** {horse['pedigree']['broodmare_sire']}")
-            st.write(f"**📊 ルールベース基礎スコア:** {score_info['detail']} | **脚質:** {score_info['running_style']} | **馬場適性:** {score_info['track_preference']}")
+            st.write(f"**脚質:** {running_style} | **馬場適性:** {track_preference}")
             if not horse['results'].empty:
                 st.dataframe(horse['results'].head(5), use_container_width=True)
             else:
@@ -838,9 +693,6 @@ if st.session_state.all_horse_data:
 
     data_context += f"""
 
-【システム展開予想】
-{race_pace_prediction}
-
 【出走馬詳細】"""
 
     # 取得した出馬表（騎手や斤量）のデータをAIプロンプトに追加
@@ -851,7 +703,6 @@ if st.session_state.all_horse_data:
     for horse in st.session_state.all_horse_data:
         p = horse['pedigree']
         results_df = horse['results']
-        score_info = horse['base_score'] # 補完済みのスコア情報を利用
         data_context += f"\n[{p['name']}] 父:{p['sire']} 母父:{p['broodmare_sire']}\n"
         
         if results_df.empty:
@@ -864,7 +715,9 @@ if st.session_state.all_horse_data:
             weight = re.match(r'(\d+)', str(latest_weight_str))
             if weight: weight_info = f" 体重:{weight.group(1)}"
 
-        data_context += f"脚質:{score_info['running_style']} 馬場:{score_info['track_preference']}{weight_info} 基礎スコア:{score_info['detail']}\n"
+        running_style = analyze_running_style(results_df)
+        track_preference = analyze_track_preference(results_df)
+        data_context += f"脚質:{running_style} 馬場:{track_preference}{weight_info}\n"
         
         existing_cols = _get_available_columns(results_df, [
             ['日付'],
@@ -898,7 +751,7 @@ if st.session_state.all_horse_data:
             perspectives = [
                 ("🩸 血統重視", "「血統（父、母、母父の傾向や血統背景）」を最重視"),
                 ("📊 指数・データ重視", "「過去の戦績、着順、タイム、馬場適性、近走馬体重」を最重視"),
-                ("🏇 展開重視", "「脚質、枠順、システムによる展開予想、今回のメンバー構成（逃げ先行馬の数）」を最重視")
+                ("🏇 展開重視", "「脚質、枠順、今回のメンバー構成（逃げ先行馬の数）」を最重視")
             ]
             
             results_dict = {}
