@@ -183,14 +183,19 @@ def normalize_combo(combo, ticket_type):
 
 TICKET_TYPE_OPTIONS = ["単勝", "複勝", "枠連", "馬連", "ワイド", "馬単", "3連複", "3連単"]
 COMBO_COUNT_REQUIRED_TYPES = {"枠連", "馬連", "ワイド", "馬単", "3連複", "3連単"}
+BETTING_METHOD_OPTIONS = ["通常", "フォーメーション", "ながし", "ボックス"]
 
 
 def create_ticket_request():
-    return {"ticket_type": "ワイド", "budget": 500, "combo_count": 3}
+    return {"ticket_type": "ワイド", "budget": 500, "combo_count": 3, "betting_method": "通常"}
 
 
 def ticket_type_requires_combo_count(ticket_type):
     return ticket_type in COMBO_COUNT_REQUIRED_TYPES
+
+
+def ticket_type_supports_betting_method(ticket_type):
+    return ticket_type not in ["単勝", "複勝"]
 
 
 def build_ticket_plan_text(plan_mode, ticket_requests, fallback_budget):
@@ -208,24 +213,31 @@ def build_ticket_plan_text(plan_mode, ticket_requests, fallback_budget):
         ticket_type = req.get("ticket_type")
         request_budget = int(req.get("budget", 0) or 0)
         combo_count = int(req.get("combo_count", 0) or 0)
+        betting_method = req.get("betting_method", "通常")
         if not ticket_type or request_budget <= 0:
             continue
+        if betting_method not in BETTING_METHOD_OPTIONS:
+            betting_method = "通常"
         valid_requests.append({
             "ticket_type": ticket_type,
             "budget": request_budget,
-            "combo_count": combo_count
+            "combo_count": combo_count,
+            "betting_method": betting_method
         })
 
     total_budget = sum(req["budget"] for req in valid_requests)
     lines = ["ユーザーの買い方希望に従って、以下の条件を満たす買い目を提案してください。"]
     for idx, req in enumerate(valid_requests, start=1):
         line = f"・条件{idx}: {req['ticket_type']}を{req['budget']}円分"
+        if ticket_type_supports_betting_method(req["ticket_type"]):
+            line += f"、方式は{req['betting_method']}"
         if ticket_type_requires_combo_count(req["ticket_type"]):
             line += f"、組数は{req['combo_count']}点ちょうど"
         lines.append(line)
     lines.extend([
         "・上記で指定された券種以外は提案しないこと。",
         "・各条件の予算を超えないこと。",
+        "・券種ごとに指定された方式（通常／フォーメーション／ながし／ボックス）を守ること。",
         "・組数指定がある券種は、指定された組数ちょうどで買い目を構成すること。",
         "・金額配分は100円単位にすること。"
     ])
@@ -241,9 +253,14 @@ def format_ticket_plan_for_context(plan_mode, ticket_requests, fallback_budget):
         ticket_type = req.get("ticket_type")
         request_budget = int(req.get("budget", 0) or 0)
         combo_count = int(req.get("combo_count", 0) or 0)
+        betting_method = req.get("betting_method", "通常")
         if not ticket_type or request_budget <= 0:
             continue
         line = f"・{ticket_type}: {request_budget}円"
+        if ticket_type_supports_betting_method(ticket_type):
+            if betting_method not in BETTING_METHOD_OPTIONS:
+                betting_method = "通常"
+            line += f" / {betting_method}"
         if ticket_type_requires_combo_count(ticket_type):
             line += f" / {combo_count}点"
         valid_requests.append(line)
@@ -587,6 +604,15 @@ if "bet_plan_mode" not in st.session_state:
     st.session_state.bet_plan_mode = "おまかせ"
 if "custom_ticket_requests" not in st.session_state:
     st.session_state.custom_ticket_requests = [create_ticket_request()]
+else:
+    normalized_requests = []
+    for req in st.session_state.custom_ticket_requests:
+        normalized_req = create_ticket_request()
+        normalized_req.update(req if isinstance(req, dict) else {})
+        if normalized_req.get("betting_method") not in BETTING_METHOD_OPTIONS:
+            normalized_req["betting_method"] = "通常"
+        normalized_requests.append(normalized_req)
+    st.session_state.custom_ticket_requests = normalized_requests or [create_ticket_request()]
 if "analysis_results" not in st.session_state:
     st.session_state.analysis_results = {}
 
@@ -811,11 +837,11 @@ if st.session_state.all_horse_data:
         )
 
         if bet_plan_mode == "カスタム":
-            st.caption("券種ごとの条件を追加できます。枠連・馬連・ワイド・馬単・3連複・3連単は組数も指定できます。")
+            st.caption("券種ごとの条件を追加できます。単勝・複勝以外は方式（通常／フォーメーション／ながし／ボックス）も指定できます。")
             remove_request_index = None
             for idx, req in enumerate(st.session_state.custom_ticket_requests):
                 st.markdown(f"**条件 {idx + 1}**")
-                cols = st.columns([1.7, 1.1, 1.1, 0.8])
+                cols = st.columns([1.6, 1.3, 1.1, 1.0, 0.8])
                 default_type = req.get("ticket_type", "ワイド")
                 ticket_type = cols[0].selectbox(
                     "券種",
@@ -823,7 +849,18 @@ if st.session_state.all_horse_data:
                     index=TICKET_TYPE_OPTIONS.index(default_type) if default_type in TICKET_TYPE_OPTIONS else 0,
                     key=f"ticket_type_{idx}"
                 )
-                request_budget = cols[1].number_input(
+                default_method = req.get("betting_method", "通常")
+                if ticket_type_supports_betting_method(ticket_type):
+                    betting_method = cols[1].selectbox(
+                        "方式",
+                        BETTING_METHOD_OPTIONS,
+                        index=BETTING_METHOD_OPTIONS.index(default_method) if default_method in BETTING_METHOD_OPTIONS else 0,
+                        key=f"ticket_method_{idx}"
+                    )
+                else:
+                    cols[1].markdown("方式指定なし")
+                    betting_method = "通常"
+                request_budget = cols[2].number_input(
                     "予算 (円)",
                     min_value=100,
                     step=100,
@@ -831,7 +868,7 @@ if st.session_state.all_horse_data:
                     key=f"ticket_budget_{idx}"
                 )
                 if ticket_type_requires_combo_count(ticket_type):
-                    combo_count = cols[2].number_input(
+                    combo_count = cols[3].number_input(
                         "組数",
                         min_value=1,
                         step=1,
@@ -839,15 +876,16 @@ if st.session_state.all_horse_data:
                         key=f"ticket_combo_{idx}"
                     )
                 else:
-                    cols[2].markdown("組数指定なし")
+                    cols[3].markdown("組数指定なし")
                     combo_count = 0
-                if cols[3].button("削除", key=f"remove_ticket_{idx}"):
+                if cols[4].button("削除", key=f"remove_ticket_{idx}"):
                     remove_request_index = idx
 
                 st.session_state.custom_ticket_requests[idx] = {
                     "ticket_type": ticket_type,
                     "budget": int(request_budget),
-                    "combo_count": int(combo_count)
+                    "combo_count": int(combo_count),
+                    "betting_method": betting_method
                 }
 
             action_cols = st.columns(2)
