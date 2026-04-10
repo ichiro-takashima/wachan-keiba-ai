@@ -2,6 +2,7 @@ import io
 import re
 import time
 import unicodedata
+from pathlib import Path
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -11,6 +12,11 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
 
 session = requests.Session()
@@ -25,6 +31,52 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     )
 }
+
+
+DATA_DIR = Path("data")
+def ensure_data_directories(base_dir=DATA_DIR):
+    """
+    pathlibでデータ保存用ディレクトリを作成する。
+    OS差異を吸収し、保存先パスを統一する。
+    """
+    base_path = Path(base_dir)
+    race_html_path = base_path / "race_html"
+    race_html_path.mkdir(parents=True, exist_ok=True)
+    return race_html_path
+
+
+def save_race_html_binary(race_id, base_dir=DATA_DIR):
+    """
+    レースページ全体のHTMLをバイナリで保存する。
+    既に保存済みならスクレイピングをスキップする。
+    """
+    race_html_dir = ensure_data_directories(base_dir)
+    output_path = race_html_dir / f"{race_id}.html"
+
+    if output_path.is_file():
+        return {"ok": True, "path": output_path, "skipped": True}
+
+    url = f"https://db.netkeiba.com/race/{race_id}/"
+    time.sleep(1)
+    response = session.get(url, headers=HEADERS, timeout=10)
+    response.raise_for_status()
+    output_path.write_bytes(response.content)
+    return {"ok": True, "path": output_path, "skipped": False}
+
+
+def load_race_html_text(race_id, base_dir=DATA_DIR):
+    race_html_dir = ensure_data_directories(base_dir)
+    output_path = race_html_dir / f"{race_id}.html"
+    if not output_path.is_file():
+        return None
+
+    content = output_path.read_bytes()
+    for encoding in ("euc-jp", "cp932", "utf-8"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", errors="ignore")
 
 
 def _normalize_label(value):
@@ -79,6 +131,42 @@ def _infer_special_columns(df):
                 break
     return df
 
+def _repair_shifted_finish_columns(df):
+    """
+    netkeibaの一部テーブルで、列見出しが1～2列分ずれて
+    「上り」「馬体重」が「勝ち馬(2着馬)」「賞金」に入ることがあるため補正する。
+    """
+    required_cols = ["上り", "馬体重", "勝ち馬(2着馬)", "賞金"]
+    if not all(col in df.columns for col in required_cols):
+        return df
+
+    up_col = df["上り"].astype(str).str.strip()
+    winner_col = df["勝ち馬(2着馬)"].astype(str).str.strip()
+    body_col = df["馬体重"].astype(str).str.strip()
+    prize_col = df["賞金"].astype(str).str.strip()
+
+    # 上りは通常「34.1」のような小数、勝ち馬(2着馬)は通常文字列（馬名）
+    up_pattern = r"^\d{2}\.\d$"
+    winner_shifted = winner_col.str.match(up_pattern, na=False).mean() >= 0.6
+    up_missing = (~up_col.str.match(up_pattern, na=False)).mean() >= 0.6
+
+    # 馬体重は通常「516(+6)」の形式、賞金は整数/小数が多い
+    body_pattern = r"^\d{3,4}\([+-]?\d+\)$"
+    body_shifted = prize_col.str.match(body_pattern, na=False).mean() >= 0.6
+    body_missing = (~body_col.str.match(body_pattern, na=False)).mean() >= 0.6
+
+    if winner_shifted and up_missing:
+        df = df.copy()
+        df["上り"] = df["勝ち馬(2着馬)"]
+        # 馬名列だった元カラムは不明値に戻す
+        df["勝ち馬(2着馬)"] = pd.NA
+
+    if body_shifted and body_missing:
+        df = df.copy()
+        df["馬体重"] = df["賞金"]
+        df["賞金"] = pd.NA
+
+    return df
 
 def _prepare_race_result_df(df):
     alias_map = {
@@ -110,6 +198,7 @@ def _prepare_race_result_df(df):
     df = _flatten_columns(df)
     df = _rename_columns(df, alias_map)
     df = _infer_special_columns(df)
+    df = _repair_shifted_finish_columns(df)
     return df
 
 
@@ -343,13 +432,13 @@ def scrape_payouts(race_id):
 def scrape_race_result_page(race_id):
     url = f"https://db.netkeiba.com/race/{race_id}/"
     try:
-        time.sleep(1)
-        response = session.get(url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
-        response.encoding = "euc-jp"
-
+        save_meta = save_race_html_binary(race_id)
+        html_text = load_race_html_text(race_id)
+        if not html_text:
+            return {"ok": False, "url": url, "payouts": {}}
+        
         payouts = {}
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(html_text, "html.parser")
         for table in soup.find_all("table", class_="pay_table_01"):
             for tr in table.find_all("tr"):
                 th = tr.find("th")
@@ -366,7 +455,7 @@ def scrape_race_result_page(race_id):
                     if pay_val.isdigit():
                         payouts[ticket_type].append({"combo": combo, "pay": int(pay_val)})
 
-        return {"ok": True, "url": url, "payouts": payouts}
+        return {"ok": True, "url": url, "payouts": payouts, "html_path": str(save_meta["path"]), "html_skipped": save_meta["skipped"]}
     except Exception:
         return {"ok": False, "url": url, "payouts": {}}
 

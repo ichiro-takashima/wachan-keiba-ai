@@ -1,11 +1,8 @@
 import streamlit as st
 import google.generativeai as genai
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
 from openai import OpenAI
 import time
-import io
 import os
 import re
 import json
@@ -165,77 +162,6 @@ def analyze_track_preference(results_df):
     elif good_track_in_money > 0: return "馬場不問"
     else: return "傾向なし"
 
-def calculate_base_score(results_df, pace_prediction):
-    """脚質、過去実績、近走着順から基礎スコアと関連情報を算出する"""
-    default_return = {
-        "score": 0.0,
-        "detail": "0点 (データなし)",
-        "running_style": "不明",
-        "track_preference": "データなし"
-    }
-    if results_df is None or results_df.empty:
-        return default_return
-
-    try:
-        style = analyze_running_style(results_df)
-        track_pref = analyze_track_preference(results_df)
-
-        score = 0
-        details = []
-
-        # 1. 近走着順スコア (Max 50点)
-        recent_score = 0
-        rank_col = _find_matching_column(results_df, ['着順', '着'])
-        if rank_col:
-            recent_5 = results_df[rank_col].dropna().head(5)
-            for rank in recent_5:
-                match = re.search(r'(\d+)', str(rank))
-                if match:
-                    r = int(match.group(1))
-                    if r == 1: recent_score += 10
-                    elif r == 2: recent_score += 8
-                    elif r == 3: recent_score += 6
-                    elif r == 4: recent_score += 4
-                    elif r == 5: recent_score += 2
-        recent_score = min(recent_score, 50)
-        score += recent_score
-        details.append(f"近走:{recent_score}")
-
-        # 2. 通算実績スコア (Max 20点)
-        track_score = 0
-        if rank_col:
-            in_money = 0
-            for rank in results_df[rank_col]:
-                match = re.search(r'(\d+)', str(rank))
-                if match and int(match.group(1)) <= 3:
-                    in_money += 1
-            track_score = min(in_money * 5, 20)
-        score += track_score
-        details.append(f"実績:{track_score}")
-
-        # 3. 展開マッチスコア (Max 30点)
-        pace_score = 0
-        if style != "不明":
-            if "ハイペース" in pace_prediction:
-                pace_score = 30 if style in ["差し", "追込"] else 10
-            elif "スローペース" in pace_prediction:
-                pace_score = 30 if style in ["逃げ", "先行"] else 10
-            else: # ミドルペース
-                pace_score = 20
-        score += pace_score
-        details.append(f"展開:{pace_score}")
-
-        return {
-            "score": float(score),
-            "detail": f"{score}点 ({', '.join(details)})",
-            "running_style": style,
-            "track_preference": track_pref
-        }
-    except Exception as e:
-        st.warning(f"基礎スコアの計算中にエラーが発生しました: {e}")
-        return default_return
-
-
 def normalize_ticket_type(t):
     return str(t).replace("三連", "3連").strip()
 
@@ -254,14 +180,19 @@ def normalize_combo(combo, ticket_type):
 
 TICKET_TYPE_OPTIONS = ["単勝", "複勝", "枠連", "馬連", "ワイド", "馬単", "3連複", "3連単"]
 COMBO_COUNT_REQUIRED_TYPES = {"枠連", "馬連", "ワイド", "馬単", "3連複", "3連単"}
+BETTING_METHOD_OPTIONS = ["通常", "フォーメーション", "ながし", "ボックス"]
 
 
 def create_ticket_request():
-    return {"ticket_type": "ワイド", "budget": 500, "combo_count": 3}
+    return {"ticket_type": "ワイド", "budget": 500, "combo_count": 3, "betting_method": "通常"}
 
 
 def ticket_type_requires_combo_count(ticket_type):
     return ticket_type in COMBO_COUNT_REQUIRED_TYPES
+
+
+def ticket_type_supports_betting_method(ticket_type):
+    return ticket_type not in ["単勝", "複勝"]
 
 
 def build_ticket_plan_text(plan_mode, ticket_requests, fallback_budget):
@@ -279,24 +210,31 @@ def build_ticket_plan_text(plan_mode, ticket_requests, fallback_budget):
         ticket_type = req.get("ticket_type")
         request_budget = int(req.get("budget", 0) or 0)
         combo_count = int(req.get("combo_count", 0) or 0)
+        betting_method = req.get("betting_method", "通常")
         if not ticket_type or request_budget <= 0:
             continue
+        if betting_method not in BETTING_METHOD_OPTIONS:
+            betting_method = "通常"
         valid_requests.append({
             "ticket_type": ticket_type,
             "budget": request_budget,
-            "combo_count": combo_count
+            "combo_count": combo_count,
+            "betting_method": betting_method
         })
 
     total_budget = sum(req["budget"] for req in valid_requests)
     lines = ["ユーザーの買い方希望に従って、以下の条件を満たす買い目を提案してください。"]
     for idx, req in enumerate(valid_requests, start=1):
         line = f"・条件{idx}: {req['ticket_type']}を{req['budget']}円分"
+        if ticket_type_supports_betting_method(req["ticket_type"]):
+            line += f"、方式は{req['betting_method']}"
         if ticket_type_requires_combo_count(req["ticket_type"]):
             line += f"、組数は{req['combo_count']}点ちょうど"
         lines.append(line)
     lines.extend([
         "・上記で指定された券種以外は提案しないこと。",
         "・各条件の予算を超えないこと。",
+        "・券種ごとに指定された方式（通常／フォーメーション／ながし／ボックス）を守ること。",
         "・組数指定がある券種は、指定された組数ちょうどで買い目を構成すること。",
         "・金額配分は100円単位にすること。"
     ])
@@ -312,15 +250,27 @@ def format_ticket_plan_for_context(plan_mode, ticket_requests, fallback_budget):
         ticket_type = req.get("ticket_type")
         request_budget = int(req.get("budget", 0) or 0)
         combo_count = int(req.get("combo_count", 0) or 0)
+        betting_method = req.get("betting_method", "通常")
         if not ticket_type or request_budget <= 0:
             continue
         line = f"・{ticket_type}: {request_budget}円"
+        if ticket_type_supports_betting_method(ticket_type):
+            if betting_method not in BETTING_METHOD_OPTIONS:
+                betting_method = "通常"
+            line += f" / {betting_method}"
         if ticket_type_requires_combo_count(ticket_type):
             line += f" / {combo_count}点"
         valid_requests.append(line)
 
     total_budget = sum(int(req.get("budget", 0) or 0) for req in ticket_requests)
     return "買い方希望:\n" + "\n".join(valid_requests) + f"\n合計予算: {total_budget}円"
+
+
+def _parse_ids_input(raw_text):
+    if not raw_text:
+        return []
+    tokens = re.split(r"[\s,]+", raw_text.strip())
+    return [token for token in tokens if token]
 
 
 def calculate_return(bets, payouts):
@@ -414,6 +364,113 @@ def build_reflection_text(predicted_bets, payouts):
 st.sidebar.title("🏇 メニュー")
 app_mode = st.sidebar.radio("モード選択", ["単一レース予想", "バックテスト"], index=0)
 
+with st.sidebar.expander("🗂️ HTML保存 / 一括テーブル生成", expanded=False):
+    st.caption("保存済みHTMLから一括でテーブルを作るための管理パネルです。")
+    race_html_dir = st.text_input("レースHTML保存先", value="data/html/race")
+    race_ids_text = st.text_area(
+        "保存したいレースID（改行 or カンマ区切り）",
+        value="",
+        height=80,
+        help="例: 202601010101, 202601010102"
+    )
+    skip_existing_race = st.checkbox("既存レースHTMLはスキップ", value=True)
+    force_race_refresh = st.checkbox("レースHTMLを強制再取得", value=False)
+    if st.button("HTML保存（レース）", use_container_width=True):
+        race_ids = _parse_ids_input(race_ids_text)
+        if not race_ids:
+            st.warning("レースIDを入力してください。")
+        else:
+            ok_count = 0
+            fail_ids = []
+            prog = st.progress(0)
+            status = st.empty()
+            for idx, rid in enumerate(race_ids, start=1):
+                status.write(f"保存中: {rid} ({idx}/{len(race_ids)})")
+                try:
+                    scraper.scrape_html_race(
+                        rid,
+                        save_dir=race_html_dir,
+                        skip_existing=skip_existing_race,
+                        force=force_race_refresh
+                    )
+                    ok_count += 1
+                except Exception:
+                    fail_ids.append(rid)
+                prog.progress(idx / len(race_ids))
+            status.empty()
+            if fail_ids:
+                st.warning(f"完了: 成功 {ok_count} / 失敗 {len(fail_ids)}（{', '.join(fail_ids[:5])}）")
+            else:
+                st.success(f"完了: {ok_count}件のレースHTMLを保存しました。")
+
+    race_table_html_dir = st.text_input("レースHTML読込元", value="data/html/race")
+    race_table_output = st.text_input("レース結果テーブル出力先", value="data/processed/race_results.tsv")
+    if st.button("一括テーブル生成（レース結果）", use_container_width=True):
+        try:
+            results_df = scraper.create_results(
+                html_dir=race_table_html_dir,
+                output_path=race_table_output,
+                sep="\t",
+                show_progress=False
+            )
+            st.success(f"生成完了: {len(results_df)}行 / {len(results_df.columns)}列")
+            st.dataframe(results_df.head(20), use_container_width=True)
+        except Exception as e:
+            st.error(f"レース結果テーブル生成に失敗しました: {e}")
+
+    horse_html_dir = st.text_input("馬HTML保存先", value="data/html/horse")
+    horse_ids_text = st.text_area(
+        "保存したい馬ID（改行 or カンマ区切り）",
+        value="",
+        height=80,
+        help="例: 2010101010, 2010101011"
+    )
+    skip_existing_horse = st.checkbox("既存馬HTMLはスキップ", value=True)
+    force_horse_refresh = st.checkbox("馬HTMLを強制再取得", value=False)
+    if st.button("HTML保存（馬の過去成績）", use_container_width=True):
+        horse_ids = _parse_ids_input(horse_ids_text)
+        if not horse_ids:
+            st.warning("馬IDを入力してください。")
+        else:
+            ok_count = 0
+            fail_ids = []
+            prog = st.progress(0)
+            status = st.empty()
+            for idx, hid in enumerate(horse_ids, start=1):
+                status.write(f"保存中: {hid} ({idx}/{len(horse_ids)})")
+                try:
+                    scraper.scrape_html_horse(
+                        [hid],
+                        save_dir=horse_html_dir,
+                        skip_existing=skip_existing_horse,
+                        force=force_horse_refresh,
+                        show_progress=False
+                    )
+                    ok_count += 1
+                except Exception:
+                    fail_ids.append(hid)
+                prog.progress(idx / len(horse_ids))
+            status.empty()
+            if fail_ids:
+                st.warning(f"完了: 成功 {ok_count} / 失敗 {len(fail_ids)}（{', '.join(fail_ids[:5])}）")
+            else:
+                st.success(f"完了: {ok_count}件の馬HTMLを保存しました。")
+
+    horse_table_html_dir = st.text_input("馬HTML読込元", value="data/html/horse")
+    horse_table_output = st.text_input("馬の過去成績テーブル出力先", value="data/processed/horse_results.tsv")
+    if st.button("一括テーブル生成（馬の過去成績）", use_container_width=True):
+        try:
+            horse_results_df = scraper.create_horse_results(
+                horse_html_dir=horse_table_html_dir,
+                output_path=horse_table_output,
+                sep="\t",
+                show_progress=False
+            )
+            st.success(f"生成完了: {len(horse_results_df)}行 / {len(horse_results_df.columns)}列")
+            st.dataframe(horse_results_df.head(20), use_container_width=True)
+        except Exception as e:
+            st.error(f"馬の過去成績テーブル生成に失敗しました: {e}")
+
 if app_mode == "バックテスト":
     @st.cache_data(ttl=3600, show_spinner=False)
     def scrape_payouts(race_id): return scraper.scrape_payouts(race_id)
@@ -496,7 +553,114 @@ if app_mode == "バックテスト":
     with col2:
         bt_max_horses = st.number_input("最大送信頭数（トークン節約用）", min_value=5, max_value=18, value=12, help="馬番の大きい外枠の馬から除外されます。全頭送るとトークンを消費します。")
 
+    bt_user_opinion = st.text_area(
+        "✍️ あなたの予想・注目馬（AIへの指示や意見があれば入力してください）",
+        placeholder="例: 1番の馬の逃げ残りに期待。雨が降っているので外枠有利。",
+        key="bt_user_opinion"
+    )
+
+    st.markdown("#### 買い方設定 (バックテスト用)")
+    if "bt_custom_ticket_requests" not in st.session_state:
+        st.session_state.bt_custom_ticket_requests = [create_ticket_request()]
+    else:
+        normalized_requests = []
+        for req in st.session_state.bt_custom_ticket_requests:
+            normalized_req = create_ticket_request()
+            normalized_req.update(req if isinstance(req, dict) else {})
+            if normalized_req.get("betting_method") not in BETTING_METHOD_OPTIONS:
+                normalized_req["betting_method"] = "通常"
+            normalized_requests.append(normalized_req)
+        st.session_state.bt_custom_ticket_requests = normalized_requests or [create_ticket_request()]
+
+    bt_bet_plan_mode = st.radio(
+        "買い方を選んでください",
+        ["おまかせ", "カスタム"],
+        key="bt_bet_plan_mode",
+        horizontal=True
+    )
+
+    if bt_bet_plan_mode == "カスタム":
+        st.caption("券種ごとの条件を追加できます。単勝・複勝以外は方式（通常／フォーメーション／ながし／ボックス）も指定できます。")
+        bt_remove_request_index = None
+        for idx, req in enumerate(st.session_state.bt_custom_ticket_requests):
+            st.markdown(f"**条件 {idx + 1}**")
+            cols = st.columns([1.6, 1.3, 1.1, 1.0, 0.8])
+            default_type = req.get("ticket_type", "ワイド")
+            ticket_type = cols[0].selectbox(
+                "券種",
+                TICKET_TYPE_OPTIONS,
+                index=TICKET_TYPE_OPTIONS.index(default_type) if default_type in TICKET_TYPE_OPTIONS else 0,
+                key=f"bt_ticket_type_{idx}"
+            )
+            default_method = req.get("betting_method", "通常")
+            if ticket_type_supports_betting_method(ticket_type):
+                betting_method = cols[1].selectbox(
+                    "方式",
+                    BETTING_METHOD_OPTIONS,
+                    index=BETTING_METHOD_OPTIONS.index(default_method) if default_method in BETTING_METHOD_OPTIONS else 0,
+                    key=f"bt_ticket_method_{idx}"
+                )
+            else:
+                cols[1].markdown("方式指定なし")
+                betting_method = "通常"
+            request_budget = cols[2].number_input(
+                "予算 (円)",
+                min_value=100,
+                step=100,
+                value=int(req.get("budget", 500) or 500),
+                key=f"bt_ticket_budget_{idx}"
+            )
+            if ticket_type_requires_combo_count(ticket_type):
+                combo_count = cols[3].number_input(
+                    "組数",
+                    min_value=1,
+                    step=1,
+                    value=int(req.get("combo_count", 3) or 3),
+                    key=f"bt_ticket_combo_{idx}"
+                )
+            else:
+                cols[3].markdown("組数指定なし")
+                combo_count = 0
+            if cols[4].button("削除", key=f"bt_remove_ticket_{idx}"):
+                bt_remove_request_index = idx
+
+            st.session_state.bt_custom_ticket_requests[idx] = {
+                "ticket_type": ticket_type,
+                "budget": int(request_budget),
+                "combo_count": int(combo_count),
+                "betting_method": betting_method
+            }
+
+        action_cols = st.columns(2)
+        if action_cols[0].button("条件を追加", key="bt_add_ticket_request"):
+            st.session_state.bt_custom_ticket_requests.append(create_ticket_request())
+            st.rerun()
+        if action_cols[1].button("最後の条件を削除", key="bt_remove_last_ticket_request"):
+            if len(st.session_state.bt_custom_ticket_requests) > 1:
+                st.session_state.bt_custom_ticket_requests.pop()
+                st.rerun()
+
+        if bt_remove_request_index is not None:
+            st.session_state.bt_custom_ticket_requests.pop(bt_remove_request_index)
+            if not st.session_state.bt_custom_ticket_requests:
+                st.session_state.bt_custom_ticket_requests = [create_ticket_request()]
+            st.rerun()
+
+        bt_custom_total_budget = sum(req.get("budget", 0) for req in st.session_state.bt_custom_ticket_requests)
+        st.info(f"カスタム条件の合計予算: {bt_custom_total_budget}円")
+        if bt_custom_total_budget != bt_budget:
+            st.caption(f"上の全体予算は {bt_budget}円ですが、カスタム条件の合計 {bt_custom_total_budget}円 を優先して買い目提案に使います。")
+
+    bt_ticket_plan_text, bt_effective_budget = build_ticket_plan_text(
+        bt_bet_plan_mode,
+        st.session_state.get("bt_custom_ticket_requests", []),
+        bt_budget
+    )
+
     if st.button("バックテスト実行"):
+        if bt_bet_plan_mode == "カスタム" and bt_effective_budget <= 0:
+            st.warning("カスタムの買い方条件を1件以上、予算ありで設定してください。")
+            st.stop()
         bt_race_ids = [r.strip() for r in bt_race_ids_str.split('\n') if r.strip()]
         if not bt_race_ids: st.warning("レースIDを入力してください。")
         else:
@@ -529,23 +693,10 @@ if app_mode == "バックテスト":
                         res_df = res_df[res_df['日付'] < pd.Timestamp(race_date)]
                     horses_data.append({"id": hid, "pedigree": ped, "results": res_df})
                 
-                all_running_styles = []
-                for horse in horses_data:
-                    if not horse['results'].empty:
-                        style = analyze_running_style(horse['results'])
-                        all_running_styles.append(style)
-
-                num_front_runners = all_running_styles.count('逃げ')
-                num_leaders = all_running_styles.count('先行')
-                if num_front_runners >= 2 or (num_front_runners == 1 and num_leaders >= 3):
-                    race_pace_prediction = "ハイペース予想。複数の逃げ・先行馬が競り合い、前方の争いが激化しそうです。これにより、後半に脚を溜められる差し・追込馬に有利な展開となる可能性があります。"
-                elif num_front_runners == 0 and num_leaders <= 2:
-                    race_pace_prediction = "スローペース予想。明確な逃げ馬がおらず、牽制しあって落ち着いた流れになりそうです。瞬発力や決め手のある馬が有利で、前残りの展開も考えられます。"
-                else:
-                    race_pace_prediction = "ミドルペース予想。平均的なペース構成で、各馬の実力がストレートに反映されやすいでしょう。"
-
                 ctx = f"--- \n【レース基本情報】\n・対象レースID: {r_id}\n・レース名: {race_info['name']}\n・コース・天候等: {race_info['data']}\n\n"
-                ctx += f"【システム展開予想】\n{race_pace_prediction}\n\n【出走馬詳細】\n"
+                if bt_user_opinion.strip():
+                    ctx += f"【ユーザーからの特記事項・予想意見】\n{bt_user_opinion}\n※上記のユーザー意見を、今回の予想の重要な根拠の一つとして加味してください。\n\n"
+                ctx += "【出走馬詳細】\n"
 
                 shutuba_df = scraper.scrape_shutuba_table(r_id)
                 if not shutuba_df.empty:
@@ -554,8 +705,6 @@ if app_mode == "バックテスト":
                 for horse in horses_data:
                     ped = horse['pedigree']
                     res_df = horse['results']
-                    score_info = calculate_base_score(res_df, race_pace_prediction)
-                    
                     ctx += f"\n[{ped['name']}] 父:{ped['sire']} 母父:{ped['broodmare_sire']}\n"
                     if res_df.empty:
                         ctx += "データなし\n"
@@ -567,7 +716,9 @@ if app_mode == "バックテスト":
                         weight = re.match(r'(\d+)', str(latest_weight_str))
                         if weight: weight_info = f" 体重:{weight.group(1)}"
 
-                    ctx += f"脚質:{score_info['running_style']} 馬場:{score_info['track_preference']}{weight_info} 基礎スコア:{score_info['detail']}\n"
+                    running_style = analyze_running_style(res_df)
+                    track_preference = analyze_track_preference(res_df)
+                    ctx += f"脚質:{running_style} 馬場:{track_preference}{weight_info}\n"
                     
                     existing_cols = _get_available_columns(res_df, [
                         ['日付'],
@@ -596,7 +747,7 @@ if app_mode == "バックテスト":
                         
                     ctx += short_df.head(5).to_csv(index=False, header=False, sep=',') + "\n"
 
-                prompt = f"""あなたはプロの競馬予想家です。出走馬データから総合的な予想を行い買い目を出力してください。予算:{bt_budget}円。
+                prompt = f"""あなたはプロの競馬予想家です。出走馬データから総合的な予想を行い買い目を出力してください。予算:{bt_effective_budget}円。
 【出力要件】
 1. レース見解と予想印
 2. 買い目（※必ず以下のJSONフォーマットでテキストの最後に記述すること）
@@ -755,73 +906,14 @@ if st.session_state.all_horse_data:
     })
     st.dataframe(df_pedigree, use_container_width=True)
 
-    # --- 展開予想ロジック（表示とAIプロンプトで共通使用） ---
-    all_running_styles = []
-    for horse in st.session_state.all_horse_data:
-        if not horse['results'].empty:
-            style = analyze_running_style(horse['results'])
-            all_running_styles.append(style)
-
-    num_front_runners = all_running_styles.count('逃げ')
-    num_leaders = all_running_styles.count('先行')
-    if num_front_runners >= 2 or (num_front_runners == 1 and num_leaders >= 3):
-        race_pace_prediction = "ハイペース予想。複数の逃げ・先行馬が競り合い、前方の争いが激化しそうです。これにより、後半に脚を溜められる差し・追込馬に有利な展開となる可能性があります。"
-    elif num_front_runners == 0 and num_leaders <= 2:
-        race_pace_prediction = "スローペース予想。明確な逃げ馬がおらず、牽制しあって落ち着いた流れになりそうです。瞬発力や決め手のある馬が有利で、前残りの展開も考えられます。"
-    else:
-        race_pace_prediction = "ミドルペース予想。平均的なペース構成で、各馬の実力がストレートに反映されやすいでしょう。"
-
-    st.info(f"🏁 **システム展開予想:** {race_pace_prediction}")
-
-    # ② 基礎スコアの計算と補完
-    for horse in st.session_state.all_horse_data:
-        if "base_score" not in horse or not isinstance(horse.get("base_score"), dict):
-            horse["base_score"] = calculate_base_score(horse['results'], race_pace_prediction)
-
-    # ③ 基礎スコア一覧表の表示
-    score_data = []
-    for horse in st.session_state.all_horse_data:
-        shutuba_info = {}
-        if st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:
-            horse_name = horse['pedigree']['name']
-            entry = st.session_state.shutuba_table[st.session_state.shutuba_table['馬名'] == horse_name]
-            if not entry.empty:
-                shutuba_info = entry.iloc[0].to_dict()
-
-        score_info = horse["base_score"]
-
-        last_corner = "-"
-        results_df = horse['results']
-        if results_df is not None and not results_df.empty:
-            corner_col = _find_matching_column(results_df, ['通過', 'コーナー通過順位', 'コーナー'])
-            if corner_col:
-                corner_pos_series = results_df[corner_col].dropna()
-                if not corner_pos_series.empty:
-                    last_corner = str(corner_pos_series.iloc[0])
-
-        score_data.append({
-            "馬番": shutuba_info.get("馬番", "-"),
-            "馬名": horse['pedigree']['name'],
-            "スコア": score_info['score'],
-            "詳細": score_info['detail'],
-            "脚質": score_info['running_style'],
-            "馬場適性": score_info['track_preference'],
-            "前走通過順": last_corner
-        })
-
-    if score_data:
-        st.subheader("📊 全馬基礎スコア一覧")
-        score_df = pd.DataFrame(score_data)
-        score_df['スコア'] = pd.to_numeric(score_df['スコア'], errors='coerce').fillna(0)
-        st.dataframe(score_df.sort_values("スコア", ascending=False), use_container_width=True)
-
-    # ④ 各馬の詳細情報
+    # 各馬の詳細情報
     st.subheader("🐎 各馬の詳細情報と直近戦績")
     for horse in st.session_state.all_horse_data:
-        score_info = horse["base_score"]
-        with st.expander(f"{horse['pedigree']['name']} (ID: {horse['id']}) - 基礎スコア: {score_info['score']:.0f}点"):
+        with st.expander(f"{horse['pedigree']['name']} (ID: {horse['id']})"):
+            running_style = analyze_running_style(horse['results'])
+            track_preference = analyze_track_preference(horse['results'])
             st.write(f"**父:** {horse['pedigree']['sire']} / **母:** {horse['pedigree']['dam']} / **母父:** {horse['pedigree']['broodmare_sire']}")
-            st.write(f"**📊 ルールベース基礎スコア:** {score_info['detail']} | **脚質:** {score_info['running_style']} | **馬場適性:** {score_info['track_preference']}")
+            st.write(f"**脚質:** {running_style} | **馬場適性:** {track_preference}")
             if not horse['results'].empty:
                 st.dataframe(horse['results'].head(5), use_container_width=True)
             else:
@@ -846,9 +938,6 @@ if st.session_state.all_horse_data:
         data_context += f"\n【ユーザーからの特記事項・予想意見】\n{user_opinion}\n※上記のユーザー意見を、今回の予想の重要な根拠の一つとして加味してください。\n"
 
     data_context += f"""
-
-【システム展開予想】
-{race_pace_prediction}
 
 【出走馬詳細】"""
 
@@ -881,7 +970,6 @@ if st.session_state.all_horse_data:
     for horse in st.session_state.all_horse_data:
         p = horse['pedigree']
         results_df = horse['results']
-        score_info = horse['base_score'] # 補完済みのスコア情報を利用
         data_context += f"\n[{p['name']}] 父:{p['sire']} 母父:{p['broodmare_sire']}\n"
         
         if results_df.empty:
@@ -894,7 +982,9 @@ if st.session_state.all_horse_data:
             weight = re.match(r'(\d+)', str(latest_weight_str))
             if weight: weight_info = f" 体重:{weight.group(1)}"
 
-        data_context += f"脚質:{score_info['running_style']} 馬場:{score_info['track_preference']}{weight_info} 基礎スコア:{score_info['detail']}\n"
+        running_style = analyze_running_style(results_df)
+        track_preference = analyze_track_preference(results_df)
+        data_context += f"脚質:{running_style} 馬場:{track_preference}{weight_info}\n"
         
         existing_cols = _get_available_columns(results_df, [
             ['日付'],
@@ -928,7 +1018,7 @@ if st.session_state.all_horse_data:
             perspectives = [
                 ("🩸 血統重視", "「血統（父、母、母父の傾向や血統背景）」を最重視"),
                 ("📊 指数・データ重視", "「過去の戦績、着順、タイム、馬場適性、近走馬体重」を最重視"),
-                ("🏇 展開重視", "「脚質、枠順、システムによる展開予想、今回のメンバー構成（逃げ先行馬の数）」を最重視")
+                ("🏇 展開重視", "「脚質、枠順、今回のメンバー構成（逃げ先行馬の数）」を最重視")
             ]
             
             results_dict = {}
@@ -988,11 +1078,11 @@ if st.session_state.all_horse_data:
         )
 
         if bet_plan_mode == "カスタム":
-            st.caption("券種ごとの条件を追加できます。枠連・馬連・ワイド・馬単・3連複・3連単は組数も指定できます。")
+            st.caption("券種ごとの条件を追加できます。単勝・複勝以外は方式（通常／フォーメーション／ながし／ボックス）も指定できます。")
             remove_request_index = None
             for idx, req in enumerate(st.session_state.custom_ticket_requests):
                 st.markdown(f"**条件 {idx + 1}**")
-                cols = st.columns([1.7, 1.1, 1.1, 0.8])
+                cols = st.columns([1.6, 1.3, 1.1, 1.0, 0.8])
                 default_type = req.get("ticket_type", "ワイド")
                 ticket_type = cols[0].selectbox(
                     "券種",
@@ -1000,7 +1090,18 @@ if st.session_state.all_horse_data:
                     index=TICKET_TYPE_OPTIONS.index(default_type) if default_type in TICKET_TYPE_OPTIONS else 0,
                     key=f"ticket_type_{idx}"
                 )
-                request_budget = cols[1].number_input(
+                default_method = req.get("betting_method", "通常")
+                if ticket_type_supports_betting_method(ticket_type):
+                    betting_method = cols[1].selectbox(
+                        "方式",
+                        BETTING_METHOD_OPTIONS,
+                        index=BETTING_METHOD_OPTIONS.index(default_method) if default_method in BETTING_METHOD_OPTIONS else 0,
+                        key=f"ticket_method_{idx}"
+                    )
+                else:
+                    cols[1].markdown("方式指定なし")
+                    betting_method = "通常"
+                request_budget = cols[2].number_input(
                     "予算 (円)",
                     min_value=100,
                     step=100,
@@ -1008,7 +1109,7 @@ if st.session_state.all_horse_data:
                     key=f"ticket_budget_{idx}"
                 )
                 if ticket_type_requires_combo_count(ticket_type):
-                    combo_count = cols[2].number_input(
+                    combo_count = cols[3].number_input(
                         "組数",
                         min_value=1,
                         step=1,
@@ -1016,15 +1117,16 @@ if st.session_state.all_horse_data:
                         key=f"ticket_combo_{idx}"
                     )
                 else:
-                    cols[2].markdown("組数指定なし")
+                    cols[3].markdown("組数指定なし")
                     combo_count = 0
-                if cols[3].button("削除", key=f"remove_ticket_{idx}"):
+                if cols[4].button("削除", key=f"remove_ticket_{idx}"):
                     remove_request_index = idx
 
                 st.session_state.custom_ticket_requests[idx] = {
                     "ticket_type": ticket_type,
                     "budget": int(request_budget),
-                    "combo_count": int(combo_count)
+                    "combo_count": int(combo_count),
+                    "betting_method": betting_method
                 }
 
             action_cols = st.columns(2)
