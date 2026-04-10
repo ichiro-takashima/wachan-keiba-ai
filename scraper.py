@@ -2,6 +2,7 @@ import io
 import re
 import time
 import unicodedata
+from pathlib import Path
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -11,6 +12,11 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
 
 session = requests.Session()
@@ -25,6 +31,52 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     )
 }
+
+
+DATA_DIR = Path("data")
+def ensure_data_directories(base_dir=DATA_DIR):
+    """
+    pathlibでデータ保存用ディレクトリを作成する。
+    OS差異を吸収し、保存先パスを統一する。
+    """
+    base_path = Path(base_dir)
+    race_html_path = base_path / "race_html"
+    race_html_path.mkdir(parents=True, exist_ok=True)
+    return race_html_path
+
+
+def save_race_html_binary(race_id, base_dir=DATA_DIR):
+    """
+    レースページ全体のHTMLをバイナリで保存する。
+    既に保存済みならスクレイピングをスキップする。
+    """
+    race_html_dir = ensure_data_directories(base_dir)
+    output_path = race_html_dir / f"{race_id}.html"
+
+    if output_path.is_file():
+        return {"ok": True, "path": output_path, "skipped": True}
+
+    url = f"https://db.netkeiba.com/race/{race_id}/"
+    time.sleep(1)
+    response = session.get(url, headers=HEADERS, timeout=10)
+    response.raise_for_status()
+    output_path.write_bytes(response.content)
+    return {"ok": True, "path": output_path, "skipped": False}
+
+
+def load_race_html_text(race_id, base_dir=DATA_DIR):
+    race_html_dir = ensure_data_directories(base_dir)
+    output_path = race_html_dir / f"{race_id}.html"
+    if not output_path.is_file():
+        return None
+
+    content = output_path.read_bytes()
+    for encoding in ("euc-jp", "cp932", "utf-8"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", errors="ignore")
 
 
 def _normalize_label(value):
@@ -380,13 +432,13 @@ def scrape_payouts(race_id):
 def scrape_race_result_page(race_id):
     url = f"https://db.netkeiba.com/race/{race_id}/"
     try:
-        time.sleep(1)
-        response = session.get(url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
-        response.encoding = "euc-jp"
-
+        save_meta = save_race_html_binary(race_id)
+        html_text = load_race_html_text(race_id)
+        if not html_text:
+            return {"ok": False, "url": url, "payouts": {}}
+        
         payouts = {}
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(html_text, "html.parser")
         for table in soup.find_all("table", class_="pay_table_01"):
             for tr in table.find_all("tr"):
                 th = tr.find("th")
@@ -403,7 +455,7 @@ def scrape_race_result_page(race_id):
                     if pay_val.isdigit():
                         payouts[ticket_type].append({"combo": combo, "pay": int(pay_val)})
 
-        return {"ok": True, "url": url, "payouts": payouts}
+        return {"ok": True, "url": url, "payouts": payouts, "html_path": str(save_meta["path"]), "html_skipped": save_meta["skipped"]}
     except Exception:
         return {"ok": False, "url": url, "payouts": {}}
 
@@ -458,3 +510,161 @@ def get_race_date(race_id):
         if match: return f"{match.group(1)}/{match.group(2).zfill(2)}/{match.group(3).zfill(2)}"
     except Exception: pass
     return pd.Timestamp.now().strftime("%Y/%m/%d")
+
+def _iter_with_progress(items, show_progress=True, desc="Processing"):
+    if show_progress and tqdm is not None:
+        return tqdm(items, desc=desc)
+    return items
+
+
+def save_table(df, output_path, sep="\t", index=False):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output_path, sep=sep, index=index)
+    return output_path
+
+
+def load_table(input_path, sep="\t"):
+    return pd.read_csv(input_path, sep=sep)
+
+
+def scrape_html_race(race_id, save_dir="data/html/race", skip_existing=True, force=False, sleep_sec=1.0):
+    race_id = str(race_id)
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    output_path = save_dir / f"{race_id}.html"
+    if output_path.exists() and skip_existing and not force:
+        return output_path
+
+    url = f"https://db.netkeiba.com/race/{race_id}/"
+    time.sleep(sleep_sec)
+    response = session.get(url, headers=HEADERS, timeout=10)
+    response.raise_for_status()
+    response.encoding = "euc-jp"
+    output_path.write_text(response.text, encoding="utf-8")
+    return output_path
+
+
+def _parse_race_id_from_path(path):
+    stem = Path(path).stem
+    match = re.search(r"(\d{10,12})", stem)
+    return match.group(1) if match else stem
+
+
+def _extract_horse_ids_from_race_html(soup):
+    horse_ids = []
+    table = soup.find("table", class_="race_table_01")
+    if not table:
+        return horse_ids
+    for tr in table.find_all("tr")[1:]:
+        link = tr.find("a", href=re.compile(r"/horse/\d{10}"))
+        if not link:
+            horse_ids.append(None)
+            continue
+        match = re.search(r"/horse/(\d{10})", link.get("href", ""))
+        horse_ids.append(match.group(1) if match else None)
+    return horse_ids
+
+
+def _extract_race_result_from_html(html_text, race_id):
+    soup = BeautifulSoup(html_text, "html.parser")
+    horse_ids = _extract_horse_ids_from_race_html(soup)
+    tables = pd.read_html(io.StringIO(html_text))
+    result_df = None
+    for candidate_df in tables:
+        if _looks_like_race_result_table(candidate_df):
+            result_df = _prepare_race_result_df(candidate_df)
+            break
+    if result_df is None or result_df.empty:
+        return pd.DataFrame()
+
+    result_df = result_df.copy()
+    result_df.insert(0, "race_id", str(race_id))
+
+    if horse_ids:
+        length = min(len(result_df), len(horse_ids))
+        result_df["horse_id"] = pd.NA
+        result_df.loc[result_df.index[:length], "horse_id"] = horse_ids[:length]
+
+    return result_df
+
+
+def create_results(html_dir, output_path=None, sep="\t", show_progress=True, glob_pattern="*.html"):
+    html_dir = Path(html_dir)
+    html_files = sorted(html_dir.glob(glob_pattern))
+    result_frames = []
+
+    for html_file in _iter_with_progress(html_files, show_progress=show_progress, desc="race html"):
+        html_text = html_file.read_text(encoding="utf-8")
+        race_id = _parse_race_id_from_path(html_file)
+        result_df = _extract_race_result_from_html(html_text, race_id)
+        if not result_df.empty:
+            result_frames.append(result_df)
+
+    if result_frames:
+        merged_df = pd.concat(result_frames, ignore_index=True)
+    else:
+        merged_df = pd.DataFrame()
+
+    if output_path:
+        save_table(merged_df, output_path=output_path, sep=sep, index=False)
+    return merged_df
+
+
+def scrape_html_horse(horse_ids, save_dir="data/html/horse", skip_existing=True, force=False, sleep_sec=1.0, show_progress=True):
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    saved_paths = []
+
+    for horse_id in _iter_with_progress(list(horse_ids), show_progress=show_progress, desc="horse html"):
+        horse_id = str(horse_id)
+        output_path = save_dir / f"{horse_id}.html"
+        if output_path.exists() and skip_existing and not force:
+            saved_paths.append(output_path)
+            continue
+
+        url = f"https://db.netkeiba.com/horse/result/{horse_id}/"
+        time.sleep(sleep_sec)
+        response = session.get(url, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        response.encoding = "euc-jp"
+        output_path.write_text(response.text, encoding="utf-8")
+        saved_paths.append(output_path)
+
+    return saved_paths
+
+
+def _extract_horse_result_from_html(html_text, horse_id):
+    tables = pd.read_html(io.StringIO(html_text))
+    result_df = None
+    for candidate_df in tables:
+        if _looks_like_race_result_table(candidate_df):
+            result_df = _prepare_race_result_df(candidate_df)
+            break
+    if result_df is None or result_df.empty:
+        return pd.DataFrame()
+    result_df = result_df.copy()
+    result_df.insert(0, "horse_id", str(horse_id))
+    return result_df
+
+
+def create_horse_results(horse_html_dir, output_path=None, sep="\t", show_progress=True, glob_pattern="*.html"):
+    horse_html_dir = Path(horse_html_dir)
+    html_files = sorted(horse_html_dir.glob(glob_pattern))
+    result_frames = []
+
+    for html_file in _iter_with_progress(html_files, show_progress=show_progress, desc="horse results"):
+        horse_id = _parse_race_id_from_path(html_file)
+        html_text = html_file.read_text(encoding="utf-8")
+        result_df = _extract_horse_result_from_html(html_text, horse_id)
+        if not result_df.empty:
+            result_frames.append(result_df)
+
+    if result_frames:
+        merged_df = pd.concat(result_frames, ignore_index=True)
+    else:
+        merged_df = pd.DataFrame()
+
+    if output_path:
+        save_table(merged_df, output_path=output_path, sep=sep, index=False)
+    return merged_df
