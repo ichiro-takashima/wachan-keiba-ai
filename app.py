@@ -360,9 +360,49 @@ def build_reflection_text(predicted_bets, payouts):
     reflection_lines.append("・次回改善案: ◎○の軸は維持しつつ、ワイド/三連複の保険を1〜2点追加して取りこぼしを減らす。")
     return "\n".join(reflection_lines)
 
+def memo_ui(text_area_key):
+    st.markdown("###### 📝 予想メモ機能")
+    
+    if text_area_key not in st.session_state:
+        st.session_state[text_area_key] = ""
+
+    memo_cols = st.columns([3, 1, 1])
+    with memo_cols[0]:
+        memo_options = ["---"] + st.session_state.saved_memos
+        selected_memo = st.selectbox(
+            "保存したメモ",
+            memo_options,
+            key=f"{text_area_key}_memo_selector",
+            label_visibility="collapsed"
+        )
+
+    with memo_cols[1]:
+        if st.button("読み込む", key=f"{text_area_key}_load_memo", use_container_width=True):
+            if selected_memo != "---":
+                st.session_state[text_area_key] = selected_memo
+                st.rerun()
+
+    with memo_cols[2]:
+        if st.button("削除", key=f"{text_area_key}_delete_memo", use_container_width=True):
+            if selected_memo != "---" and selected_memo in st.session_state.saved_memos:
+                st.session_state.saved_memos.remove(selected_memo)
+                st.toast("選択したメモを削除しました。")
+                st.rerun()
+
+    if st.button("現在の内容をメモとして保存", key=f"{text_area_key}_save_memo_main", use_container_width=True):
+        current_text = st.session_state.get(text_area_key, "")
+        if current_text and current_text not in st.session_state.saved_memos:
+            st.session_state.saved_memos.append(current_text)
+            st.toast("メモを保存しました。")
+            st.rerun()
+        elif not current_text:
+            st.toast("保存する内容がありません。")
+        else:
+            st.toast("このメモは既に保存されています。")
+
 # --- Streamlit UI ---
 st.sidebar.title("🏇 メニュー")
-app_mode = st.sidebar.radio("モード選択", ["単一レース予想", "バックテスト"], index=0)
+app_mode = st.sidebar.radio("モード選択", ["単一レース予想", "バックテスト", "予想履歴"], index=0)
 
 with st.sidebar.expander("🗂️ HTML保存 / 一括テーブル生成", expanded=False):
     st.caption("保存済みHTMLから一括でテーブルを作るための管理パネルです。")
@@ -553,10 +593,15 @@ if app_mode == "バックテスト":
     with col2:
         bt_max_horses = st.number_input("最大送信頭数（トークン節約用）", min_value=5, max_value=18, value=12, help="馬番の大きい外枠の馬から除外されます。全頭送るとトークンを消費します。")
 
+    col_bt_op1, col_bt_op2 = st.columns([4, 1])
+    with col_bt_op1:
+        st.markdown("**✍️ あなたの予想・注目馬（AIへの指示や意見があれば入力してください）**")
+
     bt_user_opinion = st.text_area(
-        "✍️ あなたの予想・注目馬（AIへの指示や意見があれば入力してください）",
+        "あなたの予想・注目馬",
         placeholder="例: 1番の馬の逃げ残りに期待。雨が降っているので外枠有利。",
-        key="bt_user_opinion"
+        key="bt_user_opinion",
+        label_visibility="collapsed"
     )
 
     st.markdown("#### 買い方設定 (バックテスト用)")
@@ -702,6 +747,11 @@ if app_mode == "バックテスト":
                 if not shutuba_df.empty:
                     ctx += "[出馬表]\n" + shutuba_df.to_csv(index=False, sep='|') + "\n"
                     
+                is_classic = any(keyword in race_info['name'] for keyword in ["桜花賞", "皐月賞", "優駿牝馬", "オークス", "東京優駿", "日本ダービー", "菊花賞"])
+                classic_instruction = ""
+                if is_classic:
+                    classic_instruction = "※本レースは3歳クラシック競走のため、未知の距離・条件への対応力が重要になります。そのため、他の要素よりも「血統背景（特に母父や配合傾向）」を2倍重視して予想を行ってください。\n"
+
                 for horse in horses_data:
                     ped = horse['pedigree']
                     res_df = horse['results']
@@ -748,6 +798,7 @@ if app_mode == "バックテスト":
                     ctx += short_df.head(5).to_csv(index=False, header=False, sep=',') + "\n"
 
                 prompt = f"""あなたはプロの競馬予想家です。出走馬データから総合的な予想を行い買い目を出力してください。予算:{bt_effective_budget}円。
+{classic_instruction}
 【出力要件】
 1. レース見解と予想印
 2. 買い目（※必ず以下のJSONフォーマットでテキストの最後に記述すること）
@@ -793,6 +844,46 @@ if app_mode == "バックテスト":
                     st.write("■ 券種別成績"); st.dataframe(tk_df, use_container_width=True)
                 st.write("■ 詳細履歴"); st.dataframe(df_res, use_container_width=True)
             with open(csv_file, 'rb') as f: st.download_button("📥 CSVをダウンロード", f, file_name="backtest_results.csv")
+    st.stop()
+
+if app_mode == "予想履歴":
+    st.title("📂 予想履歴")
+    st.markdown("これまでにAIが予想した内容の履歴を確認できます。")
+    
+    log_file = "prediction_log.csv"
+    if os.path.exists(log_file):
+        try:
+            df_log = pd.read_csv(log_file, encoding='utf-8-sig')
+            if df_log.empty:
+                st.info("予想履歴はまだありません。")
+            else:
+                df_log = df_log.sort_values(by="Timestamp", ascending=False).reset_index(drop=True)
+                
+                st.dataframe(
+                    df_log[["Timestamp", "RaceID", "Model", "Budget"]], 
+                    use_container_width=True
+                )
+                
+                st.markdown("### 📝 詳細確認")
+                selected_idx = st.selectbox(
+                    "確認したい予想を選択してください", 
+                    df_log.index, 
+                    format_func=lambda x: f"{df_log.loc[x, 'Timestamp']} - レースID: {df_log.loc[x, 'RaceID']} ({df_log.loc[x, 'Model']})"
+                )
+                
+                if selected_idx is not None:
+                    row = df_log.loc[selected_idx]
+                    st.markdown(f"**日時:** {row['Timestamp']} | **レースID:** {row['RaceID']} | **モデル:** {row['Model']} | **予算:** {row['Budget']}円")
+                    
+                    with st.expander("AIへの指示（プロンプト）"):
+                        st.text(row.get("Prompt", "データなし"))
+                        
+                    st.markdown("#### 🎯 AIの予想結果")
+                    st.write(row.get("Response", "データなし"))
+        except Exception as e:
+            st.error(f"履歴の読み込み中にエラーが発生しました: {e}")
+    else:
+        st.info("予想履歴はまだありません。")
     st.stop()
 
 st.title("🏇 わーちゃんのレース予想AI")
@@ -921,9 +1012,14 @@ if st.session_state.all_horse_data:
 
     st.subheader(f"🤖 {ai_choice} によるレース分析")
 
+    col_op1, col_op2 = st.columns([4, 1])
+    with col_op1:
+        st.markdown("**✍️ あなたの予想・注目馬（AIへの指示や意見があれば入力してください）**")
+
     user_opinion = st.text_area(
-        "✍️ あなたの予想・注目馬（AIへの指示や意見があれば入力してください）",
-        placeholder="例: 1番の馬の逃げ残りに期待。雨が降っているので外枠有利。"
+        "あなたの予想・注目馬",
+        placeholder="例: 1番の馬の逃げ残りに期待。雨が降っているので外枠有利。",
+        label_visibility="collapsed"
     )
 
     r_info = st.session_state.race_info or {"name": "不明", "data": "不明"}
@@ -1015,8 +1111,15 @@ if st.session_state.all_horse_data:
     
     if st.button("AIで多角分析を実行"):
         def run_perspectives(ai_name, ask_func, context):
+            race_name = st.session_state.race_info.get("name", "") if st.session_state.race_info else ""
+            is_classic = any(keyword in race_name for keyword in ["桜花賞", "皐月賞", "優駿牝馬", "オークス", "東京優駿", "日本ダービー", "菊花賞"])
+            
+            blood_focus = "「血統（父、母、母父の傾向や血統背景）」を最重視"
+            if is_classic:
+                blood_focus += "（※本レースはクラシック競走のため、未知の距離への対応力を測るべく、特に母父や配合傾向などの血統背景を通常以上に深く考察してください）"
+
             perspectives = [
-                ("🩸 血統重視", "「血統（父、母、母父の傾向や血統背景）」を最重視"),
+                ("🩸 血統重視", blood_focus),
                 ("📊 指数・データ重視", "「過去の戦績、着順、タイム、馬場適性、近走馬体重」を最重視"),
                 ("🏇 展開重視", "「脚質、枠順、今回のメンバー構成（逃げ先行馬の数）」を最重視")
             ]
@@ -1162,13 +1265,19 @@ if st.session_state.all_horse_data:
                 st.warning("カスタムの買い方条件を1件以上、予算ありで設定してください。")
                 st.stop()
 
+            race_name = st.session_state.race_info.get("name", "") if st.session_state.race_info else ""
+            is_classic = any(keyword in race_name for keyword in ["桜花賞", "皐月賞", "優駿牝馬", "オークス", "東京優駿", "日本ダービー", "菊花賞"])
+            classic_instruction = ""
+            if is_classic:
+                classic_instruction = "※本レースは3歳クラシック競走のため、未知の距離・条件への対応力が重要になります。「血統重視の予想」の評価ウェイトを他の2つの視点の【2倍】にして、総合評価および買い目の構築を行ってください。\n\n"
+
             for ai_name, results_dict in st.session_state.analysis_results.items():
                 ask_func = ask_gemini if ai_name == "Gemini" else ask_chatgpt
                 with st.spinner(f"{ai_name} が共通項を抽出し、最終結論を生成中..."):
                     summary_prompt = f"""あなたは総合競馬予想のスペシャリストです。
 以下の3つの異なる視点からの予想結果を分析し、共通項を抽出して最終的な予想と買い目を出力してください。
 
-【3つの視点からの予想結果】
+{classic_instruction}【3つの視点からの予想結果】
 ■ 血統重視の予想
 {results_dict.get('🩸 血統重視', '')}
 
