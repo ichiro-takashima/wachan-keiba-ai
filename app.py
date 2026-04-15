@@ -162,6 +162,133 @@ def analyze_track_preference(results_df):
     elif good_track_in_money > 0: return "馬場不問"
     else: return "傾向なし"
 
+
+def _build_race_comparison_table(all_horse_data, shutuba_df=None, max_races=8):
+    """出走馬同士で共通して走ったレースを横比較できる対戦表を作る。"""
+    if not all_horse_data:
+        return pd.DataFrame()
+
+    horse_meta = []
+    umaban_col = _find_matching_column(shutuba_df, ["馬番"]) if shutuba_df is not None else None
+    name_col = _find_matching_column(shutuba_df, ["馬名"]) if shutuba_df is not None else None
+    waku_col = _find_matching_column(shutuba_df, ["枠"]) if shutuba_df is not None else None
+    shutuba_lookup = {}
+    if shutuba_df is not None and not shutuba_df.empty and name_col:
+        for _, row in shutuba_df.iterrows():
+            shutuba_lookup[str(row.get(name_col, "")).strip()] = {
+                "馬番": row.get(umaban_col, "") if umaban_col else "",
+                "枠": row.get(waku_col, "") if waku_col else ""
+            }
+
+    race_map = {}
+    for horse in all_horse_data:
+        horse_name = str(horse.get("pedigree", {}).get("name", "")).strip()
+        horse_results = horse.get("results")
+        if horse_results is None or horse_results.empty:
+            horse_meta.append({"馬名": horse_name, "馬番": "", "枠": ""})
+            continue
+
+        date_col = _find_matching_column(horse_results, ["日付"])
+        place_col = _find_matching_column(horse_results, ["開催"])
+        r_col = _find_matching_column(horse_results, ["R"])
+        race_name_col = _find_matching_column(horse_results, ["レース名", "レース"])
+        distance_col = _find_matching_column(horse_results, ["距離"])
+        rank_col = _find_matching_column(horse_results, ["着順", "着"])
+        time_col = _find_matching_column(horse_results, ["タイム"])
+        if not all([date_col, race_name_col, rank_col]):
+            horse_meta.append({"馬名": horse_name, "馬番": "", "枠": ""})
+            continue
+
+        for _, row in horse_results.head(20).iterrows():
+            race_name = str(row.get(race_name_col, "")).strip()
+            if not race_name:
+                continue
+            date_raw = str(row.get(date_col, "")).strip()
+            date_ts = pd.to_datetime(date_raw, errors="coerce")
+            date_key = date_ts.strftime("%Y/%m/%d") if pd.notna(date_ts) else date_raw
+            place = str(row.get(place_col, "")).strip() if place_col else ""
+            distance = str(row.get(distance_col, "")).strip() if distance_col else ""
+            round_no = str(row.get(r_col, "")).strip() if r_col else ""
+            race_key = " | ".join([date_key, place, round_no, distance, race_name])
+
+            rank_txt = str(row.get(rank_col, "")).strip()
+            rank_num = pd.to_numeric(pd.Series([rank_txt]).astype(str).str.extract(r"(\d+)")[0], errors="coerce").iloc[0]
+            time_txt = str(row.get(time_col, "")).strip() if time_col else ""
+            parts = [f"{rank_txt}着" if rank_txt else "", time_txt]
+            cell_txt = " ".join([p for p in parts if p and p != "nan"]).strip()
+
+            label_lines = [date_key]
+            if place or distance:
+                label_lines.append(" ".join([p for p in [place, distance] if p]))
+            label_lines.append(race_name)
+            race_label = "\n".join([x for x in label_lines if x])
+
+            if race_key not in race_map:
+                race_map[race_key] = {
+                    "label": race_label,
+                    "date": date_ts if pd.notna(date_ts) else pd.Timestamp.min,
+                    "participants": set(),
+                    "cells": {},
+                    "ranks": {}
+                }
+            race_map[race_key]["participants"].add(horse_name)
+            race_map[race_key]["cells"][horse_name] = cell_txt if cell_txt else "—"
+            race_map[race_key]["ranks"][horse_name] = rank_num
+
+        horse_entry = {"馬名": horse_name, "馬番": "", "枠": ""}
+        if horse_name in shutuba_lookup:
+            horse_entry.update(shutuba_lookup[horse_name])
+        horse_meta.append(horse_entry)
+
+    if not race_map:
+        return pd.DataFrame()
+
+    candidate_races = [
+        (k, v) for k, v in race_map.items()
+        if len(v["participants"]) >= 2
+    ]
+    if not candidate_races:
+        return pd.DataFrame()
+
+    candidate_races.sort(key=lambda x: (x[1]["date"], len(x[1]["participants"])), reverse=True)
+    selected_races = candidate_races[:max_races]
+
+    base_df = pd.DataFrame(horse_meta).drop_duplicates(subset=["馬名"])
+    base_df["馬番_num"] = pd.to_numeric(base_df["馬番"], errors="coerce")
+    base_df = base_df.sort_values(by=["馬番_num", "馬名"], na_position="last").drop(columns=["馬番_num"])
+
+    for race_key, race_meta in selected_races:
+        col_name = race_meta["label"]
+        base_df[col_name] = base_df["馬名"].map(race_meta["cells"]).fillna("")
+
+    return base_df
+
+
+def _style_race_comparison(df):
+    """対戦表の着順に応じてセル色を付ける。"""
+    if df.empty:
+        return df
+
+    race_cols = [c for c in df.columns if c not in ["枠", "馬番", "馬名"]]
+
+    def color_cell(value):
+        rank_match = re.search(r"(\d+)着", str(value))
+        if not rank_match:
+            return ""
+        rank = int(rank_match.group(1))
+        if rank == 1:
+            return "background-color: #fff4a3;"
+        if rank == 2:
+            return "background-color: #d6efff;"
+        if rank == 3:
+            return "background-color: #ffd9d9;"
+        return ""
+
+    styler = df.style
+    if race_cols:
+        styler = styler.applymap(color_cell, subset=race_cols)
+    return styler
+
 def normalize_ticket_type(t):
     return str(t).replace("三連", "3連").strip()
 
@@ -983,6 +1110,19 @@ if st.session_state.all_horse_data:
     if st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:
         st.subheader("📊 本レース出馬表（馬番・騎手・斤量など）")
         st.dataframe(st.session_state.shutuba_table, use_container_width=True)
+
+    st.subheader("⚔️ 出走馬の対戦表（過去同一レース比較）")
+    race_compare_count = st.slider("表示する比較レース数", min_value=3, max_value=12, value=8, step=1)
+    race_comparison_df = _build_race_comparison_table(
+        st.session_state.all_horse_data,
+        st.session_state.shutuba_table,
+        max_races=race_compare_count
+    )
+    if race_comparison_df.empty:
+        st.caption("今回の出走馬同士で共通出走したレースが見つかりませんでした。")
+    else:
+        st.caption("同じレースに出走していた馬の着順・タイムを横並びで比較できます（1〜3着は色付き）。")
+        st.dataframe(_style_race_comparison(race_comparison_df), use_container_width=True, height=600)
 
     if st.session_state.past_trend_df is not None and not st.session_state.past_trend_df.empty:
         st.subheader("🕰️ 同レース過去5年（1〜3着の傾向）")
