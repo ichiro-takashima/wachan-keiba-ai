@@ -1,5 +1,5 @@
-streamlit
 google-generativeai
+streamlit
 pandas
 openai
 beautifulsoup4
