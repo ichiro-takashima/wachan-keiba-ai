@@ -294,7 +294,7 @@ def get_horse_ids_from_race(race_id):
                         umaban = int(tds[2].text.strip())
                         a_tag = tds[3].find("a")
                         if a_tag and "href" in a_tag.attrs:
-                            match = re.search(r"/horse/(\d{10})", a_tag["href"])
+                            match = re.search(r"/horse/([a-zA-Z0-9]{10})", a_tag["href"])
                             if match:
                                 horse_list.append({"pop": popularity, "umaban": umaban, "id": match.group(1)})
                     except Exception: pass
@@ -309,7 +309,7 @@ def get_horse_ids_from_race(race_id):
         soup_future = BeautifulSoup(res_future.text, "html.parser")
         horse_ids = []
         for link in soup_future.find_all("a", href=True):
-            match = re.search(r"/horse/(\d{10})", link["href"])
+            match = re.search(r"/horse/([a-zA-Z0-9]{10})", link["href"])
             if match: horse_ids.append(match.group(1))
         return list(dict.fromkeys(horse_ids))[:18]
     except Exception:
@@ -404,6 +404,44 @@ def scrape_shutuba_table(race_id):
         driver.quit()
 
 
+def _extract_payouts_from_soup(soup):
+    payouts = {}
+    for table in soup.find_all("table", class_="pay_table_01"):
+        for tr in table.find_all("tr"):
+            th = tr.find("th")
+            tds = tr.find_all("td")
+            if th and len(tds) >= 2:
+                ticket_type = th.text.strip()
+                combos = list(tds[0].stripped_strings)
+                pays = list(tds[1].stripped_strings)
+                if ticket_type not in payouts: payouts[ticket_type] = []
+                for combo, pay in zip(combos, pays):
+                    pay_val = pay.replace(",", "").replace("円", "")
+                    if pay_val.isdigit():
+                        payouts[ticket_type].append({"combo": combo, "pay": int(pay_val)})
+    if payouts:
+        return payouts
+
+    for table in soup.find_all("table", class_=re.compile(r"Payout_Detail_Table|pay_table", re.IGNORECASE)):
+        for tr in table.find_all("tr"):
+            th = tr.find("th", class_="Ticket") or tr.find("th")
+            tds = tr.find_all("td")
+            td_num = tr.find("td", class_="Number") or (tds[0] if len(tds) > 0 else None)
+            td_pay = tr.find("td", class_="Payout") or (tds[1] if len(tds) > 1 else None)
+            
+            if th and td_num and td_pay:
+                ticket_type = th.text.strip()
+                combos = [li.text.strip() for li in td_num.find_all("li")] if td_num.find("ul") else list(td_num.stripped_strings)
+                pays = [li.text.strip() for li in td_pay.find_all("li")] if td_pay.find("ul") else list(td_pay.stripped_strings)
+                
+                if ticket_type not in payouts: payouts[ticket_type] = []
+                for combo, pay in zip(combos, pays):
+                    pay_val = pay.replace(",", "").replace("円", "")
+                    if pay_val.isdigit():
+                        payouts[ticket_type].append({"combo": combo, "pay": int(pay_val)})
+    return payouts
+
+
 def scrape_payouts(race_id):
     url = f"https://db.netkeiba.com/race/{race_id}/"
     try:
@@ -411,53 +449,53 @@ def scrape_payouts(race_id):
         response = session.get(url, headers=HEADERS, timeout=10)
         response.encoding = "euc-jp"
         soup = BeautifulSoup(response.text, "html.parser")
-        payouts = {}
-        for table in soup.find_all("table", class_="pay_table_01"):
-            for tr in table.find_all("tr"):
-                th = tr.find("th")
-                tds = tr.find_all("td")
-                if th and len(tds) >= 2:
-                    ticket_type = th.text.strip()
-                    combos = list(tds[0].stripped_strings)
-                    pays = list(tds[1].stripped_strings)
-                    if ticket_type not in payouts: payouts[ticket_type] = []
-                    for combo, pay in zip(combos, pays):
-                        pay_val = pay.replace(",", "").replace("円", "")
-                        if pay_val.isdigit():
-                            payouts[ticket_type].append({"combo": combo, "pay": int(pay_val)})
+        payouts = _extract_payouts_from_soup(soup)
+        
+        if not payouts:
+            url_fallback = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
+            time.sleep(1)
+            response_fb = session.get(url_fallback, headers=HEADERS, timeout=10)
+            response_fb.encoding = "euc-jp"
+            soup_fb = BeautifulSoup(response_fb.text, "html.parser")
+            payouts = _extract_payouts_from_soup(soup_fb)
+            
         return payouts
     except Exception: return {}
 
 
 def scrape_race_result_page(race_id):
     url = f"https://db.netkeiba.com/race/{race_id}/"
+    payouts = {}
+    save_meta = {"path": "", "skipped": False}
     try:
-        save_meta = save_race_html_binary(race_id)
-        html_text = load_race_html_text(race_id)
-        if not html_text:
-            return {"ok": False, "url": url, "payouts": {}}
-        
-        payouts = {}
-        soup = BeautifulSoup(html_text, "html.parser")
-        for table in soup.find_all("table", class_="pay_table_01"):
-            for tr in table.find_all("tr"):
-                th = tr.find("th")
-                tds = tr.find_all("td")
-                if not th or len(tds) < 2:
-                    continue
-                ticket_type = th.text.strip()
-                combos = list(tds[0].stripped_strings)
-                pays = list(tds[1].stripped_strings)
-                if ticket_type not in payouts:
-                    payouts[ticket_type] = []
-                for combo, pay in zip(combos, pays):
-                    pay_val = pay.replace(",", "").replace("円", "")
-                    if pay_val.isdigit():
-                        payouts[ticket_type].append({"combo": combo, "pay": int(pay_val)})
+        try:
+            save_meta = save_race_html_binary(race_id)
+            html_text = load_race_html_text(race_id)
+            if html_text:
+                soup = BeautifulSoup(html_text, "html.parser")
+                payouts = _extract_payouts_from_soup(soup)
+        except requests.exceptions.HTTPError:
+            pass
 
-        return {"ok": True, "url": url, "payouts": payouts, "html_path": str(save_meta["path"]), "html_skipped": save_meta["skipped"]}
+        if not payouts:
+            fallback_url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
+            time.sleep(1)
+            res2 = session.get(fallback_url, headers=HEADERS, timeout=10)
+            res2.encoding = "euc-jp"
+            soup2 = BeautifulSoup(res2.text, "html.parser")
+            payouts = _extract_payouts_from_soup(soup2)
+            if payouts:
+                url = fallback_url
+        
+        if payouts:
+            return {"ok": True, "url": url, "payouts": payouts, "html_path": str(save_meta.get("path", "")), "html_skipped": save_meta.get("skipped", False)}
+        else:
+            return {"ok": False, "url": url, "payouts": {}}
     except Exception:
         return {"ok": False, "url": url, "payouts": {}}
+
+
+
 
 
 def scrape_race_info(race_id):
