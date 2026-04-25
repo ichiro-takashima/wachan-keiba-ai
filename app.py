@@ -9,6 +9,7 @@ import json
 import csv
 import scraper
 from datetime import datetime
+from evaluator import Evaluator
 
 # --- カスタムCSSの読み込み ---
 def load_css(file_name):
@@ -828,6 +829,92 @@ if app_mode == "バックテスト":
         st.session_state.get("bt_custom_ticket_requests", []),
         bt_budget
     )
+
+    with st.expander("📊 EvaluatorクラスでCSV検証（AI vs 人気順）", expanded=False):
+        st.caption("prediction CSV と payout CSV をアップロードすると、evaluator.py のロジックで客観的指標を算出します。")
+        ev_col1, ev_col2 = st.columns(2)
+        with ev_col1:
+            ev_top_n = st.number_input("上位N頭", min_value=2, max_value=18, value=3, step=1, key="ev_top_n")
+        with ev_col2:
+            ev_stake = st.number_input("1点購入額(円)", min_value=100, max_value=10000, value=100, step=100, key="ev_stake")
+
+        pred_file = st.file_uploader("prediction CSV", type=["csv"], key="ev_pred_file")
+        payout_file = st.file_uploader("payout CSV", type=["csv"], key="ev_payout_file")
+        st.markdown("**期待する列名の例**")
+        st.code("prediction: race_id, horse_number, pred_score, popularity\npayout: race_id, 券種, 組番, 払戻金", language="text")
+
+        if st.button("Evaluatorで比較実行", key="run_evaluator_compare"):
+            if pred_file is None or payout_file is None:
+                st.warning("prediction CSV と payout CSV の両方をアップロードしてください。")
+            else:
+                try:
+                    pred_df = pd.read_csv(pred_file)
+                    payout_df = pd.read_csv(payout_file)
+
+                    race_col = _find_matching_column(pred_df, ["race_id", "レースID", "raceId"])
+                    horse_col = _find_matching_column(pred_df, ["horse_number", "馬番"])
+                    score_col = _find_matching_column(pred_df, ["pred_score", "score", "予測スコア"])
+                    pop_col = _find_matching_column(pred_df, ["popularity", "人気", "人気順"])
+
+                    payout_race_col = _find_matching_column(payout_df, ["race_id", "レースID", "raceId"])
+                    payout_type_col = _find_matching_column(payout_df, ["券種", "type"])
+                    payout_combo_col = _find_matching_column(payout_df, ["組番", "combo"])
+                    payout_amt_col = _find_matching_column(payout_df, ["払戻金", "pay", "payout"])
+
+                    missing = []
+                    if race_col is None: missing.append("prediction.race_id")
+                    if horse_col is None: missing.append("prediction.horse_number")
+                    if score_col is None: missing.append("prediction.pred_score")
+                    if pop_col is None: missing.append("prediction.popularity")
+                    if payout_race_col is None: missing.append("payout.race_id")
+                    if payout_type_col is None: missing.append("payout.券種")
+                    if payout_combo_col is None: missing.append("payout.組番")
+                    if payout_amt_col is None: missing.append("payout.払戻金")
+                    if missing:
+                        st.error("必要列が不足しています: " + ", ".join(missing))
+                        st.stop()
+
+                    ev = Evaluator(top_n=int(ev_top_n), stake_per_ticket=int(ev_stake))
+                    summary_df, detail_df = ev.compare_model_vs_popularity(
+                        prediction_df=pred_df,
+                        payout_df=payout_df,
+                        score_col=score_col,
+                        popularity_col=pop_col,
+                        race_id_col=race_col,
+                        horse_col=horse_col,
+                    )
+
+                    rename_map = {
+                        "strategy_name": "戦略",
+                        "top_n": "上位N",
+                        "total_races": "対象レース数",
+                        "total_tickets": "購入点数",
+                        "total_bet": "購入総額",
+                        "total_return": "払戻総額",
+                        "hit_tickets": "的中点数",
+                        "hit_races": "的中レース数",
+                        "ticket_hit_rate": "券単位的中率(%)",
+                        "race_hit_rate": "レース単位的中率(%)",
+                        "return_rate": "回収率(%)",
+                    }
+                    summary_view = summary_df.rename(columns=rename_map).copy()
+                    for c in ["券単位的中率(%)", "レース単位的中率(%)", "回収率(%)"]:
+                        if c in summary_view.columns:
+                            summary_view[c] = summary_view[c].round(2)
+
+                    st.success("Evaluatorでの比較が完了しました。")
+                    st.dataframe(summary_view, use_container_width=True)
+                    st.caption("戦略: model=AI予測スコア順 / popularity=人気順")
+
+                    detail_download = detail_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                    summary_download = summary_view.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                    dl_col1, dl_col2 = st.columns(2)
+                    with dl_col1:
+                        st.download_button("📥 summary CSV", summary_download, file_name="evaluator_summary.csv", mime="text/csv")
+                    with dl_col2:
+                        st.download_button("📥 detail CSV", detail_download, file_name="evaluator_detail.csv", mime="text/csv")
+                except Exception as e:
+                    st.error(f"Evaluator実行中にエラーが発生しました: {e}")
 
     if st.button("バックテスト実行"):
         if bt_bet_plan_mode == "カスタム" and bt_effective_budget <= 0:
