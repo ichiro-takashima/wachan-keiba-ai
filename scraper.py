@@ -365,7 +365,11 @@ def scrape_shutuba_table(race_id):
             jockey_td = row.select_one(".Jockey")
             jockey = jockey_td.get_text(strip=True) if jockey_td else ""
 
-            # --- 6. オッズと人気 ---
+            # --- 6. 馬体重 ---
+            horse_weight_td = row.find("td", class_="Weight")
+            horse_weight = horse_weight_td.get_text(strip=True) if horse_weight_td else ""
+
+            # --- 7. オッズと人気 ---
             # オッズの抽出
             odds_span = row.find("span", id=re.compile(r"odds[-_]"))
             if odds_span:
@@ -392,6 +396,7 @@ def scrape_shutuba_table(race_id):
                 "性齢": seirei,
                 "斤量": weight,
                 "騎手": jockey,
+                "馬体重": horse_weight,
                 "オッズ": odds,
                 "人気": ninki
             })

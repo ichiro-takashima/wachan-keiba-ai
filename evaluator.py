@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Iterable, Literal
@@ -14,7 +15,7 @@ class EvaluationResult:
     """シミュレーション結果をまとめるためのコンテナ。"""
 
     strategy_name: str
-    top_n: int
+    top_n: int | str
     total_races: int
     total_tickets: int
     total_bet: int
@@ -39,17 +40,19 @@ class Evaluator:
 
     def __init__(
         self,
-        top_n: int = 3,
+        top_n: int | None = 3,
         stake_per_ticket: int = 100,
         bet_types: Iterable[BetType] = ("馬連", "ワイド", "三連複"),
+        budget: int | None = None,
     ) -> None:
-        if top_n < 2:
+        if top_n is not None and top_n < 2:
             raise ValueError("top_n は2以上で指定してください。")
         if stake_per_ticket <= 0:
             raise ValueError("stake_per_ticket は1以上で指定してください。")
         self.top_n = top_n
         self.stake_per_ticket = stake_per_ticket
         self.bet_types = tuple(bet_types)
+        self.budget = budget
 
     @staticmethod
     def _normalize_combo(combo: str, bet_type: str) -> str:
@@ -64,6 +67,25 @@ class Evaluator:
                 return "-".join(sorted(parts))
         return "-".join(parts)
 
+    def _get_top_n_for_bet_type(self, bet_type: str) -> int:
+        """券種と予算(または固定top_n)に応じて、ボックスの頭数Nを計算する。"""
+        if self.budget is None:
+            return self.top_n or 3
+            
+        combo_size_map = {"馬連": 2, "ワイド": 2, "三連複": 3}
+        r = combo_size_map.get(bet_type)
+        if not r:
+            return 0
+            
+        max_tickets = self.budget // self.stake_per_ticket
+        if max_tickets < 1:
+            return 0
+            
+        n = r
+        while math.comb(n + 1, r) <= max_tickets:
+            n += 1
+        return n
+
     def _build_box_tickets(
         self,
         ranking_df: pd.DataFrame,
@@ -76,11 +98,17 @@ class Evaluator:
         combo_size_map = {"馬連": 2, "ワイド": 2, "三連複": 3}
 
         for race_id, group in ranking_df.groupby(race_id_col):
-            horses = [str(v) for v in group[horse_col].tolist()]
             for bet_type in self.bet_types:
                 r = combo_size_map.get(bet_type)
-                if r is None or len(horses) < r:
+                if r is None:
                     continue
+                
+                n = self._get_top_n_for_bet_type(bet_type)
+                horses = [str(v) for v in group[horse_col].head(n).tolist()]
+                
+                if len(horses) < r:
+                    continue
+                
                 for combo in combinations(horses, r):
                     combo_text = "-".join(combo)
                     tickets.append(
@@ -115,7 +143,7 @@ class Evaluator:
 
         return EvaluationResult(
             strategy_name=strategy_name,
-            top_n=self.top_n,
+            top_n=f"予算{self.budget}円" if self.budget is not None else (self.top_n or 0),
             total_races=total_races,
             total_tickets=total_tickets,
             total_bet=total_bet,
