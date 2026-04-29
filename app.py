@@ -7,6 +7,7 @@ import os
 import re
 import json
 import csv
+import itertools
 import scraper
 from datetime import datetime
 from evaluator import Evaluator
@@ -29,7 +30,7 @@ API_KEY_OPENAI = os.getenv("OPENAI_API_KEY")
 if API_KEY_OPENAI is None:
     st.sidebar.error("⚠️ APIキーが読み込めていません。再度 setx コマンドを実行し、PCを再起動してください。")
 
-ai_choice = st.radio("使用するAIを選択", ["Gemini", "ChatGPT", "両方で比較"], horizontal=True)
+ai_choice = st.radio("使用するAIを選択", ["Gemini", "ChatGPT", "両方で比較", "ルールベース (AI不使用)"], horizontal=True)
 # --- 分析用ヘルパー関数 ---
 def ask_gemini(prompt):
     genai.configure(api_key=API_KEY_GEMINI)
@@ -163,6 +164,190 @@ def analyze_track_preference(results_df):
     elif good_track_in_money > 0: return "馬場不問"
     else: return "傾向なし"
 
+def calculate_deviations(scores):
+    if not scores:
+        return []
+    mean = sum(scores) / len(scores)
+    variance = sum((x - mean) ** 2 for x in scores) / len(scores)
+    std_dev = variance ** 0.5
+    if std_dev == 0:
+        return [50.0] * len(scores)
+    return [50 + (x - mean) / std_dev * 10 for x in scores]
+
+def run_rule_based_analysis(all_horse_data, shutuba_df):
+    horses = []
+    umaban_col = _find_matching_column(shutuba_df, ["馬番"]) if shutuba_df is not None else None
+    name_col = _find_matching_column(shutuba_df, ["馬名"]) if shutuba_df is not None else None
+    
+    for horse in all_horse_data:
+        hid = horse["id"]
+        ped = horse.get("pedigree", {})
+        results = horse.get("results", pd.DataFrame())
+        name = ped.get("name", "不明")
+        
+        umaban = ""
+        if shutuba_df is not None and not shutuba_df.empty and name_col and umaban_col:
+            match_row = shutuba_df[shutuba_df[name_col].astype(str).str.replace(r'\s+', '', regex=True) == str(name).replace(' ', '')]
+            if not match_row.empty:
+                umaban = str(match_row.iloc[0][umaban_col])
+        
+        data_score = 0
+        if not results.empty:
+            rank_col = _find_matching_column(results, ["着順", "着"])
+            if rank_col:
+                ranks = pd.to_numeric(results[rank_col].astype(str).str.extract(r'(\d+)')[0], errors="coerce").dropna()
+                if not ranks.empty:
+                    data_score += (18 - ranks.mean()) * 5
+                    
+            up_col = _find_matching_column(results, ["上り", "上がり", "上り3F", "上がり3F"])
+            if up_col:
+                up_times = pd.to_numeric(results[up_col].astype(str).str.extract(r'(\d+\.\d+)')[0], errors="coerce").dropna()
+                if not up_times.empty:
+                    data_score += (40 - up_times.mean()) * 2
+                    
+        ten_score = 0
+        corner_col = _find_matching_column(results, ["通過", "コーナー通過順位", "コーナー"])
+        if corner_col:
+            first_corners = []
+            for pos_str in results[corner_col].dropna():
+                positions = [int(p) for p in re.findall(r'\d+', str(pos_str))]
+                if positions:
+                    first_corners.append(positions[0])
+            if first_corners:
+                ten_score = (18 - (sum(first_corners) / len(first_corners))) * 3
+                
+        blood_score = 0
+        track_pref = analyze_track_preference(results)
+        if "巧者" in track_pref:
+            blood_score += 10
+            
+        horses.append({
+            "id": hid,
+            "name": name,
+            "umaban": umaban,
+            "data_score": data_score,
+            "ten_score": ten_score,
+            "blood_score": blood_score,
+        })
+        
+    data_scores = [h["data_score"] for h in horses]
+    ten_scores = [h["ten_score"] for h in horses]
+    blood_scores = [h["blood_score"] for h in horses]
+    
+    data_devs = calculate_deviations(data_scores)
+    ten_devs = calculate_deviations(ten_scores)
+    blood_devs = calculate_deviations(blood_scores)
+    
+    for i, h in enumerate(horses):
+        h["data_dev"] = data_devs[i]
+        h["ten_dev"] = ten_devs[i]
+        h["blood_dev"] = blood_devs[i]
+        h["total_dev"] = (data_devs[i] + ten_devs[i] + blood_devs[i]) / 3
+        
+    def format_ranking(sorted_horses, val_key):
+        lines = []
+        marks = ["◎", "○", "▲", "△", "☆"]
+        for i, h in enumerate(sorted_horses[:5]):
+            mark = marks[i] if i < len(marks) else ""
+            lines.append(f"{mark} {h['name']} (馬番:{h['umaban']}) - 偏差値: {h[val_key]:.1f}")
+        return "\n".join(lines)
+        
+    res_data = format_ranking(sorted(horses, key=lambda x: x["data_dev"], reverse=True), "data_dev")
+    res_ten = format_ranking(sorted(horses, key=lambda x: x["ten_dev"], reverse=True), "ten_dev")
+    res_blood = format_ranking(sorted(horses, key=lambda x: x["blood_dev"], reverse=True), "blood_dev")
+    
+    return {
+        "🩸 血統・適性重視": f"【独自適性スコアによる評価】\n{res_blood}",
+        "📊 指数・データ重視": f"【過去着順・上りタイム偏差値による評価】\n{res_data}",
+        "🏇 展開重視": f"【テンの速さ・道中位置取り偏差値による評価】\n{res_ten}",
+        "_raw_horses": horses
+    }
+
+def generate_rule_based_summary(analysis_res, effective_budget, custom_requests, bet_plan_mode):
+    horses = analysis_res.get("_raw_horses", [])
+    if not horses:
+        return "データがありません。"
+        
+    sorted_horses = sorted(horses, key=lambda x: x["total_dev"], reverse=True)
+    
+    summary_text = "【総合評価（偏差値平均）】\n"
+    marks = ["◎", "○", "▲", "△", "注"]
+    top_horses = sorted_horses[:5]
+    for i, h in enumerate(top_horses):
+        mark = marks[i] if i < len(marks) else ""
+        summary_text += f"{mark} {h['name']} (馬番:{h['umaban']}) - 総合偏差値: {h['total_dev']:.1f}\n"
+        
+    if len(sorted_horses) >= 5:
+        diff = sorted_horses[0]['total_dev'] - sorted_horses[4]['total_dev']
+        if diff < 5:
+            haran = "荒れる"
+        elif diff > 15:
+            haran = "堅い"
+        else:
+            haran = "標準"
+    else:
+        haran = "標準"
+        
+    summary_text += f"\n【波乱度判定】: {haran}\n"
+    
+    bets = []
+    top_umabans = [h['umaban'] for h in top_horses if h['umaban']]
+    
+    if bet_plan_mode != "カスタム":
+        top1 = top_umabans[0] if len(top_umabans) > 0 else "1"
+        top2 = top_umabans[1] if len(top_umabans) > 1 else "2"
+        top3 = top_umabans[2] if len(top_umabans) > 2 else "3"
+        top4 = top_umabans[3] if len(top_umabans) > 3 else "4"
+        
+        if haran == "堅い":
+            amt1 = effective_budget // 2
+            amt1 = (amt1 // 100) * 100 if amt1 >= 100 else 100
+            amt2 = effective_budget - amt1
+            bets.append({"type": "3連複", "combo": f"{top1}-{top2}-{top3}", "amount": amt1})
+            bets.append({"type": "3連複", "combo": f"{top1}-{top2}-{top4}", "amount": amt2})
+        elif haran == "標準":
+            amt = effective_budget // 6
+            amt = (amt // 100) * 100 if amt >= 100 else 100
+            combos = [f"{top1}-{top2}", f"{top1}-{top3}", f"{top1}-{top4}", f"{top2}-{top3}", f"{top2}-{top4}", f"{top3}-{top4}"]
+            for c in combos:
+                bets.append({"type": "馬連", "combo": c, "amount": amt})
+        else:
+            amt1 = effective_budget // 2
+            amt1 = (amt1 // 100) * 100 if amt1 >= 100 else 100
+            amt2 = effective_budget - amt1
+            bets.append({"type": "ワイド", "combo": f"{top3}-{top1}", "amount": amt1})
+            bets.append({"type": "ワイド", "combo": f"{top3}-{top2}", "amount": amt2})
+    else:
+        for req in custom_requests:
+            t_type = req.get("ticket_type", "単勝")
+            budget = req.get("budget", 100)
+            axis = req.get("axis_horse", "").strip()
+            
+            if not axis and top_umabans:
+                axis = top_umabans[0]
+            elif not axis:
+                axis = "1"
+                
+            if t_type in ["単勝", "複勝"]:
+                bets.append({"type": t_type, "combo": axis, "amount": budget})
+            elif t_type in ["馬連", "ワイド", "馬単", "枠連"]:
+                target = top_umabans[1] if len(top_umabans) > 1 and top_umabans[1] != axis else (top_umabans[0] if top_umabans else "2")
+                bets.append({"type": t_type, "combo": f"{axis}-{target}", "amount": budget})
+            elif t_type in ["3連複", "3連単"]:
+                target1 = top_umabans[1] if len(top_umabans) > 1 and top_umabans[1] != axis else "2"
+                target2 = top_umabans[2] if len(top_umabans) > 2 and top_umabans[2] != axis else "3"
+                bets.append({"type": t_type, "combo": f"{axis}-{target1}-{target2}", "amount": budget})
+            else:
+                bets.append({"type": t_type, "combo": axis, "amount": budget})
+                
+    summary_text += "\n【提案買い目】\n"
+    for b in bets:
+        summary_text += f"・{b['type']} {b['combo']} : {b['amount']}円\n"
+        
+    bets_json = json.dumps({"bets": bets}, ensure_ascii=False)
+    summary_text += f"\n```json\n{bets_json}\n```"
+    
+    return summary_text
 
 def _build_race_comparison_table(all_horse_data, shutuba_df=None, max_races=8):
     """出走馬同士で共通して走ったレースを横比較できる対戦表を作る。"""
@@ -852,10 +1037,8 @@ if app_mode == "バックテスト":
 
     with st.expander("📊 EvaluatorクラスでCSV検証（AI vs 人気順）", expanded=False):
         st.caption("prediction CSV と payout CSV をアップロードすると、evaluator.py のロジックで客観的指標を算出します。")
-        ev_col1, ev_col2 = st.columns(2)
         ev_col1, ev_col2, ev_col3 = st.columns(3)
         with ev_col1:
-            ev_top_n = st.number_input("上位N頭", min_value=2, max_value=18, value=3, step=1, key="ev_top_n")
             ev_top_n = st.number_input("上位N頭 (予算指定時は無視)", min_value=2, max_value=18, value=3, step=1, key="ev_top_n")
         with ev_col2:
             ev_stake = st.number_input("1点購入額(円)", min_value=100, max_value=10000, value=100, step=100, key="ev_stake")
@@ -898,7 +1081,6 @@ if app_mode == "バックテスト":
                         st.error("必要列が不足しています: " + ", ".join(missing))
                         st.stop()
 
-                    ev = Evaluator(top_n=int(ev_top_n), stake_per_ticket=int(ev_stake))
                     ev = Evaluator(
                         top_n=int(ev_top_n) if ev_budget == 0 else None,
                         stake_per_ticket=int(ev_stake),
@@ -1366,7 +1548,7 @@ if st.session_state.all_horse_data:
             
         data_context += short_df.head(5).to_csv(index=False, header=False, sep=',')
     
-    if st.button("AIで多角分析を実行"):
+    if st.button("多角分析を実行"):
         def run_perspectives(ai_name, ask_func, context):
             race_name = st.session_state.race_info.get("name", "") if st.session_state.race_info else ""
             is_classic = any(keyword in race_name for keyword in ["桜花賞", "皐月賞", "優駿牝馬", "オークス", "東京優駿", "日本ダービー", "菊花賞"])
@@ -1413,6 +1595,9 @@ if st.session_state.all_horse_data:
             return results_dict
 
         st.session_state.analysis_results = {}
+        if ai_choice == "ルールベース (AI不使用)":
+            st.session_state.analysis_results["ルールベース (AI不使用)"] = run_rule_based_analysis(st.session_state.all_horse_data, st.session_state.shutuba_table)
+            
         if ai_choice in ["Gemini", "両方で比較"]:
             st.session_state.analysis_results["Gemini"] = run_perspectives("Gemini", ask_gemini, data_context)
         if ai_choice in ["ChatGPT", "両方で比較"]:
@@ -1425,6 +1610,8 @@ if st.session_state.all_horse_data:
         for ai_name, results_dict in st.session_state.analysis_results.items():
             st.markdown(f"#### {ai_name}")
             for title, res in results_dict.items():
+                if title.startswith("_"):
+                    continue
                 with st.expander(f"👁️ {title} の予想結果", expanded=False):
                     st.write(res)
 
@@ -1537,6 +1724,21 @@ if st.session_state.all_horse_data:
                 classic_instruction = "※本レースは3歳クラシック競走のため、未知の距離・条件への対応力が重要になります。「血統重視の予想」の評価ウェイトを他の2つの視点の【2倍】にして、総合評価および買い目の構築を行ってください。\n\n"
 
             for ai_name, results_dict in st.session_state.analysis_results.items():
+                if ai_name == "ルールベース (AI不使用)":
+                    final_res = generate_rule_based_summary(results_dict, effective_budget, st.session_state.custom_ticket_requests, bet_plan_mode)
+                    
+                    st.markdown(f"### 🏆 ルールベース の最終結論（偏差値総合評価）")
+                    st.write(final_res)
+
+                    parsed_bets = extract_bets_from_text(final_res)
+                    st.session_state.latest_predictions[ai_name] = {
+                        "race_id": race_id,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "bets": parsed_bets,
+                        "response": final_res
+                    }
+                    continue
+
                 ask_func = ask_gemini if ai_name == "Gemini" else ask_chatgpt
                 with st.spinner(f"{ai_name} が共通項を抽出し、最終結論を生成中..."):
                     summary_prompt = f"""あなたは総合競馬予想のスペシャリストです。
