@@ -216,6 +216,14 @@ class Evaluator:
         detail["払戻額"] = (detail["払戻金"] * (self.stake_per_ticket / 100)).round().astype(int)
         detail["的中"] = (detail["払戻額"] > 0).astype(int)
 
+        # Meta data binding
+        meta_candidates = {"distance", "track_condition", "field_size", "距離", "馬場", "馬場状態", "頭数"}
+        meta_cols = list(meta_candidates.intersection(prediction_df.columns))
+        if meta_cols:
+            meta_df = prediction_df[[race_id_col] + meta_cols].drop_duplicates(subset=[race_id_col])
+            meta_df = meta_df.rename(columns={race_id_col: "race_id"})
+            detail = detail.merge(meta_df, on="race_id", how="left")
+
         return self._summarize(detail, strategy_name), detail
 
     def compare_model_vs_popularity(

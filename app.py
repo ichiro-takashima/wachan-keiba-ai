@@ -98,6 +98,121 @@ def _get_available_columns(df, candidate_map):
                 
     return selected_cols
 
+
+AI_DATA_FEATURES = [
+    ("race_id", "レース基本: レースID"),
+    ("race_name", "レース基本: レース名"),
+    ("race_condition", "レース基本: コース・距離・天候"),
+    ("past_trend_rows", "過去傾向: 過去5年の結果表"),
+    ("past_trend_summary", "過去傾向: 勝ち馬人気・馬番傾向"),
+    ("shutuba_umaban", "出馬表: 馬番"),
+    ("shutuba_waku", "出馬表: 枠番"),
+    ("shutuba_name", "出馬表: 馬名"),
+    ("shutuba_sex_age", "出馬表: 性齢"),
+    ("shutuba_jockey", "出馬表: 騎手"),
+    ("shutuba_weight_carried", "出馬表: 斤量"),
+    ("shutuba_odds", "出馬表: オッズ"),
+    ("shutuba_popularity", "出馬表: 人気"),
+    ("shutuba_stable", "出馬表: 厩舎"),
+    ("shutuba_body_weight", "出馬表: 馬体重"),
+    ("blood_sire", "血統: 父"),
+    ("blood_dam", "血統: 母"),
+    ("blood_broodmare_sire", "血統: 母父"),
+    ("analysis_running_style", "分析: 脚質"),
+    ("analysis_track_preference", "分析: 馬場適性"),
+    ("analysis_latest_weight", "分析: 近走馬体重"),
+    ("result_date", "過去戦績: 日付"),
+    ("result_race_name", "過去戦績: レース名"),
+    ("result_place", "過去戦績: 開催場"),
+    ("result_rank", "過去戦績: 着順"),
+    ("result_popularity", "過去戦績: 人気"),
+    ("result_jockey", "過去戦績: 騎手"),
+    ("result_weight_carried", "過去戦績: 斤量"),
+    ("result_distance", "過去戦績: 距離"),
+    ("result_track", "過去戦績: 馬場"),
+    ("result_time", "過去戦績: タイム"),
+    ("result_last3f", "過去戦績: 上り3F"),
+    ("result_pace", "過去戦績: ペース"),
+    ("result_corner", "過去戦績: 通過順"),
+    ("result_body_weight", "過去戦績: 馬体重"),
+]
+
+AI_DATA_FEATURE_LABELS = dict(AI_DATA_FEATURES)
+AI_DATA_FEATURE_KEYS = [key for key, _ in AI_DATA_FEATURES]
+
+
+def render_ai_data_feature_selector(key_prefix, caption):
+    st.markdown("#### ⚙️ AIへ渡すデータ要素の選択 (過学習・ノイズ防止)")
+    st.caption(caption)
+    
+    categories = {}
+    for key, label in AI_DATA_FEATURES:
+        parts = label.split(": ", 1)
+        cat = parts[0] if len(parts) > 1 else "その他"
+        name = parts[1] if len(parts) > 1 else label
+        if cat not in categories:
+            categories[cat] = []
+        categories[cat].append((key, name))
+
+    selected = set()
+    for cat, items in categories.items():
+        with st.expander(f"📁 {cat}", expanded=False):
+            cols = st.columns(3)
+            for i, (key, name) in enumerate(items):
+                with cols[i % 3]:
+                    if st.checkbox(name, value=True, key=f"{key_prefix}_feature_{key}"):
+                        selected.add(key)
+                    
+    st.caption(f"{len(selected)} / {len(AI_DATA_FEATURES)} 項目を送信")
+    return selected
+
+
+def feature_enabled(selected_features, *keys):
+    return any(key in selected_features for key in keys)
+
+
+def get_selected_shutuba_df(shutuba_df, selected_features):
+    if shutuba_df is None or shutuba_df.empty:
+        return pd.DataFrame()
+
+    feature_columns = [
+        ("shutuba_umaban", ["馬番"]),
+        ("shutuba_waku", ["枠", "枠番"]),
+        ("shutuba_name", ["馬名"]),
+        ("shutuba_sex_age", ["性齢", "性令"]),
+        ("shutuba_jockey", ["騎手"]),
+        ("shutuba_weight_carried", ["斤量"]),
+        ("shutuba_odds", ["オッズ", "単勝"]),
+        ("shutuba_popularity", ["人気"]),
+        ("shutuba_stable", ["厩舎", "調教師"]),
+        ("shutuba_body_weight", ["馬体重"]),
+    ]
+    candidate_map = [candidates for key, candidates in feature_columns if key in selected_features]
+    cols = _get_available_columns(shutuba_df, candidate_map)
+    return shutuba_df[cols] if cols else pd.DataFrame()
+
+
+def get_selected_result_columns(results_df, selected_features):
+    feature_columns = [
+        ("result_date", ["日付"]),
+        ("result_race_name", ["レース名", "レース"]),
+        ("result_place", ["開催"]),
+        ("result_rank", ["着順", "着"]),
+        ("result_popularity", ["人気"]),
+        ("result_jockey", ["騎手"]),
+        ("result_weight_carried", ["斤量"]),
+        ("result_distance", ["距離"]),
+        ("result_track", ["馬場", "馬場状態"]),
+        ("result_time", ["タイム"]),
+        ("result_last3f", ["上り", "上がり", "上り3F", "上がり3F"]),
+        ("result_pace", ["ペース", "ﾍﾟｰｽ"]),
+        ("result_corner", ["通過", "コーナー通過順", "コーナー"]),
+        ("result_body_weight", ["馬体重"]),
+    ]
+    candidate_map = [candidates for key, candidates in feature_columns if key in selected_features]
+    return _get_available_columns(results_df, candidate_map)
+
+
 def analyze_running_style(results_df):
     """通過順位のデータから脚質を判定する"""
     if results_df is None or results_df.empty:
@@ -174,11 +289,52 @@ def calculate_deviations(scores):
         return [50.0] * len(scores)
     return [50 + (x - mean) / std_dev * 10 for x in scores]
 
-def run_rule_based_analysis(all_horse_data, shutuba_df):
+def calculate_weighted_mean(values):
+    vals = list(values)
+    if not vals:
+        return 0
+    weights = [max(0.1, 1.0 - 0.2 * i) for i in range(len(vals))]
+    return sum(v * w for v, w in zip(vals, weights)) / sum(weights)
+
+def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=None):
     horses = []
+    
+    # ベースの重み
+    data_weight = 1.0
+    ten_weight = 1.0
+    blood_weight = 1.0
+    
+    current_dist = None
+    current_track_type = None
+    
+    # レース条件に応じた重みの調整（条件別可変）
+    if race_info and "data" in race_info:
+        race_data = race_info["data"]
+        dist_match = re.search(r'(\d+)m', race_data)
+        if dist_match:
+            current_dist = int(dist_match.group(1))
+            if current_dist <= 1400:
+                ten_weight += 0.5  # 短距離：展開（テンの速さ）を重め
+            elif current_dist >= 2400:
+                data_weight += 0.5 # 長距離：データ・実績・上りを重め
+        if any(w in race_data for w in ["稍重", "重", "不良", "稍"]):
+            current_track_type = "道悪"
+            blood_weight += 0.5    # 道悪：血統・適性を重め
+        elif "良" in race_data:
+            current_track_type = "良"
+            
     umaban_col = _find_matching_column(shutuba_df, ["馬番"]) if shutuba_df is not None else None
     name_col = _find_matching_column(shutuba_df, ["馬名"]) if shutuba_df is not None else None
     
+    current_place = None
+    if race_id and len(str(race_id)) >= 6:
+        place_code = str(race_id)[4:6]
+        place_dict = {
+            "01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
+            "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉"
+        }
+        current_place = place_dict.get(place_code)
+        
     for horse in all_horse_data:
         hid = horse["id"]
         ped = horse.get("pedigree", {})
@@ -197,13 +353,15 @@ def run_rule_based_analysis(all_horse_data, shutuba_df):
             if rank_col:
                 ranks = pd.to_numeric(results[rank_col].astype(str).str.extract(r'(\d+)')[0], errors="coerce").dropna()
                 if not ranks.empty:
-                    data_score += (18 - ranks.mean()) * 5
+                    weighted_rank = calculate_weighted_mean(ranks)
+                    data_score += (18 - weighted_rank) * 5
                     
             up_col = _find_matching_column(results, ["上り", "上がり", "上り3F", "上がり3F"])
             if up_col:
                 up_times = pd.to_numeric(results[up_col].astype(str).str.extract(r'(\d+\.\d+)')[0], errors="coerce").dropna()
                 if not up_times.empty:
-                    data_score += (40 - up_times.mean()) * 2
+                    weighted_up = calculate_weighted_mean(up_times)
+                    data_score += (40 - weighted_up) * 2
                     
         ten_score = 0
         corner_col = _find_matching_column(results, ["通過", "コーナー通過順位", "コーナー"])
@@ -214,12 +372,43 @@ def run_rule_based_analysis(all_horse_data, shutuba_df):
                 if positions:
                     first_corners.append(positions[0])
             if first_corners:
-                ten_score = (18 - (sum(first_corners) / len(first_corners))) * 3
+                weighted_corner = calculate_weighted_mean(first_corners)
+                ten_score = (18 - weighted_corner) * 3
                 
         blood_score = 0
-        track_pref = analyze_track_preference(results)
-        if "巧者" in track_pref:
-            blood_score += 10
+        if not results.empty:
+            rank_col = _find_matching_column(results, ["着順", "着"])
+            if rank_col:
+                df_work = results.copy()
+                df_work['rank_num'] = pd.to_numeric(df_work[rank_col].astype(str).str.extract(r'(\d+)')[0], errors='coerce')
+                
+                if current_dist:
+                    dist_col = _find_matching_column(df_work, ['距離'])
+                    if dist_col:
+                        df_work['dist_num'] = pd.to_numeric(df_work[dist_col].astype(str).str.extract(r'(\d+)')[0], errors='coerce')
+                        dist_df = df_work[df_work['dist_num'].notna() & (abs(df_work['dist_num'] - current_dist) <= 200)]
+                        if len(dist_df) > 0:
+                            hits = len(dist_df[dist_df['rank_num'] <= 3])
+                            blood_score += (hits / len(dist_df)) * 10
+                            
+                if current_track_type:
+                    track_col = _find_matching_column(df_work, ['馬場', '馬場状態'])
+                    if track_col:
+                        if current_track_type == "良":
+                            track_df = df_work[df_work[track_col].astype(str).str.contains("良", na=False)]
+                        else:
+                            track_df = df_work[df_work[track_col].astype(str).str.contains("稍|重|不", na=False)]
+                        if len(track_df) > 0:
+                            hits = len(track_df[track_df['rank_num'] <= 3])
+                            blood_score += (hits / len(track_df)) * 10
+                            
+                if current_place:
+                    place_col = _find_matching_column(df_work, ['開催'])
+                    if place_col:
+                        place_df = df_work[df_work[place_col].astype(str).str.contains(current_place, na=False)]
+                        if len(place_df) > 0:
+                            hits = len(place_df[place_df['rank_num'] <= 3])
+                            blood_score += (hits / len(place_df)) * 10
             
         horses.append({
             "id": hid,
@@ -228,6 +417,7 @@ def run_rule_based_analysis(all_horse_data, shutuba_df):
             "data_score": data_score,
             "ten_score": ten_score,
             "blood_score": blood_score,
+            "has_data": not results.empty
         })
         
     data_scores = [h["data_score"] for h in horses]
@@ -238,11 +428,12 @@ def run_rule_based_analysis(all_horse_data, shutuba_df):
     ten_devs = calculate_deviations(ten_scores)
     blood_devs = calculate_deviations(blood_scores)
     
+    total_weight = data_weight + ten_weight + blood_weight
     for i, h in enumerate(horses):
         h["data_dev"] = data_devs[i]
         h["ten_dev"] = ten_devs[i]
         h["blood_dev"] = blood_devs[i]
-        h["total_dev"] = (data_devs[i] + ten_devs[i] + blood_devs[i]) / 3
+        h["total_dev"] = (data_devs[i] * data_weight + ten_devs[i] * ten_weight + blood_devs[i] * blood_weight) / total_weight
         
     def format_ranking(sorted_horses, val_key):
         lines = []
@@ -256,26 +447,54 @@ def run_rule_based_analysis(all_horse_data, shutuba_df):
     res_ten = format_ranking(sorted(horses, key=lambda x: x["ten_dev"], reverse=True), "ten_dev")
     res_blood = format_ranking(sorted(horses, key=lambda x: x["blood_dev"], reverse=True), "blood_dev")
     
+    weight_info = f"※適用された評価ウェイト: データ {data_weight:.1f} / 展開 {ten_weight:.1f} / 血統・適性 {blood_weight:.1f}"
+    
     return {
         "🩸 血統・適性重視": f"【独自適性スコアによる評価】\n{res_blood}",
         "📊 指数・データ重視": f"【過去着順・上りタイム偏差値による評価】\n{res_data}",
         "🏇 展開重視": f"【テンの速さ・道中位置取り偏差値による評価】\n{res_ten}",
-        "_raw_horses": horses
+        "_raw_horses": horses,
+        "_weight_info": weight_info
     }
 
 def generate_rule_based_summary(analysis_res, effective_budget, custom_requests, bet_plan_mode):
     horses = analysis_res.get("_raw_horses", [])
+    weight_info = analysis_res.get("_weight_info", "")
     if not horses:
         return "データがありません。"
         
     sorted_horses = sorted(horses, key=lambda x: x["total_dev"], reverse=True)
     
     summary_text = "【総合評価（偏差値平均）】\n"
-    marks = ["◎", "○", "▲", "△", "注"]
-    top_horses = sorted_horses[:5]
+    if weight_info:
+        summary_text += f"{weight_info}\n\n"
+    marks = ["◎", "○", "▲", "△", "注", "穴", "大穴"]
+    top_horses = sorted_horses[:7]
     for i, h in enumerate(top_horses):
         mark = marks[i] if i < len(marks) else ""
         summary_text += f"{mark} {h['name']} (馬番:{h['umaban']}) - 総合偏差値: {h['total_dev']:.1f}\n"
+        
+    # 見送り判定の追加
+    no_data_count = sum(1 for h in horses if not h.get("has_data", True))
+    is_data_shortage = no_data_count >= len(horses) / 2
+    
+    is_top_close = False
+    is_crowded = False
+    if len(sorted_horses) >= 2:
+        is_top_close = (sorted_horses[0]['total_dev'] - sorted_horses[1]['total_dev']) < 1.0
+    if len(sorted_horses) >= 5:
+        is_crowded = (sorted_horses[0]['total_dev'] - sorted_horses[4]['total_dev']) < 2.5
+
+    if is_data_shortage or is_top_close or is_crowded:
+        reasons = []
+        if is_data_shortage: reasons.append("データ欠損（過去戦績なし等の馬）が半数以上いるため")
+        if is_top_close: reasons.append("1位と2位の総合偏差値差が1.0未満で上位拮抗のため")
+        if is_crowded: reasons.append("1位と5位の総合偏差値差が2.5未満でスコアが極端に密集しているため")
+            
+        summary_text += f"\n🚨 **【見送り推奨】** 🚨\n以下の理由により、本レースは**購入見送り（ケン）**を推奨します。\n"
+        for r in reasons: summary_text += f"・{r}\n"
+        summary_text += f"\n```json\n{{\"bets\": []}}\n```\n"
+        return summary_text
         
     if len(sorted_horses) >= 5:
         diff = sorted_horses[0]['total_dev'] - sorted_horses[4]['total_dev']
@@ -294,29 +513,27 @@ def generate_rule_based_summary(analysis_res, effective_budget, custom_requests,
     top_umabans = [h['umaban'] for h in top_horses if h['umaban']]
     
     if bet_plan_mode != "カスタム":
-        top1 = top_umabans[0] if len(top_umabans) > 0 else "1"
-        top2 = top_umabans[1] if len(top_umabans) > 1 else "2"
-        top3 = top_umabans[2] if len(top_umabans) > 2 else "3"
-        top4 = top_umabans[3] if len(top_umabans) > 3 else "4"
+        # 買い目生成に必要な上位馬番を確保。足りない場合は汎用的な番号を使用。
+        top_u = [h['umaban'] for h in top_horses if h['umaban']]
+        while len(top_u) < 7:
+            top_u.append(str(len(top_u) + 1))
+        top1, top2, top3, top4, top5, top6, top7 = top_u[:7]
         
         if haran == "堅い":
-            amt1 = effective_budget // 2
-            amt1 = (amt1 // 100) * 100 if amt1 >= 100 else 100
-            amt2 = effective_budget - amt1
-            bets.append({"type": "3連複", "combo": f"{top1}-{top2}-{top3}", "amount": amt1})
-            bets.append({"type": "3連複", "combo": f"{top1}-{top2}-{top4}", "amount": amt2})
+            amt = max(100, effective_budget // 8 // 100 * 100)
+            for x in [top3, top4, top5, top6, top7]:
+                bets.append({"type": "3連複", "combo": f"{top1}-{top2}-{x}", "amount": amt})
+            bets.append({"type": "3連単", "combo": f"{top1}-{top2}-{top3}", "amount": amt})
+            bets.append({"type": "3連単", "combo": f"{top1}-{top2}-{top4}", "amount": amt})
+            bets.append({"type": "3連単", "combo": f"{top1}-{top2}-{top5}", "amount": amt})
         elif haran == "標準":
-            amt = effective_budget // 6
-            amt = (amt // 100) * 100 if amt >= 100 else 100
-            combos = [f"{top1}-{top2}", f"{top1}-{top3}", f"{top1}-{top4}", f"{top2}-{top3}", f"{top2}-{top4}", f"{top3}-{top4}"]
-            for c in combos:
-                bets.append({"type": "馬連", "combo": c, "amount": amt})
+            amt = max(100, effective_budget // 15 // 100 * 100)
+            for a, b in itertools.combinations([top2, top3, top4, top5, top6, top7], 2):
+                bets.append({"type": "3連複", "combo": f"{top1}-{a}-{b}", "amount": amt})
         else:
-            amt1 = effective_budget // 2
-            amt1 = (amt1 // 100) * 100 if amt1 >= 100 else 100
-            amt2 = effective_budget - amt1
-            bets.append({"type": "ワイド", "combo": f"{top3}-{top1}", "amount": amt1})
-            bets.append({"type": "ワイド", "combo": f"{top3}-{top2}", "amount": amt2})
+            amt = max(100, effective_budget // 20 // 100 * 100)
+            for a, b, c in itertools.combinations([top1, top2, top3, top4, top5, top6], 3):
+                bets.append({"type": "3連複", "combo": f"{a}-{b}-{c}", "amount": amt})
     else:
         for req in custom_requests:
             t_type = req.get("ticket_type", "単勝")
@@ -517,11 +734,11 @@ def ticket_type_supports_betting_method(ticket_type):
 def build_ticket_plan_text(plan_mode, ticket_requests, fallback_budget):
     if plan_mode != "カスタム":
         return (
-            "波乱度の判定に基づき、必ず以下のルールで買い目を構築してください。\n"
-            "・判定が「堅い」の場合: 上位2頭を軸にした3連複2頭軸流しを提案すること。\n"
-            "・判定が「標準」の場合: 馬連4頭BOX（6点）と、それに対応する3連複フォーメーションを提案すること。\n"
-            "・判定が「荒れる」の場合: 単勝2点と、その穴馬から上位人気へのワイド流しを提案すること。\n"
-            "・金額配分は100円単位で、合計は予算以内に収めること。"
+            "波乱度の判定に基づき、必ず以下のルールで穴馬を含め買い目を厚く構築してください。\n"
+            "・判定が「堅い」の場合: 上位2頭を軸にした3連複フォーメーションと、3連単数点を提案すること（相手は穴馬まで5頭以上）。\n"
+            "・判定が「標準」の場合: 1頭軸から相手5〜6頭への3連複流し（15点等）と、3連単フォーメーションを厚めに提案すること。\n"
+            "・判定が「荒れる」の場合: 上位評価馬と穴馬を絡めた3連複ボックス（6頭以上）や、穴馬からの3連単フォーメーションを提案すること。\n"
+            "・合計金額は予算以内に収めること。"
         ), fallback_budget
 
     valid_requests = []
@@ -558,7 +775,7 @@ def build_ticket_plan_text(plan_mode, ticket_requests, fallback_budget):
         "・各条件の予算を超えないこと。",
         "・券種ごとに指定された方式（通常／フォーメーション／ながし／ボックス）を守ること。",
         "・組数指定がある券種は、指定された組数ちょうどで買い目を構成すること。",
-        "・金額配分は100円単位にすること。"
+        "・金額は1点あたり必ず100円の倍数（100円、200円、300円...）とし、150円や250円のような端数は絶対に出さないこと。"
     ])
     return "\n".join(lines), total_budget
 
@@ -918,6 +1135,15 @@ if app_mode == "バックテスト":
     with col2:
         bt_max_horses = st.number_input("最大送信頭数（トークン節約用）", min_value=5, max_value=18, value=12, help="馬番の大きい外枠の馬から除外されます。全頭送るとトークンを消費します。")
 
+    bt_selected_features = render_ai_data_feature_selector(
+        "bt",
+        "バックテストでも同様にAIへ渡すデータを細かく制御します。"
+    )
+    bt_use_shutuba_table = feature_enabled(bt_selected_features, "shutuba_umaban", "shutuba_waku", "shutuba_name", "shutuba_sex_age", "shutuba_jockey", "shutuba_weight_carried", "shutuba_odds", "shutuba_popularity", "shutuba_stable", "shutuba_body_weight")
+    bt_use_blood = feature_enabled(bt_selected_features, "blood_sire", "blood_dam", "blood_broodmare_sire")
+    bt_use_analysis = feature_enabled(bt_selected_features, "analysis_running_style", "analysis_track_preference", "analysis_latest_weight")
+    bt_use_past_results = any(key.startswith("result_") for key in bt_selected_features)
+
     col_bt_op1, col_bt_op2 = st.columns([4, 1])
     with col_bt_op1:
         st.markdown("**✍️ あなたの予想・注目馬（AIへの指示や意見があれば入力してください）**")
@@ -1045,6 +1271,13 @@ if app_mode == "バックテスト":
         with ev_col3:
             ev_budget = st.number_input("1レース予算(円・0で無効)", min_value=0, max_value=100000, value=0, step=100, key="ev_budget")
 
+        ev_mode = st.radio("シミュレーション戦略モード", [
+            "デフォルト (馬連・ワイド・三連複)", 
+            "的中率重視 (ワイド中心)", 
+            "回収率重視 (三連複中心)", 
+            "両モード比較 (的中率重視 vs 回収率重視)"
+        ], horizontal=True)
+
         pred_file = st.file_uploader("prediction CSV", type=["csv"], key="ev_pred_file")
         payout_file = st.file_uploader("payout CSV", type=["csv"], key="ev_payout_file")
         st.markdown("**期待する列名の例**")
@@ -1081,19 +1314,44 @@ if app_mode == "バックテスト":
                         st.error("必要列が不足しています: " + ", ".join(missing))
                         st.stop()
 
-                    ev = Evaluator(
-                        top_n=int(ev_top_n) if ev_budget == 0 else None,
-                        stake_per_ticket=int(ev_stake),
-                        budget=int(ev_budget) if ev_budget > 0 else None
-                    )
-                    summary_df, detail_df = ev.compare_model_vs_popularity(
-                        prediction_df=pred_df,
-                        payout_df=payout_df,
-                        score_col=score_col,
-                        popularity_col=pop_col,
-                        race_id_col=race_col,
-                        horse_col=horse_col,
-                    )
+                    if ev_mode == "デフォルト (馬連・ワイド・三連複)":
+                        bet_types_list = [("馬連", "ワイド", "三連複")]
+                        strategy_prefixes = [""]
+                    elif ev_mode == "的中率重視 (ワイド中心)":
+                        bet_types_list = [("ワイド",)]
+                        strategy_prefixes = ["的中重視_"]
+                    elif ev_mode == "回収率重視 (三連複中心)":
+                        bet_types_list = [("三連複",)]
+                        strategy_prefixes = ["回収重視_"]
+                    else:
+                        bet_types_list = [("ワイド",), ("三連複",)]
+                        strategy_prefixes = ["的中重視_", "回収重視_"]
+
+                    summary_rows = []
+                    detail_dfs = []
+                    
+                    for bet_types, prefix in zip(bet_types_list, strategy_prefixes):
+                        ev = Evaluator(
+                            top_n=int(ev_top_n) if ev_budget == 0 else None,
+                            stake_per_ticket=int(ev_stake),
+                            budget=int(ev_budget) if ev_budget > 0 else None,
+                            bet_types=bet_types
+                        )
+                        sum_df, det_df = ev.compare_model_vs_popularity(
+                            prediction_df=pred_df,
+                            payout_df=payout_df,
+                            score_col=score_col,
+                            popularity_col=pop_col,
+                            race_id_col=race_col,
+                            horse_col=horse_col,
+                        )
+                        sum_df["strategy_name"] = prefix + sum_df["strategy_name"]
+                        det_df["strategy"] = prefix + det_df["strategy"]
+                        summary_rows.append(sum_df)
+                        detail_dfs.append(det_df)
+                        
+                    summary_df = pd.concat(summary_rows, ignore_index=True)
+                    detail_df = pd.concat(detail_dfs, ignore_index=True)
 
                     rename_map = {
                         "strategy_name": "戦略",
@@ -1114,8 +1372,43 @@ if app_mode == "バックテスト":
                             summary_view[c] = summary_view[c].round(2)
 
                     st.success("Evaluatorでの比較が完了しました。")
+                    st.markdown("#### 全体サマリー")
                     st.dataframe(summary_view, use_container_width=True)
                     st.caption("戦略: model=AI予測スコア順 / popularity=人気順")
+
+                    meta_candidates = {"distance", "track_condition", "field_size", "距離", "馬場", "馬場状態", "頭数"}
+                    meta_cols = list(meta_candidates.intersection(detail_df.columns))
+                    if meta_cols:
+                        st.markdown("#### レース条件別サマリー")
+                        tabs = st.tabs(meta_cols)
+                        for tab, m_col in zip(tabs, meta_cols):
+                            with tab:
+                                grp_rows = []
+                                for (strat, val), group in detail_df.groupby(["strategy", m_col]):
+                                    t_tic = len(group)
+                                    t_race = group["race_id"].nunique()
+                                    t_bet = group["購入額"].sum()
+                                    t_ret = group["払戻額"].sum()
+                                    h_tic = group["的中"].sum()
+                                    h_race = group.groupby("race_id")["的中"].max().sum()
+                                    grp_rows.append({
+                                        "戦略": strat,
+                                        m_col: val,
+                                        "対象レース数": t_race,
+                                        "購入点数": t_tic,
+                                        "購入総額": t_bet,
+                                        "払戻総額": t_ret,
+                                        "的中点数": h_tic,
+                                        "的中レース数": h_race,
+                                        "券単位的中率(%)": round((h_tic / t_tic * 100) if t_tic else 0.0, 2),
+                                        "レース単位的中率(%)": round((h_race / t_race * 100) if t_race else 0.0, 2),
+                                        "回収率(%)": round((t_ret / t_bet * 100) if t_bet else 0.0, 2)
+                                    })
+                                if grp_rows:
+                                    grp_df = pd.DataFrame(grp_rows)
+                                    st.dataframe(grp_df, use_container_width=True)
+                    else:
+                        st.info("prediction CSV に距離、馬場、頭数などのメタデータ列が存在しないため、条件別サマリーはスキップされました。")
 
                     detail_download = detail_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
                     summary_download = summary_view.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
@@ -1153,87 +1446,116 @@ if app_mode == "バックテスト":
                 if not h_ids: continue
                 
                 h_ids = h_ids[:bt_max_horses] # トークン節約のため頭数を絞る
-                    
+                
                 horses_data = []
                 for hid in h_ids:
                     ped = scraper.scrape_horse_ped(hid)
                     res_df = scraper.scrape_race_results_dedicated(hid)
                     if not res_df.empty:
                         res_df['日付'] = pd.to_datetime(res_df['日付'], errors='coerce')
-                        res_df = res_df[res_df['日付'] < pd.Timestamp(race_date)]
+                        # バックテストでは予測基準日ではなく、レース開催日より前のデータを使用
+                        res_df = res_df[res_df['日付'] < pd.Timestamp(race_date)] 
                     horses_data.append({"id": hid, "pedigree": ped, "results": res_df})
                 
-                ctx = f"--- \n【レース基本情報】\n・対象レースID: {r_id}\n・レース名: {race_info['name']}\n・コース・天候等: {race_info['data']}\n\n"
+                race_info_lines = []
+                if "race_id" in bt_selected_features:
+                    race_info_lines.append(f"・対象レースID: {r_id}")
+                if "race_name" in bt_selected_features:
+                    race_info_lines.append(f"・レース名: {race_info['name']}")
+                if "race_condition" in bt_selected_features:
+                    race_info_lines.append(f"・コース・天候等: {race_info['data']}")
+
+                ctx = "--- \n"
+                if race_info_lines:
+                    ctx += "【レース基本情報】\n" + "\n".join(race_info_lines) + "\n\n"
                 if bt_user_opinion.strip():
                     ctx += f"【ユーザーからの特記事項・予想意見】\n{bt_user_opinion}\n※上記のユーザー意見を、今回の予想の重要な根拠の一つとして加味してください。\n\n"
+
+                # バックテスト用の買い目構築ルールをプロンプトに追加
+                ctx += f"【買い目構築ルール】\n{bt_ticket_plan_text}\n\n"
+
                 ctx += "【出走馬詳細】\n"
 
                 shutuba_df = scraper.scrape_shutuba_table(r_id)
-                if not shutuba_df.empty:
-                    ctx += "[出馬表]\n" + shutuba_df.to_csv(index=False, sep='|') + "\n"
+                if bt_use_shutuba_table and not shutuba_df.empty:
+                    selected_shutuba_df = get_selected_shutuba_df(shutuba_df, bt_selected_features)
+                    ctx += "[出馬表]\n" + selected_shutuba_df.to_csv(index=False, sep='|') + "\n"
                     
                 is_classic = any(keyword in race_info['name'] for keyword in ["桜花賞", "皐月賞", "優駿牝馬", "オークス", "東京優駿", "日本ダービー", "菊花賞"])
                 classic_instruction = ""
-                if is_classic:
+                if is_classic and bt_use_blood:
                     classic_instruction = "※本レースは3歳クラシック競走のため、未知の距離・条件への対応力が重要になります。そのため、他の要素よりも「血統背景（特に母父や配合傾向）」を2倍重視して予想を行ってください。\n"
 
                 for horse in horses_data:
                     ped = horse['pedigree']
                     res_df = horse['results']
-                    ctx += f"\n[{ped['name']}] 父:{ped['sire']} 母父:{ped['broodmare_sire']}\n"
+                    
+                    horse_header = f"\n[{ped['name']}]"
+                    blood_parts = []
+                    if "blood_sire" in bt_selected_features:
+                        blood_parts.append(f"父:{ped['sire']}")
+                    if "blood_dam" in bt_selected_features:
+                        blood_parts.append(f"母:{ped['dam']}")
+                    if "blood_broodmare_sire" in bt_selected_features:
+                        blood_parts.append(f"母父:{ped['broodmare_sire']}")
+                    if blood_parts:
+                        horse_header += " " + " ".join(blood_parts)
+                    ctx += horse_header + "\n"
+                    
                     if res_df.empty:
                         ctx += "データなし\n"
                         continue
                     
-                    weight_info = ""
-                    if '馬体重' in res_df.columns and res_df['馬体重'].notna().any():
-                        latest_weight_str = res_df['馬体重'].dropna().iloc[0]
-                        weight = re.match(r'(\d+)', str(latest_weight_str))
-                        if weight: weight_info = f" 体重:{weight.group(1)}"
+                    if bt_use_analysis:
+                        weight_info = ""
+                        if "analysis_latest_weight" in bt_selected_features and '馬体重' in res_df.columns and res_df['馬体重'].notna().any():
+                            latest_weight_str = res_df['馬体重'].dropna().iloc[0]
+                            weight = re.match(r'(\d+)', str(latest_weight_str))
+                            if weight: weight_info = f" 体重:{weight.group(1)}"
 
-                    running_style = analyze_running_style(res_df)
-                    track_preference = analyze_track_preference(res_df)
-                    ctx += f"脚質:{running_style} 馬場:{track_preference}{weight_info}\n"
+                        analysis_parts = []
+                        if "analysis_running_style" in bt_selected_features:
+                            analysis_parts.append(f"脚質:{analyze_running_style(res_df)}")
+                        if "analysis_track_preference" in bt_selected_features:
+                            analysis_parts.append(f"馬場:{analyze_track_preference(res_df)}")
+                        if weight_info:
+                            analysis_parts.append(weight_info.strip())
+                        if analysis_parts:
+                            ctx += " ".join(analysis_parts) + "\n"
                     
-                    existing_cols = _get_available_columns(res_df, [
-                        ['日付'],
-                        ['レース名', 'レース'],
-                        ['着順', '着'],
-                        ['距離'],
-                        ['馬場'],
-                        ['タイム'],
-                        ['上り', '上がり', '上り3F', '上がり3F'],
-                        ['ペース', 'ﾍﾟｰｽ'],
-                        ['通過', 'コーナー通過順', 'コーナー'],
-                        ['馬体重']
-                    ])
-                    
-                    ctx += res_df[existing_cols].head(3).to_csv(index=False, sep='|') + "\n"
-                    
-                    short_df = res_df[existing_cols].copy()
-                    if '日付' in short_df.columns:
-                        short_df['日付'] = pd.to_datetime(short_df['日付'], errors='coerce').dt.strftime('%y/%m/%d')
-                    if 'レース名' in short_df.columns:
-                        short_df['レース名'] = short_df['レース名'].astype(str).str.replace('ステークス', 'S').str.replace('カップ', 'C').str[:6]
-                    if '着順' in short_df.columns:
-                        short_df['着順'] = short_df['着順'].astype(str).str.extract(r'(\d+)')[0].fillna(short_df['着順'])
-                    if '距離' in short_df.columns:
-                        short_df['距離'] = short_df['距離'].astype(str).str.replace('m', '', regex=False)
+                    if bt_use_past_results:
+                        existing_cols = get_selected_result_columns(res_df, bt_selected_features)
+                        if not existing_cols:
+                            continue
                         
-                    ctx += short_df.head(5).to_csv(index=False, header=False, sep=',') + "\n"
+                        ctx += res_df[existing_cols].head(3).to_csv(index=False, sep='|') + "\n"
+                        
+                        short_df = res_df[existing_cols].copy()
+                        if '日付' in short_df.columns:
+                            short_df['日付'] = pd.to_datetime(short_df['日付'], errors='coerce').dt.strftime('%y/%m/%d')
+                        if 'レース名' in short_df.columns:
+                            short_df['レース名'] = short_df['レース名'].astype(str).str.replace('ステークス', 'S').str.replace('カップ', 'C').str[:6]
+                        if '着順' in short_df.columns:
+                            short_df['着順'] = short_df['着順'].astype(str).str.extract(r'(\d+)')[0].fillna(short_df['着順'])
+                        if '距離' in short_df.columns:
+                            short_df['距離'] = short_df['距離'].astype(str).str.replace('m', '', regex=False)
+                            
+                        ctx += short_df.head(5).to_csv(index=False, header=False, sep=',') + "\n"
 
-                prompt = f"""あなたはプロの競馬予想家です。不要な前置き・一般論は省略し、合計300トークン以内で簡潔に予想を出力してください。予算:{bt_effective_budget}円。
-{classic_instruction}
-【出力要件】
-・出力: 本命1、対抗1、穴1、買い目3点
-・対象: 上位評価5頭のみ詳述（根拠は各馬2行以内）、それ以外は1行評価
-・買い目データ（※必ず以下のJSONフォーマットでテキストの最後に記述すること）
-```json
-{{ "bets": [ {{"type": "馬連", "combo": "1-2", "amount": 500}} ] }}
-```
-【出走馬詳細】
-{ctx}
-"""
+                prompt_parts = [
+                    f"あなたはプロの競馬予想家です。不要な前置き・一般論は省略し、合計300トークン以内で簡潔に予想を出力してください。予算:{bt_effective_budget}円。",
+                    classic_instruction,
+                    "【出力要件】",
+                    "・出力: 本命1、対抗1、穴を複数頭",
+                    "・対象: 上位評価7頭のみ詳述（根拠は各馬2行以内）、それ以外は1行評価",
+                    "・買い目データ（※必ず以下のJSONフォーマットでテキストの最後に記述すること）",
+                    "```json",
+                    '{ "bets": [ {{"type": "3連複", "combo": "1-2-3", "amount": 500}} ] }', # 例示フォーマット
+                    "```",
+                    "【出走馬詳細】",
+                    ctx # ctxには既に買い目構築ルールが含まれている
+                ]
+                prompt = "\n".join(prompt_parts)
                 for model in bt_models:
                     prog_text.write(f"{r_id} を {model} で予想中...")
                     ai_res, bets = "", []
@@ -1451,6 +1773,16 @@ if st.session_state.all_horse_data:
 
     st.subheader(f"🤖 {ai_choice} によるレース分析")
 
+    selected_features = render_ai_data_feature_selector(
+        "race",
+        "AIに渡す情報を細かく絞り込むことで、特定のデータに引っ張られる過学習やノイズを防ぎます。"
+    )
+    use_past_trend = feature_enabled(selected_features, "past_trend_rows", "past_trend_summary")
+    use_shutuba_table = feature_enabled(selected_features, "shutuba_umaban", "shutuba_waku", "shutuba_name", "shutuba_sex_age", "shutuba_jockey", "shutuba_weight_carried", "shutuba_odds", "shutuba_popularity", "shutuba_stable", "shutuba_body_weight")
+    use_blood = feature_enabled(selected_features, "blood_sire", "blood_dam", "blood_broodmare_sire")
+    use_analysis = feature_enabled(selected_features, "analysis_running_style", "analysis_track_preference", "analysis_latest_weight")
+    use_past_results = any(key.startswith("result_") for key in selected_features)
+
     col_op1, col_op2 = st.columns([4, 1])
     with col_op1:
         st.markdown("**✍️ あなたの予想・注目馬（AIへの指示や意見があれば入力してください）**")
@@ -1462,12 +1794,17 @@ if st.session_state.all_horse_data:
     )
 
     r_info = st.session_state.race_info or {"name": "不明", "data": "不明"}
-    data_context = f"""---
-【レース基本情報】
-・対象レースID: {race_id}
-・レース名: {r_info['name']}
-・コース・天候等: {r_info['data']}
-"""
+    race_info_lines = []
+    if "race_id" in selected_features:
+        race_info_lines.append(f"・対象レースID: {race_id}")
+    if "race_name" in selected_features:
+        race_info_lines.append(f"・レース名: {r_info['name']}")
+    if "race_condition" in selected_features:
+        race_info_lines.append(f"・コース・天候等: {r_info['data']}")
+
+    data_context = "---\n"
+    if race_info_lines:
+        data_context += "【レース基本情報】\n" + "\n".join(race_info_lines) + "\n"
 
     if user_opinion.strip():
         data_context += f"\n【ユーザーからの特記事項・予想意見】\n{user_opinion}\n※上記のユーザー意見を、今回の予想の重要な根拠の一つとして加味してください。\n"
@@ -1476,7 +1813,7 @@ if st.session_state.all_horse_data:
 
 【出走馬詳細】"""
 
-    if st.session_state.past_trend_df is not None and not st.session_state.past_trend_df.empty:
+    if use_past_trend and st.session_state.past_trend_df is not None and not st.session_state.past_trend_df.empty:
         trend_df = st.session_state.past_trend_df.copy()
         trend_df["着順_num"] = pd.to_numeric(trend_df["着順"].astype(str).str.extract(r"(\d+)")[0], errors="coerce")
         trend_df["人気_num"] = pd.to_numeric(trend_df["人気"].astype(str).str.extract(r"(\d+)")[0], errors="coerce")
@@ -1491,70 +1828,85 @@ if st.session_state.all_horse_data:
         if common_umaban:
             trend_summary.append(f"馬番出現上位: {common_umaban}")
 
-        data_context += "\n\n【同レース過去5年（1〜3着）】\n"
-        data_context += trend_df[["年", "着順", "馬番", "騎手", "通過", "人気"]].to_csv(index=False, sep='|')
-        if trend_summary:
+        if "past_trend_rows" in selected_features:
+            data_context += "\n\n【同レース過去5年（1〜3着）】\n"
+            data_context += trend_df[["年", "着順", "馬番", "騎手", "通過", "人気"]].to_csv(index=False, sep='|')
+        if "past_trend_summary" in selected_features and trend_summary:
             data_context += "要約: " + " / ".join(trend_summary) + "\n"
-        data_context += "この過去傾向（馬番・騎手・通過・人気）を今回予想の根拠として優先的に評価してください。\n"
+        data_context += "この過去傾向を今回予想の根拠として優先的に評価してください。\n"
 
     # 取得した出馬表（騎手や斤量）のデータをAIプロンプトに追加
-    if st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:
+    if use_shutuba_table and st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:
+        selected_shutuba_df = get_selected_shutuba_df(st.session_state.shutuba_table, selected_features)
         data_context += "\n[出馬表]\n"
-        data_context += st.session_state.shutuba_table.to_csv(index=False, sep='|') + "\n"
+        data_context += selected_shutuba_df.to_csv(index=False, sep='|') + "\n"
 
     for horse in st.session_state.all_horse_data:
         p = horse['pedigree']
         results_df = horse['results']
-        data_context += f"\n[{p['name']}] 父:{p['sire']} 母父:{p['broodmare_sire']}\n"
+        
+        horse_header = f"\n[{p['name']}]"
+        blood_parts = []
+        if "blood_sire" in selected_features:
+            blood_parts.append(f"父:{p['sire']}")
+        if "blood_dam" in selected_features:
+            blood_parts.append(f"母:{p['dam']}")
+        if "blood_broodmare_sire" in selected_features:
+            blood_parts.append(f"母父:{p['broodmare_sire']}")
+        if blood_parts:
+            horse_header += " " + " ".join(blood_parts)
+        data_context += horse_header + "\n"
         
         if results_df.empty:
             data_context += "データなし\n"
             continue
 
-        weight_info = ""
-        if '馬体重' in results_df.columns and results_df['馬体重'].notna().any():
-            latest_weight_str = results_df['馬体重'].dropna().iloc[0]
-            weight = re.match(r'(\d+)', str(latest_weight_str))
-            if weight: weight_info = f" 体重:{weight.group(1)}"
+        if use_analysis:
+            weight_info = ""
+            if "analysis_latest_weight" in selected_features and '馬体重' in results_df.columns and results_df['馬体重'].notna().any():
+                latest_weight_str = results_df['馬体重'].dropna().iloc[0]
+                weight = re.match(r'(\d+)', str(latest_weight_str))
+                if weight: weight_info = f" 体重:{weight.group(1)}"
 
-        running_style = analyze_running_style(results_df)
-        track_preference = analyze_track_preference(results_df)
-        data_context += f"脚質:{running_style} 馬場:{track_preference}{weight_info}\n"
+            analysis_parts = []
+            if "analysis_running_style" in selected_features:
+                analysis_parts.append(f"脚質:{analyze_running_style(results_df)}")
+            if "analysis_track_preference" in selected_features:
+                analysis_parts.append(f"馬場:{analyze_track_preference(results_df)}")
+            if weight_info:
+                analysis_parts.append(weight_info.strip())
+            if analysis_parts:
+                data_context += " ".join(analysis_parts) + "\n"
         
-        existing_cols = _get_available_columns(results_df, [
-            ['日付'],
-            ['レース名', 'レース'],
-            ['着順', '着'],
-            ['距離'],
-            ['馬場'],
-            ['タイム'],
-            ['上り', '上がり', '上り3F', '上がり3F'],
-            ['ペース', 'ﾍﾟｰｽ'],
-            ['通過', 'コーナー通過順', 'コーナー'],
-            ['馬体重']
-        ])
-        data_context += results_df[existing_cols].head(3).to_csv(index=False, sep='|')
-        
-        # ③過去データを「数値のみ」に圧縮（単発予想時）
-        short_df = results_df[existing_cols].copy()
-        if '日付' in short_df.columns:
-            short_df['日付'] = pd.to_datetime(short_df['日付'], errors='coerce').dt.strftime('%y/%m/%d')
-        if 'レース名' in short_df.columns:
-            short_df['レース名'] = short_df['レース名'].astype(str).str.replace('ステークス', 'S').str.replace('カップ', 'C').str[:6]
-        if '着順' in short_df.columns:
-            short_df['着順'] = short_df['着順'].astype(str).str.extract(r'(\d+)')[0].fillna(short_df['着順'])
-        if '距離' in short_df.columns:
-            short_df['距離'] = short_df['距離'].astype(str).str.replace('m', '', regex=False)
+        if use_past_results:
+            existing_cols = get_selected_result_columns(results_df, selected_features)
+            if not existing_cols:
+                continue
+            data_context += results_df[existing_cols].head(3).to_csv(index=False, sep='|') + "\n"
             
-        data_context += short_df.head(5).to_csv(index=False, header=False, sep=',')
+            # ③過去データを「数値のみ」に圧縮（単発予想時）
+            short_df = results_df[existing_cols].copy()
+            if '日付' in short_df.columns:
+                short_df['日付'] = pd.to_datetime(short_df['日付'], errors='coerce').dt.strftime('%y/%m/%d')
+            if 'レース名' in short_df.columns:
+                short_df['レース名'] = short_df['レース名'].astype(str).str.replace('ステークス', 'S').str.replace('カップ', 'C').str[:6]
+            if '着順' in short_df.columns:
+                short_df['着順'] = short_df['着順'].astype(str).str.extract(r'(\d+)')[0].fillna(short_df['着順'])
+            if '距離' in short_df.columns:
+                short_df['距離'] = short_df['距離'].astype(str).str.replace('m', '', regex=False)
+                
+            data_context += short_df.head(5).to_csv(index=False, header=False, sep=',') + "\n"
     
     if st.button("多角分析を実行"):
         def run_perspectives(ai_name, ask_func, context):
             race_name = st.session_state.race_info.get("name", "") if st.session_state.race_info else ""
             is_classic = any(keyword in race_name for keyword in ["桜花賞", "皐月賞", "優駿牝馬", "オークス", "東京優駿", "日本ダービー", "菊花賞"])
             
-            blood_focus = "「血統（父、母、母父の傾向や血統背景）」を最重視"
-            if is_classic:
+            if use_blood:
+                blood_focus = "「血統（父、母、母父の傾向や血統背景）」を最重視"
+            else:
+                blood_focus = "血統データは選択されていないため、送信済みの戦績・適性データから距離や馬場への対応力を最重視"
+            if is_classic and use_blood:
                 blood_focus += "（※本レースはクラシック競走のため、未知の距離への対応力を測るべく、特に母父や配合傾向などの血統背景を通常以上に深く考察してください）"
 
             perspectives = [
@@ -1574,7 +1926,7 @@ if st.session_state.all_horse_data:
 
 【出力要件】
 1. この視点から見たレースの見解
-2. 上位5頭の予想印（◎, ○, ▲, △, ☆）とその明確な根拠
+2. 上位7頭の予想印（◎, ○, ▲, △, 注, 穴, 大穴など）とその明確な根拠
 
 {context}
 """
@@ -1596,7 +1948,12 @@ if st.session_state.all_horse_data:
 
         st.session_state.analysis_results = {}
         if ai_choice == "ルールベース (AI不使用)":
-            st.session_state.analysis_results["ルールベース (AI不使用)"] = run_rule_based_analysis(st.session_state.all_horse_data, st.session_state.shutuba_table)
+            st.session_state.analysis_results["ルールベース (AI不使用)"] = run_rule_based_analysis(
+                st.session_state.all_horse_data, 
+                st.session_state.shutuba_table,
+                st.session_state.race_info,
+                race_id
+            )
             
         if ai_choice in ["Gemini", "両方で比較"]:
             st.session_state.analysis_results["Gemini"] = run_perspectives("Gemini", ask_gemini, data_context)
@@ -1720,7 +2077,7 @@ if st.session_state.all_horse_data:
             race_name = st.session_state.race_info.get("name", "") if st.session_state.race_info else ""
             is_classic = any(keyword in race_name for keyword in ["桜花賞", "皐月賞", "優駿牝馬", "オークス", "東京優駿", "日本ダービー", "菊花賞"])
             classic_instruction = ""
-            if is_classic:
+            if is_classic and use_blood:
                 classic_instruction = "※本レースは3歳クラシック競走のため、未知の距離・条件への対応力が重要になります。「血統重視の予想」の評価ウェイトを他の2つの視点の【2倍】にして、総合評価および買い目の構築を行ってください。\n\n"
 
             for ai_name, results_dict in st.session_state.analysis_results.items():
