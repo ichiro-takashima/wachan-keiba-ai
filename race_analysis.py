@@ -91,11 +91,11 @@ def calculate_weighted_mean(values):
     return sum(v * w for v, w in zip(vals, weights)) / sum(weights)
 
 
-def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=None):
+def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=None, include_blood=True):
     horses = []
     data_weight = 1.0
     ten_weight = 1.0
-    blood_weight = 1.0
+    blood_weight = 1.0 if include_blood else 0.0
     current_dist = None
     current_track_type = None
 
@@ -110,7 +110,8 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
                 data_weight += 0.5
         if any(w in race_data for w in ["稍重", "重", "不良", "稍"]):
             current_track_type = "道悪"
-            blood_weight += 0.5
+            if include_blood:
+                blood_weight += 0.5
         elif "良" in race_data:
             current_track_type = "良"
 
@@ -164,7 +165,7 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
                 ten_score = (18 - calculate_weighted_mean(first_corners)) * 3
 
         blood_score = 0
-        if not results.empty:
+        if include_blood and not results.empty:
             rank_col = find_matching_column(results, ["着順", "着"])
             if rank_col:
                 df_work = results.copy()
@@ -227,13 +228,18 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
             lines.append(f"{mark} {h['name']} (馬番:{h['umaban']}) - 偏差値: {h[val_key]:.1f}")
         return "\n".join(lines)
 
-    return {
-        "🩸 血統・適性重視": f"【独自適性スコアによる評価】\n{format_ranking(sorted(horses, key=lambda x: x['blood_dev'], reverse=True), 'blood_dev')}",
+    analysis_result = {
         "📊 指数・データ重視": f"【過去着順・上りタイム偏差値による評価】\n{format_ranking(sorted(horses, key=lambda x: x['data_dev'], reverse=True), 'data_dev')}",
         "🏇 展開重視": f"【テンの速さ・道中位置取り偏差値による評価】\n{format_ranking(sorted(horses, key=lambda x: x['ten_dev'], reverse=True), 'ten_dev')}",
         "_raw_horses": horses,
         "_weight_info": f"※適用された評価ウェイト: データ {data_weight:.1f} / 展開 {ten_weight:.1f} / 血統・適性 {blood_weight:.1f}",
     }
+    if include_blood:
+        analysis_result = {
+            "🩸 血統・適性重視": f"【独自適性スコアによる評価】\n{format_ranking(sorted(horses, key=lambda x: x['blood_dev'], reverse=True), 'blood_dev')}",
+            **analysis_result,
+        }
+    return analysis_result
 
 
 def generate_rule_based_summary(analysis_res, effective_budget, custom_requests, bet_plan_mode):

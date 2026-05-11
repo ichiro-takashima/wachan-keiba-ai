@@ -8,6 +8,7 @@ import csv
 import scraper
 from datetime import datetime
 from evaluator import Evaluator
+from feature_importance import run_feature_importance
 from ai_clients import ask_chatgpt as call_chatgpt, ask_gemini as call_gemini
 from data_features import (
     feature_enabled,
@@ -494,6 +495,31 @@ if app_mode == "バックテスト":
                 except Exception as e:
                     st.error(f"Evaluator実行中にエラーが発生しました: {e}")
 
+    with st.expander("📈 Feature Importance（LightGBM特徴量重要度）", expanded=False):
+        st.caption("保存済みの data/race_html/*.html からレース結果表を読み取り、AIへ渡すデータ要素から result_rank を除外してLightGBMを一度学習します。result_time など結果後にしか分からない列は、実運用予測では引き続きリークに注意してください。")
+        fi_col1, fi_col2 = st.columns([2, 1])
+        with fi_col1:
+            fi_html_dir = st.text_input("レースHTML保存先", value="data/race_html", key="fi_html_dir")
+        with fi_col2:
+            fi_target = st.selectbox("目的変数", ["top3", "win"], index=0, format_func=lambda x: "3着以内" if x == "top3" else "1着")
+
+        if st.button("LightGBMで学習して重要度を表示", key="run_feature_importance"):
+            try:
+                fi_result = run_feature_importance(html_dir=fi_html_dir, target_col=fi_target)
+                importance_view = fi_result.importance.copy()
+                importance_view["display_name"] = importance_view.get("label", importance_view["feature"])
+                chart_df = importance_view.set_index("display_name")[["importance_pct"]]
+
+                st.success(f"学習完了: {fi_result.dataset['race_id'].nunique()}レース / {len(fi_result.dataset)}頭")
+                st.bar_chart(chart_df)
+                st.dataframe(
+                    importance_view[["feature", "label", "importance_pct", "gain_importance", "split_importance"]],
+                    use_container_width=True
+                )
+                st.caption(f"保存先: {fi_result.output_csv} / {fi_result.output_svg}")
+            except Exception as e:
+                st.error(f"特徴量重要度の計算に失敗しました: {e}")
+
     if st.button("バックテスト実行"):
         if bt_bet_plan_mode == "カスタム" and bt_effective_budget <= 0:
             st.warning("カスタムの買い方条件を1件以上、予算ありで設定してください。")
@@ -976,18 +1002,18 @@ if st.session_state.all_horse_data:
             race_name = st.session_state.race_info.get("name", "") if st.session_state.race_info else ""
             is_classic = any(keyword in race_name for keyword in ["桜花賞", "皐月賞", "優駿牝馬", "オークス", "東京優駿", "日本ダービー", "菊花賞"])
             
+            perspectives = []
             if use_blood:
                 blood_focus = "「血統（父、母、母父の傾向や血統背景）」を最重視"
-            else:
-                blood_focus = "血統データは選択されていないため、送信済みの戦績・適性データから距離や馬場への対応力を最重視"
-            if is_classic and use_blood:
-                blood_focus += "（※本レースはクラシック競走のため、未知の距離への対応力を測るべく、特に母父や配合傾向などの血統背景を通常以上に深く考察してください）"
-
-            perspectives = [
-                ("🩸 血統重視", blood_focus),
+                if is_classic:
+                    blood_focus += "（※本レースはクラシック競走のため、未知の距離への対応力を測るべく、特に母父や配合傾向などの血統背景を通常以上に深く考察してください）"
+                perspectives.append(("🩸 血統重視", blood_focus))
+            elif is_classic:
+                st.info("血統情報が未選択のため、クラシック競走でも血統重視分析はスキップします。")
+            perspectives.extend([
                 ("📊 指数・データ重視", "「過去の戦績、着順、タイム、馬場適性、近走馬体重」を最重視"),
                 ("🏇 展開重視", "「脚質、枠順、今回のメンバー構成（逃げ先行馬の数）」を最重視")
-            ]
+            ])
             
             results_dict = {}
             progress_bar = st.progress(0)
@@ -1026,7 +1052,8 @@ if st.session_state.all_horse_data:
                 st.session_state.all_horse_data, 
                 st.session_state.shutuba_table,
                 st.session_state.race_info,
-                race_id
+                race_id,
+                include_blood=use_blood
             )
             
         if ai_choice in ["Gemini", "両方で比較"]:
@@ -1172,18 +1199,25 @@ if st.session_state.all_horse_data:
 
                 ask_func = ask_gemini if ai_name == "Gemini" else ask_chatgpt
                 with st.spinner(f"{ai_name} が共通項を抽出し、最終結論を生成中..."):
+                    perspective_sections = []
+                    if use_blood:
+                        perspective_sections.append(
+                            "■ 血統重視の予想\n"
+                            f"{results_dict.get('🩸 血統重視', '')}"
+                        )
+                    perspective_sections.extend([
+                        "■ 指数・データ重視の予想\n"
+                        f"{results_dict.get('📊 指数・データ重視', '')}",
+                        "■ 展開重視の予想\n"
+                        f"{results_dict.get('🏇 展開重視', '')}",
+                    ])
+                    perspective_count = len(perspective_sections)
+                    perspective_text = "\n\n".join(perspective_sections)
                     summary_prompt = f"""あなたは総合競馬予想のスペシャリストです。
-以下の3つの異なる視点からの予想結果を分析し、共通項を抽出して最終的な予想と買い目を出力してください。
+以下の{perspective_count}つの異なる視点からの予想結果を分析し、共通項を抽出して最終的な予想と買い目を出力してください。
 
-{classic_instruction}【3つの視点からの予想結果】
-■ 血統重視の予想
-{results_dict.get('🩸 血統重視', '')}
-
-■ 指数・データ重視の予想
-{results_dict.get('📊 指数・データ重視', '')}
-
-■ 展開重視の予想
-{results_dict.get('🏇 展開重視', '')}
+{classic_instruction}【{perspective_count}つの視点からの予想結果】
+{perspective_text}
 
 【最終出力要件】
 1. 分析の共通項（どの馬が複数の視点で高く評価されているか、その理由）
