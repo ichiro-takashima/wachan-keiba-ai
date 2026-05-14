@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from data_features import find_matching_column
-
+from race_volatility import format_volatility_for_prompt
 
 def analyze_running_style(results_df):
     """通過順位のデータから脚質を判定する"""
@@ -245,6 +245,7 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
 def generate_rule_based_summary(analysis_res, effective_budget, custom_requests, bet_plan_mode):
     horses = analysis_res.get("_raw_horses", [])
     weight_info = analysis_res.get("_weight_info", "")
+    volatility = analysis_res.get("_volatility")
     if not horses:
         return "データがありません。"
 
@@ -252,6 +253,8 @@ def generate_rule_based_summary(analysis_res, effective_budget, custom_requests,
     summary_text = "【総合評価（偏差値平均）】\n"
     if weight_info:
         summary_text += f"{weight_info}\n\n"
+    if volatility:
+        summary_text += format_volatility_for_prompt(volatility) + "\n\n"
     marks = ["◎", "○", "▲", "△", "注", "穴", "大穴"]
     top_horses = sorted_horses[:7]
     for i, h in enumerate(top_horses):

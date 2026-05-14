@@ -25,6 +25,7 @@ from race_analysis import (
     run_rule_based_analysis,
     style_race_comparison as _style_race_comparison,
 )
+from race_volatility import analyze_race_volatility, format_volatility_for_prompt
 from tickets import (
     BETTING_METHOD_OPTIONS,
     TICKET_TYPE_OPTIONS,
@@ -204,11 +205,7 @@ if app_mode == "バックテスト":
                     st.error("12桁の数字を入力してください。")
 
     bt_race_ids_str = st.text_area("レースIDリスト（改行区切り）", key="bt_race_ids_input")
-    col1, col2 = st.columns(2)
-    with col1:
-        bt_budget = st.number_input("1レースあたりの予算 (円)", value=1000)
-    with col2:
-        bt_max_horses = st.number_input("最大送信頭数（トークン節約用）", min_value=5, max_value=18, value=12, help="馬番の大きい外枠の馬から除外されます。全頭送るとトークンを消費します。")
+    bt_max_horses = st.number_input("最大送信頭数（トークン節約用）", min_value=5, max_value=18, value=12, help="馬番の大きい外枠の馬から除外されます。全頭送るとトークンを消費します。")
 
     bt_selected_features = render_ai_data_feature_selector(
         "bt",
@@ -327,8 +324,10 @@ if app_mode == "バックテスト":
 
         bt_custom_total_budget = sum(req.get("budget", 0) for req in st.session_state.bt_custom_ticket_requests)
         st.info(f"カスタム条件の合計予算: {bt_custom_total_budget}円")
-        if bt_custom_total_budget != bt_budget:
-            st.caption(f"上の全体予算は {bt_budget}円ですが、カスタム条件の合計 {bt_custom_total_budget}円 を優先して買い目提案に使います。")
+        bt_budget = bt_custom_total_budget
+    else:
+        bt_budget = st.number_input("1レースあたりの予算 (円)", min_value=100, step=100, value=1000, key="bt_overall_budget")
+        st.caption("買い方希望がない場合はこちら。現状の予想モデルで券種と配分をおまかせ提案します。")
 
     bt_ticket_plan_text, bt_effective_budget = build_ticket_plan_text(
         bt_bet_plan_mode,
@@ -577,6 +576,10 @@ if app_mode == "バックテスト":
                 ctx += "【出走馬詳細】\n"
 
                 shutuba_df = scraper.scrape_shutuba_table(r_id)
+                bt_volatility = analyze_race_volatility(shutuba_df)
+                volatility_prompt = format_volatility_for_prompt(bt_volatility)
+                if volatility_prompt:
+                    ctx += f"{volatility_prompt}\n\n"
                 if bt_use_shutuba_table and not shutuba_df.empty:
                     selected_shutuba_df = get_selected_shutuba_df(shutuba_df, bt_selected_features)
                     ctx += "[出馬表]\n" + selected_shutuba_df.to_csv(index=False, sep='|') + "\n"
@@ -742,7 +745,6 @@ prediction_date = st.date_input(
     value=pd.Timestamp.now(),
     min_value=pd.Timestamp("1980-01-01")
 )
-budget = st.number_input("予算 (円)", value=1000)
 
 # --- データの保存場所を準備（コードの上のほう、ボタンより前に書いておく） ---
 if "all_horse_data" not in st.session_state:
@@ -767,6 +769,8 @@ if "analysis_results" not in st.session_state:
     st.session_state.analysis_results = {}
 if "past_trend_df" not in st.session_state:
     st.session_state.past_trend_df = None
+if "race_volatility" not in st.session_state:
+    st.session_state.race_volatility = None
 
 # --- AI予想開始ボタン ---
 if st.button("データ取得開始"):
@@ -814,6 +818,7 @@ if st.button("データ取得開始"):
                 st.session_state.shutuba_table = shutuba_df
                 st.session_state.race_info = race_info
                 st.session_state.past_trend_df = past_trend_df
+                st.session_state.race_volatility = analyze_race_volatility(shutuba_df, past_trend_df)
                 st.session_state.chat_messages = [] # 別のレースを予想する際にチャット履歴をリセット
                 st.session_state.analysis_results = {}
                 st.rerun()
@@ -831,6 +836,17 @@ if st.session_state.all_horse_data:
     if st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:
         st.subheader("📊 本レース出馬表（馬番・騎手・斤量・馬体重など）")
         st.dataframe(st.session_state.shutuba_table, use_container_width=True)
+
+    if st.session_state.race_volatility:
+        volatility = st.session_state.race_volatility
+        st.subheader("🎯 荒れ具合と推奨購入点数")
+        c1, c2, c3 = st.columns([1, 1, 3])
+        c1.metric("荒れ指数", f"{volatility['score']}/100")
+        c2.metric("判定", volatility["level"])
+        c3.info(volatility["summary"])
+        if volatility.get("reasons"):
+            st.caption("根拠: " + " / ".join(volatility["reasons"]))
+        st.dataframe(pd.DataFrame(volatility["ticket_rows"]), use_container_width=True)
 
     st.subheader("⚔️ 出走馬の対戦表（過去同一レース比較）")
     race_compare_count = st.slider("表示する比較レース数", min_value=3, max_value=12, value=8, step=1)
@@ -908,6 +924,10 @@ if st.session_state.all_horse_data:
 
     if user_opinion.strip():
         data_context += f"\n【ユーザーからの特記事項・予想意見】\n{user_opinion}\n※上記のユーザー意見を、今回の予想の重要な根拠の一つとして加味してください。\n"
+
+    volatility_prompt = format_volatility_for_prompt(st.session_state.race_volatility)
+    if volatility_prompt:
+        data_context += f"\n{volatility_prompt}\n"
 
     data_context += f"""
 
@@ -1048,14 +1068,15 @@ if st.session_state.all_horse_data:
 
         st.session_state.analysis_results = {}
         if ai_choice == "ルールベース (AI不使用)":
-            st.session_state.analysis_results["ルールベース (AI不使用)"] = run_rule_based_analysis(
+            rule_result = run_rule_based_analysis(
                 st.session_state.all_horse_data, 
                 st.session_state.shutuba_table,
                 st.session_state.race_info,
                 race_id,
                 include_blood=use_blood
             )
-            
+            rule_result["_volatility"] = st.session_state.race_volatility
+            st.session_state.analysis_results["ルールベース (AI不使用)"] = rule_result
         if ai_choice in ["Gemini", "両方で比較"]:
             st.session_state.analysis_results["Gemini"] = run_perspectives("Gemini", ask_gemini, data_context)
         if ai_choice in ["ChatGPT", "両方で比較"]:
@@ -1159,9 +1180,9 @@ if st.session_state.all_horse_data:
 
             custom_total_budget = sum(req.get("budget", 0) for req in st.session_state.custom_ticket_requests)
             st.info(f"カスタム条件の合計予算: {custom_total_budget}円")
-            if custom_total_budget != budget:
-                st.caption(f"上の全体予算は {budget}円ですが、カスタム条件の合計 {custom_total_budget}円 を優先して買い目提案に使います。")
+            budget = custom_total_budget
         else:
+            budget = st.number_input("予算 (円)", min_value=100, step=100, value=1000, key="overall_budget")
             st.caption("買い方希望がない場合はこちら。現状の予想モデルで券種と配分をおまかせ提案します。")
 
         ticket_plan_text, effective_budget = build_ticket_plan_text(
@@ -1222,9 +1243,10 @@ if st.session_state.all_horse_data:
 【最終出力要件】
 1. 分析の共通項（どの馬が複数の視点で高く評価されているか、その理由）
 2. 最終的な総合予想印（◎, ○, ▲, △, 注, 消）と総合評価の根拠
-3. レースの波乱度判定（「堅い」「標準」「荒れる」のいずれか）とその理由
-4. 予算{effective_budget}円の範囲での具体的な買い目（馬券種、組み合わせ（すべて馬番で書くこと）、金額配分）と、その買い方を選んだ理由
-5. 買い目データ（※システムの自動集計用。必ず以下のJSONフォーマットでテキストの最後に記述すること）
+3. レースの波乱度判定（「堅い」「標準」「荒れ気味」「大荒れ警戒」のいずれか）とその理由
+4. 荒れ具合診断を踏まえた購入点数の判断（券種ごとの実際の点数も明記）
+5. 予算{effective_budget}円の範囲での具体的な買い目（馬券種、組み合わせ（すべて馬番で書くこと）、金額配分）と、その買い方を選んだ理由
+6. 買い目データ（※システムの自動集計用。必ず以下のJSONフォーマットでテキストの最後に記述すること）
 ```json
 {{ "bets": [ {{"type": "馬連", "combo": "1-2", "amount": 500}} ] }}
 ```
