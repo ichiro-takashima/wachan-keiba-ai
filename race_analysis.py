@@ -91,6 +91,234 @@ def calculate_weighted_mean(values):
     return sum(v * w for v, w in zip(vals, weights)) / sum(weights)
 
 
+def _to_number(value):
+    if value is None:
+        return None
+    text = str(value).replace(",", "")
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _numeric_series(df, candidates):
+    col = find_matching_column(df, candidates)
+    if not col:
+        return pd.Series(dtype="float64")
+    return pd.to_numeric(df[col].astype(str).str.extract(r"(-?\d+(?:\.\d+)?)")[0], errors="coerce").dropna()
+
+
+def _top3_rate(df):
+    if df is None or df.empty or "rank_num" not in df:
+        return None
+    valid = df[df["rank_num"].notna()]
+    if valid.empty:
+        return None
+    return len(valid[valid["rank_num"] <= 3]) / len(valid)
+
+
+def _score_rule_factors(results, shutuba_meta, current_dist, current_place, current_track_type):
+    score = 0.0
+    details = []
+    ability = 0.0
+    suitability = 0.0
+    value = 0.0
+    external = 0.0
+
+    rank_series = _numeric_series(results, ["着順", "着"]) if results is not None and not results.empty else pd.Series(dtype="float64")
+    if not rank_series.empty:
+        latest_rank = rank_series.iloc[0]
+        last5 = rank_series.head(5)
+        top3_count = int((last5 <= 3).sum())
+        if latest_rank == 1:
+            ability += 3
+            details.append("前走1着 +3")
+        elif latest_rank <= 3:
+            ability += 2
+            details.append("前走3着以内 +2")
+        if top3_count >= 3:
+            ability += 2
+            details.append("近5走で3着以内3回以上 +2")
+        elif top3_count >= 2:
+            ability += 1
+            details.append("近5走で3着以内2回 +1")
+
+    last3f = _numeric_series(results, ["上り", "上がり", "上り3F", "上がり3F"]) if results is not None and not results.empty else pd.Series(dtype="float64")
+    if not last3f.empty:
+        avg_last3f = calculate_weighted_mean(last3f.head(5))
+        if avg_last3f <= 34.5:
+            ability += 2
+            details.append("近走上がり優秀 +2")
+        elif avg_last3f <= 35.5:
+            ability += 1
+            details.append("近走上がり良好 +1")
+
+    rating = _numeric_series(results, ["レーティング", "rating", "指数"]) if results is not None and not results.empty else pd.Series(dtype="float64")
+    if not rating.empty:
+        avg_rating = calculate_weighted_mean(rating.head(5))
+        if avg_rating >= 100:
+            ability += 2
+            details.append("レーティング100以上 +2")
+        elif avg_rating >= 90:
+            ability += 1
+            details.append("レーティング90以上 +1")
+
+    if results is not None and not results.empty and not rank_series.empty:
+        df_work = results.copy()
+        df_work["rank_num"] = rank_series.reindex(results.index)
+        if current_dist:
+            dist_col = find_matching_column(df_work, ["距離"])
+            if dist_col:
+                df_work["dist_num"] = pd.to_numeric(df_work[dist_col].astype(str).str.extract(r"(\d+)")[0], errors="coerce")
+                dist_df = df_work[df_work["dist_num"].notna() & (abs(df_work["dist_num"] - current_dist) <= 200)]
+                rate = _top3_rate(dist_df)
+                if rate is not None and rate >= 0.4:
+                    suitability += 2
+                    details.append("距離適性あり +2")
+        if current_track_type:
+            track_col = find_matching_column(df_work, ["馬場", "馬場状態"])
+            if track_col:
+                if current_track_type == "良":
+                    track_df = df_work[df_work[track_col].astype(str).str.contains("良", na=False)]
+                else:
+                    track_df = df_work[df_work[track_col].astype(str).str.contains("稍|重|不", na=False)]
+                rate = _top3_rate(track_df)
+                if rate is not None and rate >= 0.4:
+                    suitability += 1.5
+                    details.append("馬場適性あり +1.5")
+        if current_place:
+            place_col = find_matching_column(df_work, ["開催"])
+            if place_col:
+                place_df = df_work[df_work[place_col].astype(str).str.contains(current_place, na=False)]
+                rate = _top3_rate(place_df)
+                if rate is not None and rate >= 0.35:
+                    suitability += 1.5
+                    details.append("コース適性あり +1.5")
+
+    odds = _to_number(shutuba_meta.get("odds"))
+    popularity = _to_number(shutuba_meta.get("popularity"))
+    if odds is not None:
+        if odds >= 5 and ability + suitability >= 4:
+            value += 2
+            details.append("能力・適性に対して単勝オッズ妙味 +2")
+        elif odds >= 10 and ability + suitability >= 3:
+            value += 1
+            details.append("中穴妙味 +1")
+    if popularity is not None and popularity >= 6 and ability + suitability >= 4:
+        value += 1.5
+        details.append("人気以上に評価可能 +1.5")
+
+    current_jockey = str(shutuba_meta.get("jockey", "")).strip()
+    if results is not None and not results.empty and current_jockey:
+        jockey_col = find_matching_column(results, ["騎手"])
+        if jockey_col:
+            latest_jockey = str(results.iloc[0].get(jockey_col, "")).strip()
+            if latest_jockey and latest_jockey != current_jockey:
+                external -= 0.5
+                details.append("騎手乗り替わり -0.5")
+    frame = _to_number(shutuba_meta.get("frame"))
+    if frame is not None and frame in {1, 2, 7, 8}:
+        external += 0.5
+        details.append("枠順補正 +0.5")
+    carried_weight = _to_number(shutuba_meta.get("weight_carried"))
+    if carried_weight is not None:
+        if carried_weight >= 58:
+            external -= 1
+            details.append("斤量58kg以上 -1")
+        elif carried_weight <= 53:
+            external += 1
+            details.append("斤量53kg以下 +1")
+
+    score = ability + suitability + value + external
+    return {
+        "rule_score": score,
+        "ability_score": ability,
+        "suitability_score": suitability,
+        "value_score": value,
+        "external_score": external,
+        "rule_details": details[:5],
+        "odds": odds,
+        "popularity": popularity,
+    }
+
+
+def _parse_axis_horses(axis_text):
+    return [part for part in re.split(r"[\s,、・/]+", str(axis_text or "").strip()) if part]
+
+
+def _unique_ordered(values):
+    seen = set()
+    ordered = []
+    for value in values:
+        value = str(value).strip()
+        if value and value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
+
+
+def _candidate_custom_combos(ticket_type, ranked_umabans, axis_text, betting_method="通常"):
+    ranked_umabans = _unique_ordered(ranked_umabans)
+    axis_horses = _unique_ordered(_parse_axis_horses(axis_text))
+    if not axis_horses and betting_method == "ながし" and ranked_umabans:
+        axis_horses = [ranked_umabans[0]]
+
+    pool = _unique_ordered(axis_horses + ranked_umabans)
+    if ticket_type in ["単勝", "複勝"]:
+        return axis_horses[:1] or ranked_umabans[:1] or ["1"]
+
+    if ticket_type in ["馬連", "ワイド", "枠連"]:
+        combos = []
+        if axis_horses:
+            for axis in axis_horses:
+                for target in ranked_umabans:
+                    if target != axis:
+                        combos.append("-".join([axis, target]))
+        else:
+            combos = ["-".join(pair) for pair in itertools.combinations(pool, 2)]
+        return _unique_ordered(combos)
+
+    if ticket_type == "馬単":
+        combos = []
+        if axis_horses:
+            for axis in axis_horses:
+                for target in ranked_umabans:
+                    if target != axis:
+                        combos.append(f"{axis}-{target}")
+        else:
+            combos = ["-".join(pair) for pair in itertools.permutations(pool, 2)]
+        return _unique_ordered(combos)
+
+    if ticket_type == "3連複":
+        combos = []
+        if axis_horses:
+            fixed = axis_horses[:2]
+            targets = [u for u in ranked_umabans if u not in fixed]
+            need = 3 - len(fixed)
+            for extra in itertools.combinations(targets, need):
+                combos.append("-".join(fixed + list(extra)))
+        else:
+            combos = ["-".join(combo) for combo in itertools.combinations(pool, 3)]
+        return _unique_ordered(combos)
+
+    if ticket_type == "3連単":
+        combos = []
+        if axis_horses:
+            fixed = axis_horses[:2]
+            targets = [u for u in ranked_umabans if u not in fixed]
+            need = 3 - len(fixed)
+            for extra in itertools.permutations(targets, need):
+                combos.append("-".join(fixed + list(extra)))
+        else:
+            combos = ["-".join(combo) for combo in itertools.permutations(pool, 3)]
+        return _unique_ordered(combos)
+
+    return axis_horses[:1] or ranked_umabans[:1] or ["1"]
+
+
 def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=None, include_blood=True):
     horses = []
     data_weight = 1.0
@@ -117,6 +345,11 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
 
     umaban_col = find_matching_column(shutuba_df, ["馬番"]) if shutuba_df is not None else None
     name_col = find_matching_column(shutuba_df, ["馬名"]) if shutuba_df is not None else None
+    frame_col = find_matching_column(shutuba_df, ["枠", "枠番"]) if shutuba_df is not None else None
+    jockey_col = find_matching_column(shutuba_df, ["騎手"]) if shutuba_df is not None else None
+    carried_weight_col = find_matching_column(shutuba_df, ["斤量"]) if shutuba_df is not None else None
+    odds_col = find_matching_column(shutuba_df, ["オッズ", "単勝"]) if shutuba_df is not None else None
+    popularity_col = find_matching_column(shutuba_df, ["人気"]) if shutuba_df is not None else None
 
     current_place = None
     if race_id and len(str(race_id)) >= 6:
@@ -134,10 +367,19 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
         name = ped.get("name", "不明")
 
         umaban = ""
+        shutuba_meta = {}
         if shutuba_df is not None and not shutuba_df.empty and name_col and umaban_col:
             match_row = shutuba_df[shutuba_df[name_col].astype(str).str.replace(r"\s+", "", regex=True) == str(name).replace(" ", "")]
             if not match_row.empty:
-                umaban = str(match_row.iloc[0][umaban_col])
+                matched = match_row.iloc[0]
+                umaban = str(matched[umaban_col])
+                shutuba_meta = {
+                    "frame": matched.get(frame_col, "") if frame_col else "",
+                    "jockey": matched.get(jockey_col, "") if jockey_col else "",
+                    "weight_carried": matched.get(carried_weight_col, "") if carried_weight_col else "",
+                    "odds": matched.get(odds_col, "") if odds_col else "",
+                    "popularity": matched.get(popularity_col, "") if popularity_col else "",
+                }
 
         data_score = 0
         if not results.empty:
@@ -199,6 +441,8 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
                             hits = len(place_df[place_df["rank_num"] <= 3])
                             blood_score += (hits / len(place_df)) * 10
 
+        rule_factors = _score_rule_factors(results, shutuba_meta, current_dist, current_place, current_track_type)
+
         horses.append({
             "id": hid,
             "name": name,
@@ -207,18 +451,38 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
             "ten_score": ten_score,
             "blood_score": blood_score,
             "has_data": not results.empty,
+            **rule_factors,
         })
 
     data_devs = calculate_deviations([h["data_score"] for h in horses])
     ten_devs = calculate_deviations([h["ten_score"] for h in horses])
     blood_devs = calculate_deviations([h["blood_score"] for h in horses])
+    rule_devs = calculate_deviations([h["rule_score"] for h in horses])
 
-    total_weight = data_weight + ten_weight + blood_weight
+    rule_weight = 0.8
+    total_weight = data_weight + ten_weight + blood_weight + rule_weight
     for i, h in enumerate(horses):
         h["data_dev"] = data_devs[i]
         h["ten_dev"] = ten_devs[i]
         h["blood_dev"] = blood_devs[i]
-        h["total_dev"] = (data_devs[i] * data_weight + ten_devs[i] * ten_weight + blood_devs[i] * blood_weight) / total_weight
+        h["rule_dev"] = rule_devs[i]
+        h["total_dev"] = (
+            data_devs[i] * data_weight
+            + ten_devs[i] * ten_weight
+            + blood_devs[i] * blood_weight
+            + rule_devs[i] * rule_weight
+        ) / total_weight
+
+    strengths = [max(0.01, h["total_dev"] - 35) for h in horses]
+    strength_total = sum(strengths) or 1
+    for h, strength in zip(horses, strengths):
+        odds = h.get("odds")
+        my_probability = strength / strength_total
+        market_probability = (1 / odds) if odds and odds > 0 else None
+        h["my_probability"] = my_probability
+        h["market_probability"] = market_probability
+        h["expected_value"] = (my_probability * odds) if odds and odds > 0 else None
+        h["is_value_pick"] = bool(h["expected_value"] and h["expected_value"] >= 1.05)
 
     def format_ranking(sorted_horses, val_key):
         lines = []
@@ -231,8 +495,9 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
     analysis_result = {
         "📊 指数・データ重視": f"【過去着順・上りタイム偏差値による評価】\n{format_ranking(sorted(horses, key=lambda x: x['data_dev'], reverse=True), 'data_dev')}",
         "🏇 展開重視": f"【テンの速さ・道中位置取り偏差値による評価】\n{format_ranking(sorted(horses, key=lambda x: x['ten_dev'], reverse=True), 'ten_dev')}",
+        "💰 期待値・ルール評価": f"【能力・適性・期待値・外部要因の加点評価】\n{format_ranking(sorted(horses, key=lambda x: x['rule_dev'], reverse=True), 'rule_dev')}",
         "_raw_horses": horses,
-        "_weight_info": f"※適用された評価ウェイト: データ {data_weight:.1f} / 展開 {ten_weight:.1f} / 血統・適性 {blood_weight:.1f}",
+        "_weight_info": f"※適用された評価ウェイト: データ {data_weight:.1f} / 展開 {ten_weight:.1f} / 血統・適性 {blood_weight:.1f} / 期待値ルール {rule_weight:.1f}",
     }
     if include_blood:
         analysis_result = {
@@ -259,7 +524,11 @@ def generate_rule_based_summary(analysis_res, effective_budget, custom_requests,
     top_horses = sorted_horses[:7]
     for i, h in enumerate(top_horses):
         mark = marks[i] if i < len(marks) else ""
-        summary_text += f"{mark} {h['name']} (馬番:{h['umaban']}) - 総合偏差値: {h['total_dev']:.1f}\n"
+        ev_text = f" / EV:{h['expected_value']:.2f}" if h.get("expected_value") is not None else ""
+        odds_text = f" / 単勝:{h['odds']:.1f}" if h.get("odds") is not None else ""
+        summary_text += f"{mark} {h['name']} (馬番:{h['umaban']}) - 総合偏差値: {h['total_dev']:.1f}{odds_text}{ev_text}\n"
+        if h.get("rule_details"):
+            summary_text += "  ルール根拠: " + " / ".join(h["rule_details"]) + "\n"
 
     no_data_count = sum(1 for h in horses if not h.get("has_data", True))
     is_data_shortage = no_data_count >= len(horses) / 2
@@ -281,59 +550,94 @@ def generate_rule_based_summary(analysis_res, effective_budget, custom_requests,
         summary_text += "\n```json\n{\"bets\": []}\n```\n"
         return summary_text
 
-    if len(sorted_horses) >= 5:
+    top_odds = sorted_horses[0].get("odds") if sorted_horses else None
+    top_popularity = sorted_horses[0].get("popularity") if sorted_horses else None
+    if top_popularity == 1 and top_odds is not None and top_odds <= 1.5:
+        haran = "堅い"
+        race_type = "堅実レース"
+    elif len(sorted_horses) >= 5:
         diff = sorted_horses[0]["total_dev"] - sorted_horses[4]["total_dev"]
         haran = "荒れる" if diff < 5 else "堅い" if diff > 15 else "標準"
+        race_type = "波乱レース" if haran == "荒れる" else "堅実レース" if haran == "堅い" else "標準レース"
     else:
         haran = "標準"
+        race_type = "標準レース"
 
-    summary_text += f"\n【波乱度判定】: {haran}\n"
+    value_picks = [h for h in top_horses if h.get("is_value_pick") and h.get("umaban")]
+    summary_text += f"\n【レース分類】: {race_type}\n"
+    summary_text += f"【波乱度判定】: {haran}\n"
+    if value_picks:
+        summary_text += "【期待値候補】: " + "、".join(
+            f"{h['name']}({h['umaban']}, EV {h['expected_value']:.2f})" for h in value_picks[:3]
+        ) + "\n"
     bets = []
     top_umabans = [h["umaban"] for h in top_horses if h["umaban"]]
+    ranked_umabans = top_umabans[:]
+    while len(ranked_umabans) < 7:
+        ranked_umabans.append(str(len(ranked_umabans) + 1))
 
     if bet_plan_mode != "カスタム":
-        top_u = [h["umaban"] for h in top_horses if h["umaban"]]
-        while len(top_u) < 7:
-            top_u.append(str(len(top_u) + 1))
+        top_u = ranked_umabans[:]
         top1, top2, top3, top4, top5, top6, top7 = top_u[:7]
 
-        if haran == "堅い":
+        value_axis = value_picks[0] if value_picks else None
+        if value_axis and value_axis.get("odds") and value_axis["odds"] >= 5 and value_axis.get("rule_score", 0) >= 4:
+            win_amount = max(100, int(effective_budget * 0.6) // 100 * 100)
+            place_amount = max(100, (effective_budget - win_amount) // 100 * 100)
+            bets.append({"type": "単勝", "combo": value_axis["umaban"], "amount": win_amount})
+            if effective_budget - win_amount >= 100:
+                bets.append({"type": "複勝", "combo": value_axis["umaban"], "amount": place_amount})
+            summary_text += "【買い方判断】: 軸候補の期待値が高いため、単勝・複勝中心で勝負します。\n"
+        elif haran == "堅い":
             amt = max(100, effective_budget // 8 // 100 * 100)
             for x in [top3, top4, top5, top6, top7]:
                 bets.append({"type": "3連複", "combo": f"{top1}-{top2}-{x}", "amount": amt})
             bets.append({"type": "3連単", "combo": f"{top1}-{top2}-{top3}", "amount": amt})
             bets.append({"type": "3連単", "combo": f"{top1}-{top2}-{top4}", "amount": amt})
             bets.append({"type": "3連単", "combo": f"{top1}-{top2}-{top5}", "amount": amt})
+            summary_text += "【買い方判断】: 上位の信頼度が高いため、1〜2頭軸の3連系で組み立てます。\n"
         elif haran == "標準":
             amt = max(100, effective_budget // 15 // 100 * 100)
             for a, b in itertools.combinations([top2, top3, top4, top5, top6, top7], 2):
                 bets.append({"type": "3連複", "combo": f"{top1}-{a}-{b}", "amount": amt})
+            summary_text += "【買い方判断】: 軸は置きつつ相手を広げる三連複流しで組み立てます。\n"
         else:
-            amt = max(100, effective_budget // 20 // 100 * 100)
-            for a, b, c in itertools.combinations([top1, top2, top3, top4, top5, top6], 3):
-                bets.append({"type": "3連複", "combo": f"{a}-{b}-{c}", "amount": amt})
+            partners = [u for u in [top1, top2, top3, top4, top5, top6] if u != top1]
+            amt = max(100, effective_budget // max(1, len(partners) * 2) // 100 * 100)
+            for target in partners:
+                bets.append({"type": "ワイド", "combo": f"{top1}-{target}", "amount": amt})
+                bets.append({"type": "馬連", "combo": f"{top1}-{target}", "amount": amt})
+            summary_text += "【買い方判断】: 上位拮抗の波乱想定のため、ワイド・馬連で中穴まで拾います。\n"
     else:
         for req in custom_requests:
             t_type = req.get("ticket_type", "単勝")
-            budget = req.get("budget", 100)
+            budget = int(req.get("budget", 100) or 100)
+            combo_count = int(req.get("combo_count", 1) or 1)
             axis = req.get("axis_horse", "").strip()
 
-            if not axis and top_umabans:
-                axis = top_umabans[0]
-            elif not axis:
-                axis = "1"
-
             if t_type in ["単勝", "複勝"]:
-                bets.append({"type": t_type, "combo": axis, "amount": budget})
-            elif t_type in ["馬連", "ワイド", "馬単", "枠連"]:
-                target = top_umabans[1] if len(top_umabans) > 1 and top_umabans[1] != axis else (top_umabans[0] if top_umabans else "2")
-                bets.append({"type": t_type, "combo": f"{axis}-{target}", "amount": budget})
-            elif t_type in ["3連複", "3連単"]:
-                target1 = top_umabans[1] if len(top_umabans) > 1 and top_umabans[1] != axis else "2"
-                target2 = top_umabans[2] if len(top_umabans) > 2 and top_umabans[2] != axis else "3"
-                bets.append({"type": t_type, "combo": f"{axis}-{target1}-{target2}", "amount": budget})
+                target_count = 1
             else:
-                bets.append({"type": t_type, "combo": axis, "amount": budget})
+                target_count = max(1, combo_count)
+                affordable_count = max(1, budget // 100)
+                if target_count > affordable_count:
+                    summary_text += f"【注意】: {t_type}は予算{budget}円では{combo_count}点を100円単位で買えないため、{affordable_count}点に調整します。\n"
+                    target_count = affordable_count
+
+            candidates = _candidate_custom_combos(t_type, ranked_umabans, axis, req.get("betting_method", "通常"))
+            selected_combos = candidates[:target_count]
+            if not selected_combos:
+                continue
+            if len(selected_combos) < target_count:
+                summary_text += f"【注意】: {t_type}は候補が{len(selected_combos)}点分しか作れなかったため、その点数で提案します。\n"
+
+            amount = budget if t_type in ["単勝", "複勝"] else (budget // len(selected_combos) // 100 * 100)
+            amount = max(100, amount)
+            if amount * len(selected_combos) > budget and t_type not in ["単勝", "複勝"]:
+                amount = 100
+
+            for combo in selected_combos:
+                bets.append({"type": t_type, "combo": combo, "amount": amount})
 
     summary_text += "\n【提案買い目】\n"
     for bet in bets:

@@ -7,7 +7,7 @@
 <text x="24" y="90" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">過去傾向: 過去5年の結果表</text>
 <rect x="180" y="74" width="0" height="20" rx="3" fill="#2563eb"/>
 <text x="188" y="90" font-family="Arial, sans-serif" font-size="12" fill="#374151">0.0%</text>
-<text x="24" y="124" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">レース基本: コース・距離・天候</text>
+<text x="24" y="124" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 斤量</text>
 <rect x="180" y="108" width="0" height="20" rx="3" fill="#2563eb"/>
 <text x="188" y="124" font-family="Arial, sans-serif" font-size="12" fill="#374151">0.0%</text>
 <text x="24" y="158" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">血統: 母</text>
@@ -19,46 +19,46 @@
 <text x="24" y="226" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">血統: 母父</text>
 <rect x="180" y="210" width="0" height="20" rx="3" fill="#2563eb"/>
 <text x="188" y="226" font-family="Arial, sans-serif" font-size="12" fill="#374151">0.0%</text>
-<text x="24" y="260" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 斤量</text>
+<text x="24" y="260" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">レース基本: コース・距離・天候</text>
 <rect x="180" y="244" width="0" height="20" rx="3" fill="#2563eb"/>
 <text x="188" y="260" font-family="Arial, sans-serif" font-size="12" fill="#374151">0.0%</text>
-<text x="24" y="294" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">レース基本: レースID</text>
-<rect x="180" y="278" width="5" height="20" rx="3" fill="#2563eb"/>
-<text x="193" y="294" font-family="Arial, sans-serif" font-size="12" fill="#374151">0.4%</text>
-<text x="24" y="328" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 人気</text>
-<rect x="180" y="312" width="11" height="20" rx="3" fill="#2563eb"/>
-<text x="199" y="328" font-family="Arial, sans-serif" font-size="12" fill="#374151">0.8%</text>
-<text x="24" y="362" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 馬番</text>
-<rect x="180" y="346" width="19" height="20" rx="3" fill="#2563eb"/>
-<text x="207" y="362" font-family="Arial, sans-serif" font-size="12" fill="#374151">1.3%</text>
-<text x="24" y="396" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">レース基本: レース名</text>
-<rect x="180" y="380" width="35" height="20" rx="3" fill="#2563eb"/>
-<text x="223" y="396" font-family="Arial, sans-serif" font-size="12" fill="#374151">2.4%</text>
-<text x="24" y="430" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 馬名</text>
-<rect x="180" y="414" width="48" height="20" rx="3" fill="#2563eb"/>
-<text x="236" y="430" font-family="Arial, sans-serif" font-size="12" fill="#374151">3.4%</text>
-<text x="24" y="464" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">過去傾向: 勝ち馬人気・馬番傾向</text>
-<rect x="180" y="448" width="50" height="20" rx="3" fill="#2563eb"/>
-<text x="238" y="464" font-family="Arial, sans-serif" font-size="12" fill="#374151">3.5%</text>
-<text x="24" y="498" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 性齢</text>
-<rect x="180" y="482" width="67" height="20" rx="3" fill="#2563eb"/>
-<text x="255" y="498" font-family="Arial, sans-serif" font-size="12" fill="#374151">4.7%</text>
+<text x="24" y="294" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">レース基本: レース名</text>
+<rect x="180" y="278" width="17" height="20" rx="3" fill="#2563eb"/>
+<text x="205" y="294" font-family="Arial, sans-serif" font-size="12" fill="#374151">0.7%</text>
+<text x="24" y="328" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">レース基本: レースID</text>
+<rect x="180" y="312" width="19" height="20" rx="3" fill="#2563eb"/>
+<text x="207" y="328" font-family="Arial, sans-serif" font-size="12" fill="#374151">0.8%</text>
+<text x="24" y="362" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">過去傾向: 勝ち馬人気・馬番傾向</text>
+<rect x="180" y="346" width="35" height="20" rx="3" fill="#2563eb"/>
+<text x="223" y="362" font-family="Arial, sans-serif" font-size="12" fill="#374151">1.5%</text>
+<text x="24" y="396" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 馬番</text>
+<rect x="180" y="380" width="88" height="20" rx="3" fill="#2563eb"/>
+<text x="276" y="396" font-family="Arial, sans-serif" font-size="12" fill="#374151">3.7%</text>
+<text x="24" y="430" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 枠番</text>
+<rect x="180" y="414" width="101" height="20" rx="3" fill="#2563eb"/>
+<text x="289" y="430" font-family="Arial, sans-serif" font-size="12" fill="#374151">4.3%</text>
+<text x="24" y="464" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 性齢</text>
+<rect x="180" y="448" width="117" height="20" rx="3" fill="#2563eb"/>
+<text x="305" y="464" font-family="Arial, sans-serif" font-size="12" fill="#374151">4.9%</text>
+<text x="24" y="498" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 馬名</text>
+<rect x="180" y="482" width="135" height="20" rx="3" fill="#2563eb"/>
+<text x="323" y="498" font-family="Arial, sans-serif" font-size="12" fill="#374151">5.7%</text>
 <text x="24" y="532" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 厩舎</text>
-<rect x="180" y="516" width="80" height="20" rx="3" fill="#2563eb"/>
-<text x="268" y="532" font-family="Arial, sans-serif" font-size="12" fill="#374151">5.6%</text>
-<text x="24" y="566" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 枠番</text>
-<rect x="180" y="550" width="90" height="20" rx="3" fill="#2563eb"/>
-<text x="278" y="566" font-family="Arial, sans-serif" font-size="12" fill="#374151">6.2%</text>
-<text x="24" y="600" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 騎手</text>
-<rect x="180" y="584" width="101" height="20" rx="3" fill="#2563eb"/>
-<text x="289" y="600" font-family="Arial, sans-serif" font-size="12" fill="#374151">7.0%</text>
-<text x="24" y="634" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 馬体重</text>
-<rect x="180" y="618" width="142" height="20" rx="3" fill="#2563eb"/>
-<text x="330" y="634" font-family="Arial, sans-serif" font-size="12" fill="#374151">9.8%</text>
-<text x="24" y="668" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">過去戦績: タイム</text>
-<rect x="180" y="652" width="142" height="20" rx="3" fill="#2563eb"/>
-<text x="330" y="668" font-family="Arial, sans-serif" font-size="12" fill="#374151">9.9%</text>
+<rect x="180" y="516" width="152" height="20" rx="3" fill="#2563eb"/>
+<text x="340" y="532" font-family="Arial, sans-serif" font-size="12" fill="#374151">6.4%</text>
+<text x="24" y="566" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">過去戦績: タイム</text>
+<rect x="180" y="550" width="204" height="20" rx="3" fill="#2563eb"/>
+<text x="392" y="566" font-family="Arial, sans-serif" font-size="12" fill="#374151">8.6%</text>
+<text x="24" y="600" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 馬体重</text>
+<rect x="180" y="584" width="225" height="20" rx="3" fill="#2563eb"/>
+<text x="413" y="600" font-family="Arial, sans-serif" font-size="12" fill="#374151">9.5%</text>
+<text x="24" y="634" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 騎手</text>
+<rect x="180" y="618" width="296" height="20" rx="3" fill="#2563eb"/>
+<text x="484" y="634" font-family="Arial, sans-serif" font-size="12" fill="#374151">12.4%</text>
+<text x="24" y="668" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: 人気</text>
+<rect x="180" y="652" width="343" height="20" rx="3" fill="#2563eb"/>
+<text x="531" y="668" font-family="Arial, sans-serif" font-size="12" fill="#374151">14.4%</text>
 <text x="24" y="702" font-family="Meiryo, Arial, sans-serif" font-size="14" fill="#1f2937">出馬表: オッズ</text>
 <rect x="180" y="686" width="650" height="20" rx="3" fill="#2563eb"/>
-<text x="838" y="702" font-family="Arial, sans-serif" font-size="12" fill="#374151">44.9%</text>
+<text x="838" y="702" font-family="Arial, sans-serif" font-size="12" fill="#374151">27.2%</text>
 </svg>

@@ -178,9 +178,9 @@ if app_mode == "バックテスト":
     @st.cache_data(ttl=3600, show_spinner=False)
     def get_race_date(race_id): return scraper.get_race_date(race_id)
 
-    st.title("🔄 AIバックテスト機能")
-    st.markdown("過去のレースIDを入力し、AIの予想精度（的中率・回収率）を検証します。結果はCSVに保存されます。")
-    bt_models = st.multiselect("検証するAIモデル", ["Gemini", "ChatGPT"], default=["Gemini"])
+    st.title("🔄 予想バックテスト機能")
+    st.markdown("過去のレースIDを入力し、AI・ルールベースの予想精度（的中率・回収率）を検証します。結果はCSVに保存されます。")
+    bt_models = st.multiselect("検証するモデル", ["Gemini", "ChatGPT", "ルールベース (AI不使用)"], default=["Gemini"])
     
     if "bt_race_ids_input" not in st.session_state:
         st.session_state.bt_race_ids_input = "202405020811\n202305020811"
@@ -523,6 +523,9 @@ if app_mode == "バックテスト":
         if bt_bet_plan_mode == "カスタム" and bt_effective_budget <= 0:
             st.warning("カスタムの買い方条件を1件以上、予算ありで設定してください。")
             st.stop()
+        if not bt_models:
+            st.warning("検証するモデルを1つ以上選択してください。")
+            st.stop()
         bt_race_ids = [r.strip() for r in bt_race_ids_str.split('\n') if r.strip()]
         if not bt_race_ids: st.warning("レースIDを入力してください。")
         else:
@@ -663,9 +666,26 @@ if app_mode == "バックテスト":
                     prog_text.write(f"{r_id} を {model} で予想中...")
                     ai_res, bets = "", []
                     try:
-                        ai_res = ask_gemini(prompt) if model == "Gemini" else ask_chatgpt(prompt)
-                        match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', ai_res, re.DOTALL | re.IGNORECASE)
-                        if match: bets = json.loads(match.group(1)).get("bets", [])
+                        if model == "ルールベース (AI不使用)":
+                            rule_result = run_rule_based_analysis(
+                                horses_data,
+                                shutuba_df,
+                                race_info,
+                                r_id,
+                                include_blood=bt_use_blood,
+                            )
+                            rule_result["_volatility"] = bt_volatility
+                            ai_res = generate_rule_based_summary(
+                                rule_result,
+                                bt_effective_budget,
+                                st.session_state.get("bt_custom_ticket_requests", []),
+                                bt_bet_plan_mode,
+                            )
+                            bets = extract_bets_from_text(ai_res)
+                        else:
+                            ai_res = ask_gemini(prompt) if model == "Gemini" else ask_chatgpt(prompt)
+                            match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', ai_res, re.DOTALL | re.IGNORECASE)
+                            if match: bets = json.loads(match.group(1)).get("bets", [])
                     except Exception as e:
                         st.error(f"モデル '{model}' の処理中にエラーが発生しました: {e}")
                         continue
