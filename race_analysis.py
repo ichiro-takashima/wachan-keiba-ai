@@ -602,12 +602,23 @@ def generate_rule_based_summary(analysis_res, effective_budget, custom_requests,
                 bets.append({"type": "3連複", "combo": f"{top1}-{a}-{b}", "amount": amt})
             summary_text += "【買い方判断】: 軸は置きつつ相手を広げる三連複流しで組み立てます。\n"
         else:
-            partners = [u for u in [top1, top2, top3, top4, top5, top6] if u != top1]
-            amt = max(100, effective_budget // max(1, len(partners) * 2) // 100 * 100)
+            win_axis = value_picks[0]["umaban"] if value_picks else top1
+            win_amount = int(effective_budget * 0.3) // 100 * 100
+            if win_amount < 100 and effective_budget >= 500:
+                win_amount = 100
+            win_amount = min(win_amount, int(effective_budget * 0.4) // 100 * 100)
+            if win_amount >= 100:
+                bets.append({"type": "単勝", "combo": win_axis, "amount": win_amount})
+
+            remaining_budget = max(0, effective_budget - win_amount)
+            partners = [u for u in [top1, top2, top3, top4, top5, top6] if u != win_axis]
+            candidate_bets = []
             for target in partners:
-                bets.append({"type": "ワイド", "combo": f"{top1}-{target}", "amount": amt})
-                bets.append({"type": "馬連", "combo": f"{top1}-{target}", "amount": amt})
-            summary_text += "【買い方判断】: 上位拮抗の波乱想定のため、ワイド・馬連で中穴まで拾います。\n"
+                candidate_bets.append({"type": "ワイド", "combo": f"{win_axis}-{target}", "amount": 100})
+                candidate_bets.append({"type": "馬連", "combo": f"{win_axis}-{target}", "amount": 100})
+            affordable_count = remaining_budget // 100
+            bets.extend(candidate_bets[:affordable_count])
+            summary_text += "【買い方判断】: 大荒れ想定のため、単勝を予算の20〜40%程度入れて一撃を狙い、残りでワイド・馬連を拾います。\n"
     else:
         for req in custom_requests:
             t_type = req.get("ticket_type", "単勝")

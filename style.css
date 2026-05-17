@@ -5,6 +5,21 @@
     color: #2C3E50;
 }
 
+.app-title {
+    font-size: 1.75rem;
+    line-height: 1.25;
+    font-weight: 700;
+    margin: 0 0 1rem;
+    color: #263747;
+}
+
+@media (min-width: 900px) {
+    .app-title {
+        font-size: 2rem;
+        white-space: nowrap;
+    }
+}
+
 /* ボタンのデザインをモダンにする */
 .stButton > button {
     background-color: #2980B9;

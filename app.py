@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 import pandas as pd
 import time
 import os
@@ -10,6 +10,7 @@ from datetime import datetime
 from evaluator import Evaluator
 from feature_importance import run_feature_importance
 from ai_clients import ask_chatgpt as call_chatgpt, ask_gemini as call_gemini
+from backtest_ml import train_backtest_trend_model
 from data_features import (
     feature_enabled,
     find_matching_column as _find_matching_column,
@@ -29,7 +30,6 @@ from race_volatility import analyze_race_volatility, format_volatility_for_promp
 from tickets import (
     BETTING_METHOD_OPTIONS,
     TICKET_TYPE_OPTIONS,
-    build_reflection_text,
     build_ticket_plan_text,
     calculate_return,
     create_ticket_request,
@@ -335,6 +335,30 @@ if app_mode == "バックテスト":
         bt_budget
     )
 
+    bt_use_backtest_ml = st.checkbox(
+        "バックテスト結果からML傾向を学習して予想に反映する",
+        value=True,
+        key="bt_use_backtest_ml",
+        help="backtest_results.csv の買い目履歴を使い、同一レースID系統で回収率が高かった馬券種・馬番構成をプロンプトへ追加します。"
+    )
+
+    with st.expander("バックテストML傾向プレビュー", expanded=False):
+        preview_race_id = st.text_input("傾向を見るレースID", value=base_race_id if "base_race_id" in locals() else "202405020811", key="bt_ml_preview_race_id")
+        if st.button("ML傾向を表示", key="show_backtest_ml_preview"):
+            try:
+                ml_result = train_backtest_trend_model(preview_race_id, max_horse_number=bt_max_horses)
+                if not ml_result.context_text:
+                    st.info("backtest_results.csv に学習できる履歴がまだありません。")
+                else:
+                    st.text(ml_result.context_text)
+                    if not ml_result.candidates.empty:
+                        st.dataframe(
+                            ml_result.candidates[["ticket_type", "combo", "trend_score", "avg_return_rate", "samples", "hit_races"]].head(20),
+                            use_container_width=True
+                        )
+            except Exception as e:
+                st.error(f"バックテストML傾向の作成に失敗しました: {e}")
+
     with st.expander("📊 EvaluatorクラスでCSV検証（AI vs 人気順）", expanded=False):
         st.caption("prediction CSV と payout CSV をアップロードすると、evaluator.py のロジックで客観的指標を算出します。")
         ev_col1, ev_col2, ev_col3 = st.columns(3)
@@ -576,6 +600,14 @@ if app_mode == "バックテスト":
                 # バックテスト用の買い目構築ルールをプロンプトに追加
                 ctx += f"【買い目構築ルール】\n{bt_ticket_plan_text}\n\n"
 
+                if bt_use_backtest_ml:
+                    try:
+                        ml_result = train_backtest_trend_model(r_id, max_horse_number=bt_max_horses)
+                        if ml_result.context_text:
+                            ctx += ml_result.context_text + "\n\n"
+                    except Exception as e:
+                        st.warning(f"バックテストML傾向を作成できませんでした: {e}")
+
                 ctx += "【出走馬詳細】\n"
 
                 shutuba_df = scraper.scrape_shutuba_table(r_id)
@@ -757,7 +789,10 @@ if app_mode == "予想履歴":
         st.info("予想履歴はまだありません。")
     st.stop()
 
-st.title("🏇 わーちゃんのレース予想AI")
+st.markdown(
+    '<h1 class="app-title">A horse racing prediction AI</h1>',
+    unsafe_allow_html=True,
+)
 
 race_id = st.text_input("Race IDを入力 (例: 202405020811)")
 prediction_date = st.date_input(
@@ -913,6 +948,12 @@ if st.session_state.all_horse_data:
         "race",
         "AIに渡す情報を細かく絞り込むことで、特定のデータに引っ張られる過学習やノイズを防ぎます。"
     )
+    use_backtest_ml = st.checkbox(
+        "バックテスト結果からML傾向を学習して予想に反映する",
+        value=True,
+        key="race_use_backtest_ml",
+        help="backtest_results.csv の買い目履歴を使い、同一レースID系統の買い目傾向を予想プロンプトへ追加します。"
+    )
     use_past_trend = feature_enabled(selected_features, "past_trend_rows", "past_trend_summary")
     use_shutuba_table = feature_enabled(selected_features, "shutuba_umaban", "shutuba_waku", "shutuba_name", "shutuba_sex_age", "shutuba_jockey", "shutuba_weight_carried", "shutuba_odds", "shutuba_popularity", "shutuba_stable", "shutuba_body_weight")
     use_blood = feature_enabled(selected_features, "blood_sire", "blood_dam", "blood_broodmare_sire")
@@ -948,6 +989,24 @@ if st.session_state.all_horse_data:
     volatility_prompt = format_volatility_for_prompt(st.session_state.race_volatility)
     if volatility_prompt:
         data_context += f"\n{volatility_prompt}\n"
+
+    if use_backtest_ml:
+        try:
+            max_horse_number = None
+            if st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:
+                max_horse_number = len(st.session_state.shutuba_table)
+            ml_result = train_backtest_trend_model(race_id, max_horse_number=max_horse_number)
+            if ml_result.context_text:
+                data_context += "\n" + ml_result.context_text + "\n"
+                with st.expander("バックテストML傾向", expanded=False):
+                    st.text(ml_result.context_text)
+                    if not ml_result.candidates.empty:
+                        st.dataframe(
+                            ml_result.candidates[["ticket_type", "combo", "trend_score", "avg_return_rate", "samples", "hit_races"]].head(20),
+                            use_container_width=True
+                        )
+        except Exception as e:
+            st.warning(f"バックテストML傾向を作成できませんでした: {e}")
 
     data_context += f"""
 
@@ -1266,6 +1325,7 @@ if st.session_state.all_horse_data:
 3. レースの波乱度判定（「堅い」「標準」「荒れ気味」「大荒れ警戒」のいずれか）とその理由
 4. 荒れ具合診断を踏まえた購入点数の判断（券種ごとの実際の点数も明記）
 5. 予算{effective_budget}円の範囲での具体的な買い目（馬券種、組み合わせ（すべて馬番で書くこと）、金額配分）と、その買い方を選んだ理由
+   - 「大荒れ警戒」または強い波乱想定の場合は、期待値のある穴馬または最上位評価馬の単勝を予算の20〜40%程度入れ、残りでワイド・馬連・3連複を組み立てること。
 6. 買い目データ（※システムの自動集計用。必ず以下のJSONフォーマットでテキストの最後に記述すること）
 ```json
 {{ "bets": [ {{"type": "馬連", "combo": "1-2", "amount": 500}} ] }}
@@ -1375,8 +1435,6 @@ if st.session_state.all_horse_data:
                         total_bet, total_return, hits, ticket_stats = calculate_return(bets, payouts)
                         hit_rate = (hits / len(bets) * 100) if bets else 0
                         return_rate = (total_return / total_bet * 100) if total_bet > 0 else 0
-                        reflection = build_reflection_text(bets, payouts)
-
                         st.markdown(f"#### {model_name} 的中結果")
                         st.write(f"購入合計: {total_bet}円 / 払戻合計: {total_return}円 / 回収率: {return_rate:.1f}% / 的中率: {hit_rate:.1f}%")
                         if ticket_stats:
@@ -1385,6 +1443,3 @@ if st.session_state.all_horse_data:
                             )
                             ticket_df["回収率"] = (ticket_df["払戻額"] / ticket_df["購入額"] * 100).fillna(0).round(1).astype(str) + "%"
                             st.dataframe(ticket_df, use_container_width=True)
-
-                        st.markdown("**次回予想に活かす振り返り**")
-                        st.write(reflection)
