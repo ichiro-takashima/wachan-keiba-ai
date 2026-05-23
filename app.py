@@ -60,6 +60,62 @@ def ask_chatgpt(prompt):
     return call_chatgpt(prompt, API_KEY_OPENAI)
 
 
+def collect_single_race_data(target_race_id, cutoff_date):
+    """単一レース予想に必要なデータをまとめて取得する。"""
+    h_ids = scraper.get_horse_ids_from_race(target_race_id)
+    if not h_ids:
+        return None
+
+    temp_horse_data = []
+    temp_pedigree_list = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for i, hid in enumerate(h_ids):
+        status_text.write(f"🔍 {i+1}/{len(h_ids)}頭目 (ID: {hid}) を取得中...")
+
+        ped_data = scraper.scrape_horse_ped(hid)
+        temp_pedigree_list.append(ped_data)
+
+        results_df = scraper.scrape_race_results_dedicated(hid)
+
+        if not results_df.empty:
+            results_df['日付'] = pd.to_datetime(results_df['日付'], errors='coerce')
+            results_df = results_df[results_df['日付'] < pd.Timestamp(cutoff_date)]
+            results_df['日付'] = results_df['日付'].dt.strftime('%Y/%m/%d')
+
+        temp_horse_data.append({"id": hid, "pedigree": ped_data, "results": results_df})
+        progress_bar.progress((i + 1) / len(h_ids))
+
+    status_text.write("📊 出馬表（レース情報）を取得中...")
+    shutuba_df = scraper.scrape_shutuba_table(target_race_id)
+    race_info = scraper.scrape_race_info(target_race_id)
+    past_trend_df = scraper.scrape_past_top3_trend(target_race_id, years=5)
+
+    status_text.empty()
+    progress_bar.empty()
+
+    return {
+        "all_horse_data": temp_horse_data,
+        "pedigree_list": temp_pedigree_list,
+        "shutuba_table": shutuba_df,
+        "race_info": race_info,
+        "past_trend_df": past_trend_df,
+        "race_volatility": analyze_race_volatility(shutuba_df, past_trend_df),
+    }
+
+
+def save_single_race_data(data):
+    st.session_state.all_horse_data = data["all_horse_data"]
+    st.session_state.pedigree_list = data["pedigree_list"]
+    st.session_state.shutuba_table = data["shutuba_table"]
+    st.session_state.race_info = data["race_info"]
+    st.session_state.past_trend_df = data["past_trend_df"]
+    st.session_state.race_volatility = data["race_volatility"]
+    st.session_state.chat_messages = []
+    st.session_state.analysis_results = {}
+
+
 # --- Streamlit UI ---
 st.sidebar.title("🏇 メニュー")
 app_mode = st.sidebar.radio("モード選択", ["単一レース予想", "バックテスト", "予想履歴"], index=0)
@@ -790,11 +846,16 @@ if app_mode == "予想履歴":
     st.stop()
 
 st.markdown(
-    '<h1 class="app-title">A horse racing prediction AI</h1>',
+    '<h1 class="app-title">競馬予想AI</h1>',
     unsafe_allow_html=True,
 )
 
-race_id = st.text_input("Race IDを入力 (例: 202405020811)")
+if "race_id_input" not in st.session_state:
+    st.session_state.race_id_input = ""
+if "pending_race_id_input" in st.session_state:
+    st.session_state.race_id_input = st.session_state.pop("pending_race_id_input")
+
+race_id = st.text_input("Race IDを入力 (例: 202405020811)", key="race_id_input")
 prediction_date = st.date_input(
     "予想の基準日（この日より前のデータのみ使用）", 
     value=pd.Timestamp.now(),
@@ -826,6 +887,82 @@ if "past_trend_df" not in st.session_state:
     st.session_state.past_trend_df = None
 if "race_volatility" not in st.session_state:
     st.session_state.race_volatility = None
+if "hard_race_scan_results" not in st.session_state:
+    st.session_state.hard_race_scan_results = []
+
+with st.expander("当日レースID一覧から「堅い」レースを探す", expanded=False):
+    st.caption("当日のレースIDを複数貼り付けると、出馬表と過去5年傾向から荒れ具合を判定します。堅いレースはそのまま多角分析と買い目選択へ進めます。")
+    day_race_ids_text = st.text_area(
+        "当日レースID（改行 or カンマ区切り）",
+        value="",
+        height=100,
+        key="hard_race_ids_input",
+        placeholder="例:\n202405020811\n202405020812"
+    )
+
+    if st.button("堅いレースを判定", key="scan_hard_races", use_container_width=True):
+        day_race_ids = _parse_ids_input(day_race_ids_text)
+        if not day_race_ids:
+            st.warning("レースIDを入力してください。")
+        else:
+            scan_rows = []
+            scan_progress = st.progress(0)
+            scan_status = st.empty()
+            for idx, rid in enumerate(day_race_ids, start=1):
+                scan_status.write(f"判定中: {rid} ({idx}/{len(day_race_ids)})")
+                try:
+                    scan_shutuba_df = scraper.scrape_shutuba_table(rid)
+                    scan_race_info = scraper.scrape_race_info(rid)
+                    scan_past_trend_df = scraper.scrape_past_top3_trend(rid, years=5)
+                    volatility = analyze_race_volatility(scan_shutuba_df, scan_past_trend_df)
+                    scan_rows.append({
+                        "race_id": rid,
+                        "レース名": scan_race_info.get("name", ""),
+                        "条件": scan_race_info.get("data", ""),
+                        "荒れ指数": volatility["score"],
+                        "判定": volatility["level"],
+                        "方針": volatility["summary"],
+                        "根拠": " / ".join(volatility.get("reasons", [])),
+                    })
+                except Exception as e:
+                    scan_rows.append({
+                        "race_id": rid,
+                        "レース名": "",
+                        "条件": "",
+                        "荒れ指数": None,
+                        "判定": "取得失敗",
+                        "方針": "",
+                        "根拠": str(e),
+                    })
+                scan_progress.progress(idx / len(day_race_ids))
+            scan_status.empty()
+            scan_progress.empty()
+            st.session_state.hard_race_scan_results = scan_rows
+
+    if st.session_state.hard_race_scan_results:
+        scan_df = pd.DataFrame(st.session_state.hard_race_scan_results)
+        hard_df = scan_df[scan_df["判定"] == "堅い"].copy()
+        st.dataframe(scan_df, use_container_width=True)
+
+        if hard_df.empty:
+            st.info("今回の一覧には、判定が「堅い」のレースは見つかりませんでした。")
+        else:
+            st.success(f"堅いレース候補: {len(hard_df)}件")
+            selected_hard_race = st.selectbox(
+                "多角分析へ進むレース",
+                hard_df["race_id"].tolist(),
+                format_func=lambda rid: f"{rid} - {hard_df.loc[hard_df['race_id'] == rid, 'レース名'].iloc[0]}",
+                key="selected_hard_race_id"
+            )
+            if st.button("この堅いレースで多角分析へ進む", key="load_selected_hard_race", use_container_width=True):
+                st.session_state.pending_race_id_input = selected_hard_race
+                with st.spinner("選択した堅いレースの詳細データを取得中..."):
+                    race_data = collect_single_race_data(selected_hard_race, prediction_date)
+                if race_data is None:
+                    st.error("出走馬が見つかりませんでした。")
+                else:
+                    save_single_race_data(race_data)
+                    st.rerun()
 
 # --- AI予想開始ボタン ---
 if st.button("データ取得開始"):
@@ -835,47 +972,11 @@ if st.button("データ取得開始"):
         st.warning("Race IDを入力してください")
     else:
         with st.spinner("出走馬データを収集中..."):
-            h_ids = scraper.get_horse_ids_from_race(race_id)
-            if not h_ids:
+            race_data = collect_single_race_data(race_id, prediction_date)
+            if race_data is None:
                 st.error("出走馬が見つかりませんでした。")
             else:
-                temp_horse_data = []
-                temp_pedigree_list = []
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                for i, hid in enumerate(h_ids):
-                    status_text.write(f"🔍 {i+1}/{len(h_ids)}頭目 (ID: {hid}) を取得中...")
-                    
-                    ped_data = scraper.scrape_horse_ped(hid)
-                    temp_pedigree_list.append(ped_data)
-                    
-                    results_df = scraper.scrape_race_results_dedicated(hid)
-                    
-                    if not results_df.empty:
-                        results_df['日付'] = pd.to_datetime(results_df['日付'], errors='coerce')
-                        cutoff_date = pd.Timestamp(prediction_date)
-                        results_df = results_df[results_df['日付'] < cutoff_date]
-                        results_df['日付'] = results_df['日付'].dt.strftime('%Y/%m/%d')
-                    
-                    temp_horse_data.append({"id": hid, "pedigree": ped_data, "results": results_df})
-                    progress_bar.progress((i + 1) / len(h_ids))
-
-                # 出馬表のスクレイピングを実行
-                status_text.write("📊 出馬表（レース情報）を取得中...")
-                shutuba_df = scraper.scrape_shutuba_table(race_id)
-                race_info = scraper.scrape_race_info(race_id)
-                past_trend_df = scraper.scrape_past_top3_trend(race_id, years=5)
-
-                # データをセッションに保存して再起動
-                st.session_state.all_horse_data = temp_horse_data
-                st.session_state.pedigree_list = temp_pedigree_list
-                st.session_state.shutuba_table = shutuba_df
-                st.session_state.race_info = race_info
-                st.session_state.past_trend_df = past_trend_df
-                st.session_state.race_volatility = analyze_race_volatility(shutuba_df, past_trend_df)
-                st.session_state.chat_messages = [] # 別のレースを予想する際にチャット履歴をリセット
-                st.session_state.analysis_results = {}
+                save_single_race_data(race_data)
                 st.rerun()
 
 # --- ここから表示フェーズ（データがあるときだけ自動で表示される） ---
