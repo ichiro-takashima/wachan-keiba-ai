@@ -503,6 +503,53 @@ def scrape_race_result_page(race_id):
 
 
 
+def _clean_race_text(text):
+    text = str(text or "").replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _extract_race_info_from_soup(soup, race_id):
+    name_tag = soup.select_one(".RaceList_Item02 .RaceName") or soup.select_one(".RaceName")
+    data01_tag = soup.select_one(".RaceList_Item02 .RaceData01") or soup.select_one(".RaceData01")
+    data02_tag = soup.select_one(".RaceList_Item02 .RaceData02") or soup.select_one(".RaceData02")
+
+    if not name_tag:
+        return None
+
+    race_name = _clean_race_text(name_tag.get_text(" ", strip=True))
+    if not race_name:
+        return None
+
+    data01 = _clean_race_text(data01_tag.get_text(" ", strip=True)) if data01_tag else ""
+    data02 = _clean_race_text(data02_tag.get_text(" ", strip=True)) if data02_tag else ""
+    data = _clean_race_text(" / ".join(part for part in [data01, data02] if part))
+
+    spans02 = [span.get_text(" ", strip=True) for span in data02_tag.find_all("span")] if data02_tag else []
+    entries = ""
+    for value in spans02:
+        if re.search(r"\d+頭", value):
+            entries = value
+            break
+
+    course_match = re.search(r"(芝|ダ|障害)\s*\d{3,4}m(?:\s*\([^)]+\))?", data01)
+    start_match = re.search(r"(\d{1,2}:\d{2})\s*発走", data01)
+
+    return {
+        "race_id": race_id,
+        "name": race_name,
+        "data": data,
+        "start_time": start_match.group(1) if start_match else "",
+        "course": _clean_race_text(course_match.group(0)) if course_match else "",
+        "meeting": spans02[0] if len(spans02) > 0 else "",
+        "place": spans02[1] if len(spans02) > 1 else "",
+        "day": spans02[2] if len(spans02) > 2 else "",
+        "race_class": spans02[4] if len(spans02) > 4 else "",
+        "entries": entries,
+        "detail": data02,
+    }
+
+
 def scrape_race_info(race_id):
     # 1. 現在のレースページ(race.netkeiba.com)から取得を試みる
     url_shutuba = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
@@ -511,15 +558,9 @@ def scrape_race_info(race_id):
         res.encoding = "euc-jp"
         soup = BeautifulSoup(res.text, "html.parser")
         
-        name_tag = soup.find("div", class_="RaceName")
-        if name_tag and name_tag.text.strip():
-            race_name = name_tag.text.strip()
-            race_data = ""
-            data_tag = soup.find("div", class_="RaceData01")
-            if data_tag:
-                race_data = data_tag.text.replace("\n", " ").strip()
-                race_data = re.sub(r'\s+', ' ', race_data)
-            return {"name": race_name, "data": race_data}
+        race_info = _extract_race_info_from_soup(soup, race_id)
+        if race_info:
+            return race_info
     except Exception:
         pass
         
@@ -537,11 +578,43 @@ def scrape_race_info(race_id):
             p = dl.find("diary_snap_cut") or dl.find("p")
             race_data = p.text.replace("\xa0", " ").strip() if p else ""
             race_data = re.sub(r'\s+', ' ', race_data)
-            return {"name": race_name, "data": race_data}
+            return {"race_id": race_id, "name": race_name, "data": race_data}
     except Exception:
         pass
 
     return {"name": f"レースID: {race_id}", "data": "情報取得不可"}
+
+def scrape_race_info(race_id):
+    url_shutuba = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
+    try:
+        res = session.get(url_shutuba, headers=HEADERS, timeout=10)
+        res.encoding = res.apparent_encoding or "euc-jp"
+        soup = BeautifulSoup(res.text, "html.parser")
+        race_info = _extract_race_info_from_soup(soup, race_id)
+        if race_info:
+            return race_info
+    except Exception:
+        pass
+
+    url_db = f"https://db.netkeiba.com/race/{race_id}/"
+    try:
+        res = session.get(url_db, headers=HEADERS, timeout=10)
+        res.encoding = "euc-jp"
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        dl = soup.find("dl", class_="racedata")
+        if dl:
+            h1 = dl.find("h1")
+            race_name = _clean_race_text(h1.get_text(" ", strip=True)) if h1 else ""
+            p = dl.find(class_="diary_snap_cut") or dl.find("p")
+            race_data = _clean_race_text(p.get_text(" ", strip=True)) if p else ""
+            if race_name:
+                return {"race_id": race_id, "name": race_name, "data": race_data}
+    except Exception:
+        pass
+
+    return {"race_id": race_id, "name": f"レースID: {race_id}", "data": "情報取得不可"}
+
 
 def get_race_date(race_id):
     url = f"https://db.netkeiba.com/race/{race_id}/"
