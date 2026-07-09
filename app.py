@@ -152,15 +152,25 @@ def _horse_number_lookup(shutuba_df):
     return lookup
 
 
-def build_full_ai_betting_prompt(race_id, max_budget, user_note=""):
+def build_full_ai_betting_prompt(race_id, max_budget, user_note="", use_full_budget=False):
     race_info = st.session_state.race_info or {"name": "不明", "data": "不明"}
     shutuba_df = st.session_state.shutuba_table
     horse_number_by_name = _horse_number_lookup(shutuba_df)
+    budget_policy = (
+        f"最大予算{max_budget}円を必ず全額使い切ってください。集計用JSONのbetsのamount合計も必ず{max_budget}円にしてください。"
+        if use_full_budget
+        else "最大予算は上限です。期待値が低い場合は0円または一部だけ賭ける判断も許可します。"
+    )
+    recommended_amount_requirement = (
+        f"7. 実際に賭ける推奨額（必ず{max_budget}円）と、全額をどう配分したかの理由"
+        if use_full_budget
+        else f"7. 実際に賭ける推奨額（0円から{max_budget}円まで）と、その金額にした理由"
+    )
 
     sections = [
         AI_PERSONA_PROMPT,
         "以下のスクレイピング済みデータを複合的に評価し、レース分析と買い方を提案してください。",
-        "最大予算は上限です。期待値が低い場合は0円または一部だけ賭ける判断も許可します。",
+        budget_policy,
         "買い方、券種、点数、配分は完全にあなたの判断に委ねます。",
         "金額は必ず100円単位にしてください。50円、150円、250円など100円の倍数ではない金額は絶対に出さないでください。",
         "馬は必ず馬番で指定してください。",
@@ -173,7 +183,7 @@ def build_full_ai_betting_prompt(race_id, max_budget, user_note=""):
         "4. 【リスクヘッジ・別シナリオ】馬場悪化、展開変化、人気馬凡走時の対応",
         "5. 総合印（◎ ○ ▲ △ 注 穴 消）と根拠",
         "6. 波乱度と見送り判断を含むリスク評価",
-        f"7. 実際に賭ける推奨額（0円から{max_budget}円まで）と、その金額にした理由",
+        recommended_amount_requirement,
         "8. 具体的な買い目（券種、組み合わせ、金額、狙い）",
         "9. 最後に必ず集計用JSONをこの形式で出力: ```json\n{\"bets\":[{\"type\":\"ワイド\",\"combo\":\"1-2\",\"amount\":100}]}\n```",
         "",
@@ -181,6 +191,7 @@ def build_full_ai_betting_prompt(race_id, max_budget, user_note=""):
         f"レース名: {race_info.get('name', '不明')}",
         f"条件: {race_info.get('data', '不明')}",
         f"最大予算: {max_budget}円",
+        f"予算方針: {'最大予算を全額使用' if use_full_budget else '最大予算内で任意使用'}",
     ]
     if user_note.strip():
         sections.extend(["", "【ユーザーの注目点】", user_note.strip()])
@@ -213,8 +224,8 @@ def build_full_ai_betting_prompt(race_id, max_budget, user_note=""):
     return "\n".join(sections)
 
 
-def run_full_ai_betting_analysis(race_id, max_budget, user_note):
-    prompt = build_full_ai_betting_prompt(race_id, max_budget, user_note)
+def run_full_ai_betting_analysis(race_id, max_budget, user_note, use_full_budget=False):
+    prompt = build_full_ai_betting_prompt(race_id, max_budget, user_note, use_full_budget)
     targets = []
     if ai_choice in ["Gemini", "両方で比較"]:
         targets.append(("Gemini", ask_gemini))
@@ -1100,7 +1111,7 @@ if st.session_state.all_horse_data:
     st.markdown("---")
     st.subheader("🚀 AI総合予想と賭け方提案")
     st.caption("血統、各馬の過去10戦、出馬表をAIへ渡し、最大予算内で実際にいくら賭けるかまで提案します。期待値が低い場合は見送りや減額も許可します。")
-    full_cols = st.columns([1, 3])
+    full_cols = st.columns([1, 1, 3])
     with full_cols[0]:
         full_max_budget = st.number_input(
             "最大予算 (円)",
@@ -1111,6 +1122,12 @@ if st.session_state.all_horse_data:
             key="full_ai_max_budget",
         )
     with full_cols[1]:
+        use_full_budget = st.checkbox(
+            "最大予算をすべて使う",
+            value=False,
+            key="full_ai_use_full_budget",
+        )
+    with full_cols[2]:
         full_user_note = st.text_input(
             "注目点・希望（任意）",
             placeholder="例: 道悪想定。無理に買わず期待値重視で。",
@@ -1129,6 +1146,7 @@ if st.session_state.all_horse_data:
                 race_id,
                 int(full_max_budget),
                 full_user_note,
+                use_full_budget,
             )
             for model_name, response in st.session_state.full_ai_reports.items():
                 st.session_state.latest_predictions[model_name] = {
@@ -1149,6 +1167,7 @@ if st.session_state.all_horse_data:
         race_id,
         int(st.session_state.get("full_ai_max_budget", 1000)),
         st.session_state.get("full_ai_user_note", ""),
+        st.session_state.get("full_ai_use_full_budget", False),
     )
 
     # --- 💬 AIと相談機能の追加 ---

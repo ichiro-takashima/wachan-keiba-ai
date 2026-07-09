@@ -34,6 +34,26 @@ HEADERS = {
 
 
 DATA_DIR = Path("data")
+JRA_PLACE_CODES = {"01", "02", "03", "04", "05", "06", "07", "08", "09", "10"}
+
+
+def is_local_race_id(race_id):
+    race_id = str(race_id)
+    return len(race_id) >= 6 and race_id[4:6] not in JRA_PLACE_CODES
+
+
+def _race_page_urls(race_id):
+    if is_local_race_id(race_id):
+        return [
+            f"https://nar.netkeiba.com/race/shutuba.html?race_id={race_id}",
+            f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}",
+        ]
+    return [
+        f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}",
+        f"https://nar.netkeiba.com/race/shutuba.html?race_id={race_id}",
+    ]
+
+
 def ensure_data_directories(base_dir=DATA_DIR):
     """
     pathlibでデータ保存用ディレクトリを作成する。
@@ -311,12 +331,101 @@ def get_horse_ids_from_race(race_id):
         for link in soup_future.find_all("a", href=True):
             match = re.search(r"/horse/([a-zA-Z0-9]{10})", link["href"])
             if match: horse_ids.append(match.group(1))
-        return list(dict.fromkeys(horse_ids))[:18]
+        if horse_ids:
+            return list(dict.fromkeys(horse_ids))[:18]
+
+        for race_url in _race_page_urls(race_id):
+            res_page = session.get(race_url, headers=HEADERS, timeout=10)
+            res_page.encoding = res_page.apparent_encoding or "utf-8"
+            soup_page = BeautifulSoup(res_page.text, "html.parser")
+            for link in soup_page.find_all("a", href=True):
+                match = re.search(r"/horse/([a-zA-Z0-9]{10})", link["href"])
+                if match:
+                    horse_ids.append(match.group(1))
+            if horse_ids:
+                return list(dict.fromkeys(horse_ids))[:18]
+        return []
     except Exception:
         return []
 
 
+def _parse_shutuba_rows(soup):
+    data = []
+    table_rows = soup.find_all("tr", class_="HorseList")
+
+    for row in table_rows:
+        umaban_tag = row.find("td", class_=re.compile(r"Umaban\d"))
+        umaban = umaban_tag.get_text(strip=True) if umaban_tag else ""
+        if not umaban:
+            continue
+
+        waku_tag = row.find("td", class_=re.compile(r"Waku\d"))
+        waku = waku_tag.get_text(strip=True) if waku_tag else ""
+
+        horse_a = row.find("a", href=re.compile(r"/horse/"))
+        horse_name = re.sub(r"\s+", "", horse_a.text) if horse_a else ""
+
+        tds = row.find_all("td")
+        seirei_td = row.find("td", class_="Barei")
+        seirei = seirei_td.get_text(strip=True) if seirei_td else (tds[4].get_text(strip=True) if len(tds) > 4 else "")
+
+        carried_weight = ""
+        if seirei_td:
+            carried_weight = tds[5].get_text(strip=True) if len(tds) > 5 else ""
+        else:
+            carried_weight = tds[5].get_text(strip=True) if len(tds) > 5 else ""
+
+        jockey_td = row.select_one(".Jockey")
+        jockey = jockey_td.get_text(strip=True) if jockey_td else ""
+
+        trainer_td = row.select_one(".Trainer")
+        stable = trainer_td.get_text(" ", strip=True) if trainer_td else ""
+
+        horse_weight_td = row.find("td", class_="Weight")
+        raw_horse_weight = horse_weight_td.get_text(" ", strip=True) if horse_weight_td else ""
+        horse_weight_match = re.search(r"(\d{3}\s*\([+-]?\d+\))", raw_horse_weight)
+        horse_weight = horse_weight_match.group(1) if horse_weight_match else ""
+
+        odds_span = row.find("span", id=re.compile(r"odds[-_]"))
+        odds_td = row.select_one("td.Popular.Txt_R") or row.find("td", class_=re.compile(r"\bOdds\b|txt_r", re.IGNORECASE))
+        odds = odds_span.get_text(strip=True) if odds_span else (odds_td.get_text(strip=True) if odds_td else "")
+
+        ninki_span = row.find("span", id=re.compile(r"ninki[-_]"))
+        ninki_td = row.select_one("td.Popular_Ninki") or row.select_one("td.Popular.Txt_C")
+        if not ninki_td:
+            pop_tds = row.find_all("td", class_=re.compile(r"Popular|Popularity|r3ml", re.IGNORECASE))
+            ninki_td = pop_tds[-1] if pop_tds else None
+        ninki = ninki_span.get_text(strip=True) if ninki_span else (ninki_td.get_text(strip=True) if ninki_td else "")
+
+        data.append({
+            "枠": waku,
+            "馬番": umaban,
+            "馬名": horse_name,
+            "性齢": seirei,
+            "斤量": carried_weight,
+            "騎手": jockey,
+            "厩舎": stable,
+            "馬体重": horse_weight,
+            "オッズ": odds,
+            "人気": ninki,
+        })
+
+    return pd.DataFrame(data)
+
+
 def scrape_shutuba_table(race_id):
+    if is_local_race_id(race_id):
+        for race_url in _race_page_urls(race_id):
+            try:
+                time.sleep(1)
+                res = session.get(race_url, headers=HEADERS, timeout=12)
+                res.encoding = res.apparent_encoding or "utf-8"
+                df = _parse_shutuba_rows(BeautifulSoup(res.text, "html.parser"))
+                if not df.empty:
+                    return df
+            except Exception:
+                continue
+
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
 
     options = Options()
@@ -334,6 +443,10 @@ def scrape_shutuba_table(race_id):
 
         html = driver.page_source
         soup = BeautifulSoup(html, "lxml")
+
+        parsed_df = _parse_shutuba_rows(soup)
+        if not parsed_df.empty:
+            return parsed_df
 
         data = []
         table_rows = soup.find_all("tr", class_="HorseList")
@@ -367,7 +480,9 @@ def scrape_shutuba_table(race_id):
 
             # --- 6. 馬体重 ---
             horse_weight_td = row.find("td", class_="Weight")
-            horse_weight = horse_weight_td.get_text(strip=True) if horse_weight_td else ""
+            raw_horse_weight = horse_weight_td.get_text(" ", strip=True) if horse_weight_td else ""
+            horse_weight_match = re.search(r"(\d{3}\s*\([+-]?\d+\))", raw_horse_weight)
+            horse_weight = horse_weight_match.group(1) if horse_weight_match else ""
 
             # --- 7. オッズと人気 ---
             # オッズの抽出
@@ -401,7 +516,21 @@ def scrape_shutuba_table(race_id):
                 "人気": ninki
             })
 
-        return pd.DataFrame(data)
+        df = pd.DataFrame(data)
+        if not df.empty:
+            return df
+
+        for race_url in _race_page_urls(race_id):
+            try:
+                time.sleep(1)
+                res = session.get(race_url, headers=HEADERS, timeout=12)
+                res.encoding = res.apparent_encoding or "utf-8"
+                fallback_df = _parse_shutuba_rows(BeautifulSoup(res.text, "html.parser"))
+                if not fallback_df.empty:
+                    return fallback_df
+            except Exception:
+                continue
+        return df
     except Exception as e:
         print(f"Error: {e}")
         return pd.DataFrame()
@@ -585,16 +714,16 @@ def scrape_race_info(race_id):
     return {"name": f"レースID: {race_id}", "data": "情報取得不可"}
 
 def scrape_race_info(race_id):
-    url_shutuba = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
-    try:
-        res = session.get(url_shutuba, headers=HEADERS, timeout=10)
-        res.encoding = res.apparent_encoding or "euc-jp"
-        soup = BeautifulSoup(res.text, "html.parser")
-        race_info = _extract_race_info_from_soup(soup, race_id)
-        if race_info:
-            return race_info
-    except Exception:
-        pass
+    for url_shutuba in _race_page_urls(race_id):
+        try:
+            res = session.get(url_shutuba, headers=HEADERS, timeout=10)
+            res.encoding = res.apparent_encoding or "utf-8"
+            soup = BeautifulSoup(res.text, "html.parser")
+            race_info = _extract_race_info_from_soup(soup, race_id)
+            if race_info:
+                return race_info
+        except Exception:
+            continue
 
     url_db = f"https://db.netkeiba.com/race/{race_id}/"
     try:
