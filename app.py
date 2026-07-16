@@ -6,6 +6,7 @@ import re
 import json
 import csv
 import scraper
+import bet_plans
 from datetime import datetime
 from evaluator import Evaluator
 from feature_importance import run_feature_importance
@@ -152,26 +153,121 @@ def _horse_number_lookup(shutuba_df):
     return lookup
 
 
-def build_full_ai_betting_prompt(race_id, max_budget, user_note="", use_full_budget=False):
+def render_bet_plan_selector():
+    """netkeibaの馬券購入画面を参考にした、券種・方式・目標点数・配分を指定するUI。
+
+    馬番は指定せず、AIがレース分析に基づいて実際の馬番を決定する。
+    """
+    st.caption(
+        "netkeibaの馬券購入画面と同じ考え方（通常・ボックス・流し・フォーメーション）で、"
+        "券種・方式・目標点数（例: 三連単流し10点）・配分金額を指定します。"
+        "実際にどの馬番を対象にするかはAIがレース分析に基づいて提案します。"
+    )
+
+    ticket_types = list(bet_plans.TICKET_ARITY.keys())
+    bp_ticket_type = st.selectbox("券種", ticket_types, key="bp_ticket_type")
+    arity = bet_plans.TICKET_ARITY[bp_ticket_type]
+    ordered = bp_ticket_type in bet_plans.ORDERED_TICKETS
+    methods = bet_plans.METHODS_BY_TICKET[bp_ticket_type]
+    bp_method = st.radio("方式", methods, horizontal=True, key="bp_method")
+
+    block = {"ticket_type": bp_ticket_type, "method": bp_method}
+
+    if bp_method == "流し":
+        if arity == 3:
+            axis_count_label = st.radio("軸の頭数", ["1頭流し", "2頭流し"], horizontal=True, key="bp_nagashi_axis_count3")
+            axis_count = 1 if axis_count_label == "1頭流し" else 2
+            block["axis_count"] = axis_count
+            if ordered and axis_count == 1:
+                block["axis_position"] = st.radio("軸の着順", ["1着", "2着", "3着"], horizontal=True, key="bp_nagashi_pos3")
+        elif ordered:
+            block["axis_position"] = st.radio("軸の着順", ["1着", "2着"], horizontal=True, key="bp_nagashi_pos2")
+
+    points_label = "何頭に賭けるか（点数）" if arity == 1 else "目標点数"
+    bp_points = st.number_input(points_label, min_value=1, max_value=200, value=5, step=1, key="bp_points")
+    block["points"] = int(bp_points)
+
+    st.markdown("**配分金額**")
+    amt_col1, amt_col2 = st.columns(2)
+    with amt_col1:
+        amount_mode_label = st.radio(
+            "金額の指定方法", ["1点あたり金額", "この買い目全体の予算（均等割り）"], key="bp_amount_mode"
+        )
+    amount_mode = "per_point" if amount_mode_label == "1点あたり金額" else "total"
+    block["amount_mode"] = amount_mode
+    with amt_col2:
+        block["amount_value"] = st.number_input(
+            "金額（円）",
+            min_value=100,
+            step=100,
+            value=100 if amount_mode == "per_point" else 1000,
+            key="bp_amount_value",
+        )
+
+    st.caption(f"この設定の見積もり: {bet_plans.describe_block(block)}")
+
+    if st.button("この買い方をプランに追加", key="bp_add_block", use_container_width=True):
+        st.session_state.bet_plan_blocks.append(block)
+        st.success("買い方プランに追加しました。")
+        st.rerun()
+
+    if st.session_state.bet_plan_blocks:
+        st.markdown("#### 現在の買い方プラン")
+        grand_total = 0
+        remove_idx = None
+        for idx, b in enumerate(st.session_state.bet_plan_blocks):
+            block_total = bet_plans.block_total_amount(b)
+            grand_total += block_total
+            bc1, bc2 = st.columns([5, 1])
+            with bc1:
+                st.write(bet_plans.describe_block(b))
+            with bc2:
+                if st.button("削除", key=f"bp_remove_{idx}"):
+                    remove_idx = idx
+        if remove_idx is not None:
+            st.session_state.bet_plan_blocks.pop(remove_idx)
+            st.rerun()
+        st.info(f"買い方プラン合計（見積もり）: {grand_total}円")
+    else:
+        st.caption("まだ買い方プランが追加されていません。追加すると、AIはこのプランの点数・配分を目安に実際の馬番を提案します。")
+
+
+def build_full_ai_betting_prompt(race_id, max_budget, plan_blocks=None, use_full_budget=False):
     race_info = st.session_state.race_info or {"name": "不明", "data": "不明"}
     shutuba_df = st.session_state.shutuba_table
     horse_number_by_name = _horse_number_lookup(shutuba_df)
-    budget_policy = (
-        f"最大予算{max_budget}円を必ず全額使い切ってください。集計用JSONのbetsのamount合計も必ず{max_budget}円にしてください。"
-        if use_full_budget
-        else "最大予算は上限です。期待値が低い場合は0円または一部だけ賭ける判断も許可します。"
-    )
-    recommended_amount_requirement = (
-        f"7. 実際に賭ける推奨額（必ず{max_budget}円）と、全額をどう配分したかの理由"
-        if use_full_budget
-        else f"7. 実際に賭ける推奨額（0円から{max_budget}円まで）と、その金額にした理由"
-    )
+    plan_blocks = plan_blocks or []
+    plan_total = sum(bet_plans.block_total_amount(b) for b in plan_blocks)
+
+    if plan_blocks:
+        budget_policy = (
+            f"ユーザーは下記の【ユーザーが指定した買い方プラン】（見積合計{plan_total}円）の券種・方式・目標点数・配分金額をすでに決めています。"
+            "この券種・方式・点数・金額の枠組みは変更せず、その枠組みに当てはめる実際の馬番をあなたの分析に基づいて決定してください。"
+        )
+        recommended_amount_requirement = "7. 各買い方プランに実際に割り当てた合計金額（プランの見積金額にできるだけ近づける）とその配分理由"
+    else:
+        budget_policy = (
+            f"最大予算{max_budget}円を必ず全額使い切ってください。集計用JSONのbetsのamount合計も必ず{max_budget}円にしてください。"
+            if use_full_budget
+            else "最大予算は上限です。期待値が低い場合は0円または一部だけ賭ける判断も許可します。"
+        )
+        recommended_amount_requirement = (
+            f"7. 実際に賭ける推奨額（必ず{max_budget}円）と、全額をどう配分したかの理由"
+            if use_full_budget
+            else f"7. 実際に賭ける推奨額（0円から{max_budget}円まで）と、その金額にした理由"
+        )
 
     sections = [
         AI_PERSONA_PROMPT,
-        "以下のスクレイピング済みデータを複合的に評価し、レース分析と買い方を提案してください。",
+        "以下のスクレイピング済みデータを複合的に評価し、レース分析を行ってください。",
         budget_policy,
-        "買い方、券種、点数、配分は完全にあなたの判断に委ねます。",
+        (
+            "買い方、券種、点数、配分は完全にあなたの判断に委ねます。"
+            if not plan_blocks
+            else "券種・方式（通常/ボックス/流し/フォーメーション）・目標点数・配分金額はユーザーが指定済みのため変更しないでください。"
+            "そのプランごとに、対象とする馬番をあなたの分析に基づいて選び、具体的な買い目（組み合わせ）として提案してください。"
+            "点数はプランの目標点数にできるだけ合わせ、やむを得ず変える場合も理由を明記してください。"
+        ),
         "金額は必ず100円単位にしてください。50円、150円、250円など100円の倍数ではない金額は絶対に出さないでください。",
         "馬は必ず馬番で指定してください。",
         "",
@@ -184,7 +280,11 @@ def build_full_ai_betting_prompt(race_id, max_budget, user_note="", use_full_bud
         "5. 総合印（◎ ○ ▲ △ 注 穴 消）と根拠",
         "6. 波乱度と見送り判断を含むリスク評価",
         recommended_amount_requirement,
-        "8. 具体的な買い目（券種、組み合わせ、金額、狙い）",
+        (
+            "8. 具体的な買い目（券種、組み合わせ、金額、狙い）"
+            if not plan_blocks
+            else "8. 指定されたプランごとの具体的な買い目（馬番の組み合わせ、点数、金額、狙い）"
+        ),
         "9. 最後に必ず集計用JSONをこの形式で出力: ```json\n{\"bets\":[{\"type\":\"ワイド\",\"combo\":\"1-2\",\"amount\":100}]}\n```",
         "",
         f"【対象レース】ID: {race_id}",
@@ -193,8 +293,12 @@ def build_full_ai_betting_prompt(race_id, max_budget, user_note="", use_full_bud
         f"最大予算: {max_budget}円",
         f"予算方針: {'最大予算を全額使用' if use_full_budget else '最大予算内で任意使用'}",
     ]
-    if user_note.strip():
-        sections.extend(["", "【ユーザーの注目点】", user_note.strip()])
+    if plan_blocks:
+        plan_lines = ["【ユーザーが指定した買い方プラン】"]
+        for b in plan_blocks:
+            plan_lines.append(f"- {bet_plans.describe_block(b)}")
+        plan_lines.append(f"見積合計: {plan_total}円")
+        sections.extend([""] + plan_lines)
 
     volatility_prompt = format_volatility_for_prompt(st.session_state.race_volatility)
     if volatility_prompt:
@@ -224,8 +328,8 @@ def build_full_ai_betting_prompt(race_id, max_budget, user_note="", use_full_bud
     return "\n".join(sections)
 
 
-def run_full_ai_betting_analysis(race_id, max_budget, user_note, use_full_budget=False):
-    prompt = build_full_ai_betting_prompt(race_id, max_budget, user_note, use_full_budget)
+def run_full_ai_betting_analysis(race_id, max_budget, plan_blocks, use_full_budget=False):
+    prompt = build_full_ai_betting_prompt(race_id, max_budget, plan_blocks, use_full_budget)
     targets = []
     if ai_choice in ["Gemini", "両方で比較"]:
         targets.append(("Gemini", ask_gemini))
@@ -941,6 +1045,8 @@ if "race_volatility" not in st.session_state:
     st.session_state.race_volatility = None
 if "hard_race_scan_results" not in st.session_state:
     st.session_state.hard_race_scan_results = []
+if "bet_plan_blocks" not in st.session_state:
+    st.session_state.bet_plan_blocks = []
 
 with st.expander("当日レースID一覧から「堅い」レースを探す", expanded=False):
     st.caption("当日のレースIDを複数貼り付けると、出馬表と過去5年傾向から荒れ具合を判定します。堅いレースはそのまま総合予想と買い目提案へ進めます。")
@@ -1110,29 +1216,37 @@ if st.session_state.all_horse_data:
 
     st.markdown("---")
     st.subheader("🚀 AI総合予想と賭け方提案")
-    st.caption("血統、各馬の過去10戦、出馬表をAIへ渡し、最大予算内で実際にいくら賭けるかまで提案します。期待値が低い場合は見送りや減額も許可します。")
-    full_cols = st.columns([1, 1, 3])
+    st.caption("血統、各馬の過去10戦、出馬表をAIへ渡してレース分析を行います。買い方プランを指定しない場合は、最大予算内でAIが自由に買い目を提案します。")
+
+    with st.expander("🎯 買い方セレクト（券種・方式・目標点数・配分）", expanded=True):
+        render_bet_plan_selector()
+
+    plan_blocks = st.session_state.bet_plan_blocks
+    plan_total = sum(bet_plans.block_total_amount(b) for b in plan_blocks)
+
+    full_cols = st.columns([1, 1])
     with full_cols[0]:
         full_max_budget = st.number_input(
-            "最大予算 (円)",
+            "最大予算 (円) ※買い方プラン未指定時にAIが自由提案する上限",
             min_value=0,
             max_value=1000000,
             value=1000,
             step=100,
             key="full_ai_max_budget",
+            disabled=bool(plan_blocks),
         )
     with full_cols[1]:
         use_full_budget = st.checkbox(
             "最大予算をすべて使う",
             value=False,
             key="full_ai_use_full_budget",
+            disabled=bool(plan_blocks),
         )
-    with full_cols[2]:
-        full_user_note = st.text_input(
-            "注目点・希望（任意）",
-            placeholder="例: 道悪想定。無理に買わず期待値重視で。",
-            key="full_ai_user_note",
-        )
+
+    if plan_blocks:
+        st.success(f"買い方プランが指定されています（見積合計{plan_total}円）。この点数・配分を目安にAIが馬番を選んで買い目を提案します。")
+    else:
+        st.caption("買い方プランが未指定のため、AIが最大予算内で買い方を自由に提案します。")
 
     if st.button("血統・過去10戦・出馬表からAI分析して買い方を提案", use_container_width=True):
         if ai_choice == "ルールベース (AI不使用)":
@@ -1145,7 +1259,7 @@ if st.session_state.all_horse_data:
             st.session_state.full_ai_reports = run_full_ai_betting_analysis(
                 race_id,
                 int(full_max_budget),
-                full_user_note,
+                plan_blocks,
                 use_full_budget,
             )
             for model_name, response in st.session_state.full_ai_reports.items():
@@ -1166,7 +1280,7 @@ if st.session_state.all_horse_data:
     data_context = build_full_ai_betting_prompt(
         race_id,
         int(st.session_state.get("full_ai_max_budget", 1000)),
-        st.session_state.get("full_ai_user_note", ""),
+        plan_blocks,
         st.session_state.get("full_ai_use_full_budget", False),
     )
 

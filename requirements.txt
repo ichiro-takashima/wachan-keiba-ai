@@ -1,4 +1,15 @@
 google-generativeai
 streamlit
 pandas
+numpy
 lightgbm
+requests
+beautifulsoup4
+lxml
+scikit-learn
+selenium
+webdriver-manager
+tqdm
+optuna
+optuna-integration[lightgbm]
+matplotlib
