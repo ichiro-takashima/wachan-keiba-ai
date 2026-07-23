@@ -244,22 +244,16 @@ def build_full_ai_betting_prompt(race_id, max_budget, plan_blocks=None, use_full
             f"ユーザーは下記の【ユーザーが指定した買い方プラン】（見積合計{plan_total}円）の券種・方式・目標点数・配分金額をすでに決めています。"
             "この券種・方式・点数・金額の枠組みは変更せず、その枠組みに当てはめる実際の馬番をあなたの分析に基づいて決定してください。"
         )
-        recommended_amount_requirement = "7. 各買い方プランに実際に割り当てた合計金額（プランの見積金額にできるだけ近づける）とその配分理由"
     else:
         budget_policy = (
             f"最大予算{max_budget}円を必ず全額使い切ってください。集計用JSONのbetsのamount合計も必ず{max_budget}円にしてください。"
             if use_full_budget
             else "最大予算は上限です。期待値が低い場合は0円または一部だけ賭ける判断も許可します。"
         )
-        recommended_amount_requirement = (
-            f"7. 実際に賭ける推奨額（必ず{max_budget}円）と、全額をどう配分したかの理由"
-            if use_full_budget
-            else f"7. 実際に賭ける推奨額（0円から{max_budget}円まで）と、その金額にした理由"
-        )
 
     sections = [
         AI_PERSONA_PROMPT,
-        "以下のスクレイピング済みデータを複合的に評価し、レース分析を行ってください。",
+        "以下のスクレイピング済みデータを複合的に評価し、レース分析を行ってください（分析はあなたの内部で行い、出力には含めないでください）。",
         budget_policy,
         (
             "買い方、券種、点数、配分は完全にあなたの判断に委ねます。"
@@ -268,24 +262,18 @@ def build_full_ai_betting_prompt(race_id, max_budget, plan_blocks=None, use_full
             "そのプランごとに、対象とする馬番をあなたの分析に基づいて選び、具体的な買い目（組み合わせ）として提案してください。"
             "点数はプランの目標点数にできるだけ合わせ、やむを得ず変える場合も理由を明記してください。"
         ),
-        "金額は必ず100円単位にしてください。50円、150円、250円など100円の倍数ではない金額は絶対に出さないでください。",
+        "金額は必ず100円単位にしてください（馬券は10円単位の調整ができないため）。50円、150円、250円など100の倍数ではない金額は絶対に出さないでください。",
         "馬は必ず馬番で指定してください。",
         "",
         "【出力要件】",
-        "0. 【前提条件】良馬場想定・重馬場想定・ペース想定など、分析の前提を明記",
-        "1. データ取得状況の短評（血統、過去10戦、出馬表が揃っているか）",
-        "2. 【データ・統計的傾向】過去傾向、人気の過信リスク、条件別の示唆を整理",
-        "3. 【注目馬・分析】各馬を血統、過去10戦、出馬表要素、コース適性、ローテーション、馬の癖で分解",
-        "4. 【リスクヘッジ・別シナリオ】馬場悪化、展開変化、人気馬凡走時の対応",
-        "5. 総合印（◎ ○ ▲ △ 注 穴 消）と根拠",
-        "6. 波乱度と見送り判断を含むリスク評価",
-        recommended_amount_requirement,
+        "トークンの無駄遣いを避けるため、前置き・分析文・理由説明は書かず、券種と買い目だけがわかる形式で券種ごとに1行、簡潔に出力してください。",
+        "例: 単勝：7 / 複勝：3、7 / 三連複：3-7-9（500円）",
         (
-            "8. 具体的な買い目（券種、組み合わせ、金額、狙い）"
+            "券種・組み合わせ・金額は完全にあなたの判断で決めてください。"
             if not plan_blocks
-            else "8. 指定されたプランごとの具体的な買い目（馬番の組み合わせ、点数、金額、狙い）"
+            else "指定された買い方プランごとに1行ずつ、そのプランに割り当てた馬番の組み合わせと金額を出力してください。"
         ),
-        "9. 最後に必ず集計用JSONをこの形式で出力: ```json\n{\"bets\":[{\"type\":\"ワイド\",\"combo\":\"1-2\",\"amount\":100}]}\n```",
+        "最後に必ず集計用JSONをこの形式で出力: ```json\n{\"bets\":[{\"type\":\"ワイド\",\"combo\":\"1-2\",\"amount\":100}]}\n```",
         "",
         f"【対象レース】ID: {race_id}",
         f"レース名: {race_info.get('name', '不明')}",
@@ -492,6 +480,24 @@ if app_mode == "バックテスト":
                     base_year = int(base_race_id[:4])
                     rest_id = base_race_id[4:]
                     generated_ids = [f"{base_year - i}{rest_id}" for i in range(years_to_go_back)]
+                    st.session_state.bt_race_ids_input = "\n".join(generated_ids)
+                    st.rerun()
+                else:
+                    st.error("12桁の数字を入力してください。")
+
+    with st.expander("🏟️ その日の同会場の全レースIDを一括生成する", expanded=False):
+        st.markdown("基準となるレースID（例: 202610020601）から、同じ開催日・同じ会場の全レースIDを自動生成します（1Rから指定Rまで）。\n※実際の開催レース数より多く指定した場合、存在しないIDは自動スキップされます。")
+        col_gen4, col_gen5, col_gen6 = st.columns([2, 1, 1])
+        with col_gen4:
+            base_race_id_day = st.text_input("基準レースID (12桁)", value="202610020601", key="base_race_id_day")
+        with col_gen5:
+            max_race_no = st.number_input("最大レース数", min_value=1, max_value=12, value=12, key="max_race_no_day")
+        with col_gen6:
+            st.write("") # 位置合わせ用
+            if st.button("IDを生成", use_container_width=True, key="gen_day_race_ids_button"):
+                if len(base_race_id_day) == 12 and base_race_id_day.isdigit():
+                    venue_day_prefix = base_race_id_day[:10]
+                    generated_ids = [f"{venue_day_prefix}{race_no:02d}" for race_no in range(1, int(max_race_no) + 1)]
                     st.session_state.bt_race_ids_input = "\n".join(generated_ids)
                     st.rerun()
                 else:
@@ -858,7 +864,7 @@ if app_mode == "バックテスト":
                         if not existing_cols:
                             continue
                         
-                        ctx += res_df[existing_cols].head(3).to_csv(index=False, sep='|') + "\n"
+                        ctx += res_df[existing_cols].head(10).to_csv(index=False, sep='|') + "\n"
                         
                         short_df = res_df[existing_cols].copy()
                         if '日付' in short_df.columns:
@@ -870,23 +876,21 @@ if app_mode == "バックテスト":
                         if '距離' in short_df.columns:
                             short_df['距離'] = short_df['距離'].astype(str).str.replace('m', '', regex=False)
                             
-                        ctx += short_df.head(5).to_csv(index=False, header=False, sep=',') + "\n"
+                        ctx += short_df.head(10).to_csv(index=False, header=False, sep=',') + "\n"
 
                 prompt_parts = [
                     AI_PERSONA_PROMPT,
-                    f"不要な前置き・一般論は省略し、合計300トークン以内で簡潔に予想を出力してください。最大予算:{bt_effective_budget}円。",
+                    f"以下のデータを単一レース予想と同じ水準で複合的に評価し、レース分析を行ってください（分析はあなたの内部で行い、出力には含めないでください）。最大予算:{bt_effective_budget}円。",
                     "買い方、券種、点数、配分は完全にあなたの判断に委ねます。期待値が低い場合は0円または一部だけ賭ける判断も許可します。",
-                    "金額は必ず100円単位にしてください。50円、150円、250円など100円の倍数ではない金額は絶対に出さないでください。",
+                    "金額は必ず100円単位にしてください（馬券は10円単位の調整ができないため）。50円、150円、250円など100の倍数ではない金額は絶対に出さないでください。",
                     classic_instruction,
                     "【出力要件】",
-                    "・【前提条件】馬場・ペース・展開の想定を明記",
-                    "・【データ・統計的傾向】過去傾向と人気過信リスクを簡潔に整理",
-                    "・【注目馬・分析】本命1、対抗1、穴を複数頭。根拠は変数ベースで説明",
-                    "・【リスクヘッジ・別シナリオ】馬場や展開が変わった場合の修正点",
-                    "・対象: 上位評価7頭のみ詳述（根拠は各馬2行以内）、それ以外は1行評価",
+                    "トークンの無駄遣いを避けるため、前置き・分析文・理由説明は書かず、券種と買い目だけがわかる形式で券種ごとに1行、簡潔に出力してください。",
+                    "例: 単勝：7 / 複勝：3、7 / 三連複：3-7-9（500円）",
+                    "券種・組み合わせ・金額は完全にあなたの判断で決めてください。",
                     "・買い目データ（※必ず以下のJSONフォーマットでテキストの最後に記述すること）",
                     "```json",
-                    '{ "bets": [ {{"type": "3連複", "combo": "1-2-3", "amount": 500}} ] }', # 例示フォーマット
+                    '{ "bets": [ {"type": "3連複", "combo": "1-2-3", "amount": 500} ] }', # 例示フォーマット
                     "```",
                     "【出走馬詳細】",
                     ctx
