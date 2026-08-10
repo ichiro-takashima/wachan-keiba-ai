@@ -7,6 +7,7 @@ import json
 import csv
 import scraper
 import bet_plans
+import balance
 from datetime import datetime
 from evaluator import Evaluator
 from feature_importance import run_feature_importance
@@ -30,6 +31,7 @@ from race_analysis import (
 from race_volatility import analyze_race_volatility, format_volatility_for_prompt
 from tickets import (
     calculate_return,
+    check_gamiri,
     extract_bets_from_text,
     parse_ids_input as _parse_ids_input,
 )
@@ -70,6 +72,30 @@ AI_PERSONA_PROMPT = """# 目的
 3. 馬の評価は、コース適性、ローテーション、騎手の仕掛け、馬の癖、展開適性などの変数でロジカルに説明する。
 4. 冷静、客観的、協力的に話す。過度な煽りや「絶対に来る」「大鉄板」などの断定表現は禁止する。
 """
+
+OUTPUT_FORMAT_INSTRUCTIONS = [
+    "トークンの無駄遣いを避けるため、前置きや長い分析文は書かず、以下のフォーマットに厳密に従って出力してください。",
+    "券種・買い目プランが複数ある場合は、このブロックをプランごとに繰り返してください。",
+    "",
+    "【本日の勝負レース：（券種・方式）】",
+    "",
+    "■ 印・買い目構成",
+    "◎ （馬番）. （馬名）",
+    "○ （馬番）. （馬名）",
+    "▲ （馬番）. （馬名）",
+    "△ （馬番）. （馬名）　※△は複数可",
+    "- - - - - - - - - - - - - - - - - - - - ",
+    "（三連単・馬単など着順を指定する券種の場合のみ、以下のように着順別の馬番を列挙）",
+    "【1着】 （馬番）",
+    "【2着】 （馬番, 馬番, ...）",
+    "【3着】 （馬番, 馬番, ...）",
+    "（三連複・馬連・ワイドなど着順を問わない券種の場合は、【1着】〜【3着】の代わりに組み合わせを列挙）",
+    "",
+    "■ 投資・購入情報",
+    "* 式別：（券種・方式）",
+    "* 買い目点数：（点数）点",
+    "* 予算：（合計金額）円（1点（単価）円）",
+]
 
 
 def collect_single_race_data(target_race_id, cutoff_date):
@@ -266,12 +292,11 @@ def build_full_ai_betting_prompt(race_id, max_budget, plan_blocks=None, use_full
         "馬は必ず馬番で指定してください。",
         "",
         "【出力要件】",
-        "トークンの無駄遣いを避けるため、前置き・分析文・理由説明は書かず、券種と買い目だけがわかる形式で券種ごとに1行、簡潔に出力してください。",
-        "例: 単勝：7 / 複勝：3、7 / 三連複：3-7-9（500円）",
+        *OUTPUT_FORMAT_INSTRUCTIONS,
         (
             "券種・組み合わせ・金額は完全にあなたの判断で決めてください。"
             if not plan_blocks
-            else "指定された買い方プランごとに1行ずつ、そのプランに割り当てた馬番の組み合わせと金額を出力してください。"
+            else "各ブロックの式別・点数・予算は、指定された買い方プランの内容に合わせてください。"
         ),
         "最後に必ず集計用JSONをこの形式で出力: ```json\n{\"bets\":[{\"type\":\"ワイド\",\"combo\":\"1-2\",\"amount\":100}]}\n```",
         "",
@@ -343,7 +368,7 @@ def run_full_ai_betting_analysis(race_id, max_budget, plan_blocks, use_full_budg
 
 # --- Streamlit UI ---
 st.sidebar.title("🏇 メニュー")
-app_mode = st.sidebar.radio("モード選択", ["単一レース予想", "バックテスト", "予想履歴"], index=0)
+app_mode = st.sidebar.radio("モード選択", ["単一レース予想", "バックテスト", "予想履歴", "My収支"], index=0)
 
 with st.sidebar.expander("🗂️ HTML保存 / 一括テーブル生成", expanded=False):
     st.caption("保存済みHTMLから一括でテーブルを作るための管理パネルです。")
@@ -885,8 +910,7 @@ if app_mode == "バックテスト":
                     "金額は必ず100円単位にしてください（馬券は10円単位の調整ができないため）。50円、150円、250円など100の倍数ではない金額は絶対に出さないでください。",
                     classic_instruction,
                     "【出力要件】",
-                    "トークンの無駄遣いを避けるため、前置き・分析文・理由説明は書かず、券種と買い目だけがわかる形式で券種ごとに1行、簡潔に出力してください。",
-                    "例: 単勝：7 / 複勝：3、7 / 三連複：3-7-9（500円）",
+                    *OUTPUT_FORMAT_INSTRUCTIONS,
                     "券種・組み合わせ・金額は完全にあなたの判断で決めてください。",
                     "・買い目データ（※必ず以下のJSONフォーマットでテキストの最後に記述すること）",
                     "```json",
@@ -991,6 +1015,116 @@ if app_mode == "予想履歴":
         st.info("予想履歴はまだありません。")
     st.stop()
 
+if app_mode == "My収支":
+    st.title("💰 My収支")
+    st.caption(
+        "単一レース予想の「結果照合」でチェックを入れて保存した予想と、"
+        "手動で入力した実際の購入結果をもとに、月別・年別・券種別の収支を確認できます。"
+    )
+
+    with st.expander("✏️ 実際の購入結果を手動で追加", expanded=False):
+        st.caption("AIの提案どおりに買わなかった場合や、アプリ外で購入した馬券もここから記録できます。")
+        mc1, mc2, mc3 = st.columns(3)
+        with mc1:
+            manual_date = st.date_input("購入日（レース施行日）", value=pd.Timestamp.now(), key="manual_balance_date")
+            manual_race_id = st.text_input("Race ID（任意）", key="manual_balance_race_id")
+        with mc2:
+            manual_race_name = st.text_input("レース名（任意）", key="manual_balance_race_name")
+            manual_ticket_type = st.selectbox(
+                "券種", list(bet_plans.TICKET_ARITY.keys()) + ["その他"], key="manual_balance_ticket_type"
+            )
+        with mc3:
+            manual_bet = st.number_input("購入金額（円）", min_value=0, step=100, value=0, key="manual_balance_bet")
+            manual_return = st.number_input("払戻金額（円）", min_value=0, step=100, value=0, key="manual_balance_return")
+        manual_memo = st.text_input("メモ（任意）", key="manual_balance_memo")
+
+        if st.button("My収支に追加", key="manual_balance_add"):
+            if manual_bet <= 0:
+                st.warning("購入金額を入力してください。")
+            else:
+                hit = 1 if manual_return > 0 else 0
+                balance.append_entries([{
+                    "race_date": manual_date.strftime("%Y/%m/%d"),
+                    "race_id": manual_race_id,
+                    "race_name": manual_race_name,
+                    "source": "手動入力",
+                    "ticket_type": manual_ticket_type,
+                    "bet_count": 1,
+                    "hits": hit,
+                    "total_bet": int(manual_bet),
+                    "total_return": int(manual_return),
+                    "ticket_stats": json.dumps(
+                        {manual_ticket_type: {"bet": int(manual_bet), "return": int(manual_return), "hits": hit}},
+                        ensure_ascii=False,
+                    ),
+                    "memo": manual_memo,
+                }])
+                st.success("My収支に追加しました。")
+                st.rerun()
+
+    balance_df = balance.load_balance_df()
+
+    if balance_df.empty:
+        st.info("まだMy収支の記録がありません。単一レース予想の「結果照合」でチェックを入れて保存するか、上の手動入力から追加してください。")
+        st.stop()
+
+    total_bet_all = balance_df["total_bet"].sum()
+    total_return_all = balance_df["total_return"].sum()
+    total_profit_all = total_return_all - total_bet_all
+    total_return_rate = (total_return_all / total_bet_all * 100) if total_bet_all > 0 else 0
+
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1.metric("総投資額", f"{int(total_bet_all):,}円")
+    sc2.metric("総払戻額", f"{int(total_return_all):,}円")
+    sc3.metric("収支", f"{int(total_profit_all):+,}円")
+    sc4.metric("回収率", f"{total_return_rate:.1f}%")
+
+    period_label = st.radio("集計単位", ["月別", "年別"], horizontal=True, key="balance_period_mode")
+    freq = "M" if period_label == "月別" else "Y"
+    period_df = balance.summarize_by_period(balance_df, freq=freq)
+
+    if period_df.empty:
+        st.info("集計できる日付データがありません。")
+    else:
+        st.markdown(f"#### {period_label}収支")
+        st.bar_chart(period_df.set_index("period")[["収支"]])
+        display_df = period_df.rename(columns={"period": "期間"}).copy()
+        display_df["回収率"] = display_df["回収率"].astype(str) + "%"
+        st.dataframe(display_df, use_container_width=True)
+
+    st.markdown("#### 🎫 券種別の収支（全期間）")
+    ticket_summary_df = balance.summarize_by_ticket_type(balance_df)
+    if ticket_summary_df.empty:
+        st.caption("券種別のデータがありません。")
+    else:
+        ticket_display = ticket_summary_df.copy()
+        ticket_display["回収率"] = ticket_display["回収率"].astype(str) + "%"
+        st.dataframe(ticket_display, use_container_width=True)
+
+    with st.expander("📋 記録一覧（削除も可能）", expanded=False):
+        list_df = balance_df.sort_values("race_date", ascending=False).copy()
+        list_df["race_date"] = list_df["race_date"].dt.strftime("%Y/%m/%d")
+        show_cols = ["entry_id", "race_date", "race_id", "race_name", "source", "ticket_type", "total_bet", "total_return", "profit", "memo"]
+        st.dataframe(
+            list_df[show_cols].rename(columns={
+                "entry_id": "ID", "race_date": "日付", "race_id": "レースID", "race_name": "レース名",
+                "source": "元", "ticket_type": "券種", "total_bet": "購入額", "total_return": "払戻額",
+                "profit": "収支", "memo": "メモ",
+            }),
+            use_container_width=True,
+        )
+
+        delete_id = st.selectbox("削除する記録のID", [""] + list_df["entry_id"].tolist(), key="balance_delete_select")
+        if st.button("この記録を削除", key="balance_delete_button"):
+            if delete_id:
+                balance.delete_entries([delete_id])
+                st.success("削除しました。")
+                st.rerun()
+            else:
+                st.warning("削除する記録を選択してください。")
+
+    st.stop()
+
 st.markdown(
     '<h1 class="app-title">競馬予想AI</h1>',
     unsafe_allow_html=True,
@@ -1051,6 +1185,8 @@ if "hard_race_scan_results" not in st.session_state:
     st.session_state.hard_race_scan_results = []
 if "bet_plan_blocks" not in st.session_state:
     st.session_state.bet_plan_blocks = []
+if "gamiri_check_result" not in st.session_state:
+    st.session_state.gamiri_check_result = None
 
 with st.expander("当日レースID一覧から「堅い」レースを探す", expanded=False):
     st.caption("当日のレースIDを複数貼り付けると、出馬表と過去5年傾向から荒れ具合を判定します。堅いレースはそのまま総合予想と買い目提案へ進めます。")
@@ -1281,6 +1417,60 @@ if st.session_state.all_horse_data:
             with st.expander(f"{model_name} の分析・推奨賭け金・買い目", expanded=True):
                 st.write(response)
 
+        st.markdown("---")
+        st.subheader("🔍 オッズ確認・ガミリチェック（購入前）")
+        st.caption(
+            "現在のオッズを取得し、買い目のどれかが的中しても購入合計額を下回ってしまう"
+            "「ガミリ」が起きていないかを購入前にチェックします。"
+        )
+        gamiri_target_models = [
+            model_name for model_name, pred in st.session_state.latest_predictions.items()
+            if pred.get("race_id") == race_id and pred.get("bets")
+        ]
+        if not gamiri_target_models:
+            st.caption("買い目JSONが取得できているAI予想がないため、チェックできません。")
+        else:
+            gamiri_model = st.selectbox("チェックする予想", gamiri_target_models, key="gamiri_model_select")
+            if st.button("最新オッズを取得してガミリをチェック", key="gamiri_check_button"):
+                target_bets = st.session_state.latest_predictions[gamiri_model]["bets"]
+                ticket_types_needed = sorted({b.get("type", "") for b in target_bets if b.get("type")})
+                with st.spinner("最新オッズを取得中..."):
+                    odds_data = scraper.scrape_realtime_odds(race_id, ticket_types_needed)
+                rows, total_bet = check_gamiri(target_bets, odds_data)
+                st.session_state.gamiri_check_result = {
+                    "model": gamiri_model, "race_id": race_id, "rows": rows, "total_bet": total_bet,
+                }
+
+            gamiri_result = st.session_state.get("gamiri_check_result")
+            if gamiri_result and gamiri_result.get("model") == gamiri_model and gamiri_result.get("race_id") == race_id:
+                rows = gamiri_result["rows"]
+                total_bet = gamiri_result["total_bet"]
+                if not rows:
+                    st.info("有効な買い目がありません。")
+                else:
+                    df_rows = pd.DataFrame(rows)
+                    display_df = df_rows.rename(columns={
+                        "type": "券種", "combo": "組み合わせ", "amount": "購入額",
+                        "odds": "現在オッズ", "est_return": "的中時の推定払戻", "profit": "購入合計との損益",
+                    }).copy()
+                    display_df["判定"] = df_rows["is_gamiri"].map(
+                        lambda x: "⚠️ ガミリ" if x is True else ("✅ 問題なし" if x is False else "オッズ取得不可")
+                    )
+                    st.dataframe(display_df.drop(columns=["is_gamiri"]), use_container_width=True)
+                    st.caption(f"購入合計: {total_bet}円（ワイド・複勝は最低オッズで保守的に計算しています）")
+
+                    gamiri_rows = df_rows[df_rows["is_gamiri"] == True]
+                    not_found_rows = df_rows[df_rows["is_gamiri"].isna()]
+                    if not gamiri_rows.empty:
+                        st.warning(
+                            f"⚠️ {len(gamiri_rows)}点で、的中しても購入合計{total_bet}円を下回る「ガミリ」の"
+                            "可能性があります。配分金額の見直しをおすすめします。"
+                        )
+                    elif not_found_rows.empty:
+                        st.success("現在のオッズでは、どの買い目が的中しても購入合計を下回らない見込みです。")
+                    if not not_found_rows.empty:
+                        st.caption(f"{len(not_found_rows)}点はオッズが取得できませんでした（発売前・対象外の可能性があります）。")
+
     data_context = build_full_ai_betting_prompt(
         race_id,
         int(st.session_state.get("full_ai_max_budget", 1000)),
@@ -1330,7 +1520,10 @@ if st.session_state.all_horse_data:
 
     if has_prediction_for_current_race:
         st.subheader("💴 結果照合（過去レース限定・任意実行）")
-        st.caption("予想後にボタンを押すと、結果・払戻ページを参照して的中と回収金額を計算します。")
+        st.caption(
+            "予想後にボタンを押すと、結果・払戻ページを参照して的中と回収金額を計算します。"
+            "My収支に反映したい予想にチェックを入れて保存すると、月別・年別の収支に集計されます。"
+        )
         if st.button("結果ページで的中チェックを実行"):
             if not race_id:
                 st.warning("Race IDを入力してください。")
@@ -1345,6 +1538,9 @@ if st.session_state.all_horse_data:
                     else:
                         st.success(f"結果ページを確認しました: {result_payload.get('url')}")
 
+                    race_date = scraper.get_race_date(race_id)
+                    race_name = (st.session_state.race_info or {}).get("name", "")
+                    race_results = {}
                     for model_name, pred in st.session_state.latest_predictions.items():
                         if pred.get("race_id") != race_id:
                             continue
@@ -1355,13 +1551,61 @@ if st.session_state.all_horse_data:
                             continue
 
                         total_bet, total_return, hits, ticket_stats = calculate_return(bets, payouts)
-                        hit_rate = (hits / len(bets) * 100) if bets else 0
-                        return_rate = (total_return / total_bet * 100) if total_bet > 0 else 0
-                        st.markdown(f"#### {model_name} 的中結果")
-                        st.write(f"購入合計: {total_bet}円 / 払戻合計: {total_return}円 / 回収率: {return_rate:.1f}% / 的中率: {hit_rate:.1f}%")
-                        if ticket_stats:
-                            ticket_df = pd.DataFrame.from_dict(ticket_stats, orient='index').reset_index().rename(
-                                columns={"index": "券種", "bet": "購入額", "return": "払戻額", "hits": "的中数"}
-                            )
-                            ticket_df["回収率"] = (ticket_df["払戻額"] / ticket_df["購入額"] * 100).fillna(0).round(1).astype(str) + "%"
-                            st.dataframe(ticket_df, use_container_width=True)
+                        race_results[model_name] = {
+                            "race_date": race_date,
+                            "race_name": race_name,
+                            "bet_count": len(bets),
+                            "hits": hits,
+                            "total_bet": total_bet,
+                            "total_return": total_return,
+                            "ticket_stats": ticket_stats,
+                            "saved": False,
+                        }
+                    st.session_state.result_check_cache[race_id] = race_results
+
+        cached_results = st.session_state.result_check_cache.get(race_id)
+        if cached_results:
+            for model_name, r in cached_results.items():
+                hit_rate = (r["hits"] / r["bet_count"] * 100) if r["bet_count"] else 0
+                return_rate = (r["total_return"] / r["total_bet"] * 100) if r["total_bet"] > 0 else 0
+                st.markdown(f"#### {model_name} 的中結果")
+                st.write(f"購入合計: {r['total_bet']}円 / 払戻合計: {r['total_return']}円 / 回収率: {return_rate:.1f}% / 的中率: {hit_rate:.1f}%")
+                if r["ticket_stats"]:
+                    ticket_df = pd.DataFrame.from_dict(r["ticket_stats"], orient='index').reset_index().rename(
+                        columns={"index": "券種", "bet": "購入額", "return": "払戻額", "hits": "的中数"}
+                    )
+                    ticket_df["回収率"] = (ticket_df["払戻額"] / ticket_df["購入額"] * 100).fillna(0).round(1).astype(str) + "%"
+                    st.dataframe(ticket_df, use_container_width=True)
+
+                if r["saved"]:
+                    st.success("✅ My収支に追加済みです。")
+                else:
+                    r["include_in_balance"] = st.checkbox(
+                        f"この{model_name}の結果をMy収支に追加する",
+                        key=f"balance_chk_{race_id}_{model_name}",
+                    )
+
+            to_save = [
+                (model_name, r) for model_name, r in cached_results.items()
+                if not r["saved"] and r.get("include_in_balance")
+            ]
+            if to_save and st.button("チェックした結果をMy収支に保存", key=f"balance_save_{race_id}"):
+                entries = []
+                for model_name, r in to_save:
+                    entries.append({
+                        "race_date": r["race_date"],
+                        "race_id": race_id,
+                        "race_name": r["race_name"],
+                        "source": model_name,
+                        "ticket_type": ",".join(r["ticket_stats"].keys()) if r["ticket_stats"] else "",
+                        "bet_count": r["bet_count"],
+                        "hits": r["hits"],
+                        "total_bet": r["total_bet"],
+                        "total_return": r["total_return"],
+                        "ticket_stats": json.dumps(r["ticket_stats"], ensure_ascii=False),
+                        "memo": "",
+                    })
+                    r["saved"] = True
+                balance.append_entries(entries)
+                st.success(f"{len(entries)}件をMy収支に追加しました。")
+                st.rerun()

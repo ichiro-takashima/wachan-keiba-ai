@@ -103,6 +103,52 @@ def calculate_return(bets, payouts):
     return total_bet, total_return, hits, ticket_stats
 
 
+def check_gamiri(bets, odds_data):
+    """現在オッズをもとに、買い目が的中しても購入合計額を下回ってしまう「ガミリ」を検出する。
+
+    ガミリ = ある買い目が的中したときの推定払戻が、買い目全体の購入合計を下回る状態。
+    戻り値: (rows, total_bet)
+    """
+    normalized_bets = normalize_bet_amounts(bets)
+    total_bet = sum(bet.get("amount", 0) for bet in normalized_bets)
+
+    rows = []
+    for bet in normalized_bets:
+        raw_type = bet.get("type", "")
+        combo = str(bet.get("combo", ""))
+        amount = bet.get("amount", 0)
+        if amount <= 0 or not raw_type or not combo:
+            continue
+
+        ticket_type = normalize_ticket_type(raw_type)
+        type_odds = odds_data.get(raw_type, {}) if odds_data else {}
+        target_combo = normalize_combo(combo, ticket_type)
+
+        odds_info = None
+        for key, info in type_odds.items():
+            if normalize_combo(key, ticket_type) == target_combo:
+                odds_info = info
+                break
+
+        if odds_info is None:
+            rows.append({
+                "type": raw_type, "combo": combo, "amount": amount,
+                "odds": None, "est_return": None, "profit": None, "is_gamiri": None,
+            })
+            continue
+
+        odds_value = odds_info.get("odds", 0)
+        est_return = int(round(amount * odds_value))
+        profit = est_return - total_bet
+        rows.append({
+            "type": raw_type, "combo": combo, "amount": amount,
+            "odds": odds_value, "est_return": est_return, "profit": profit,
+            "is_gamiri": profit < 0,
+        })
+
+    return rows, total_bet
+
+
 def build_reflection_text(predicted_bets, payouts):
     predicted_ticket_types = {bet.get("type", "") for bet in predicted_bets if bet.get("type")}
     payout_ticket_types = set((payouts or {}).keys())

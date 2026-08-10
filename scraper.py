@@ -597,6 +597,63 @@ def scrape_payouts(race_id):
     except Exception: return {}
 
 
+ODDS_TYPE_CODE = {
+    "単勝": "1",
+    "複勝": "2",
+    "枠連": "3",
+    "馬連": "4",
+    "ワイド": "5",
+    "馬単": "6",
+    "三連複": "7",
+    "三連単": "8",
+}
+
+
+def _format_odds_combo_key(key):
+    parts = [str(int(key[i:i + 2])) for i in range(0, len(key), 2)]
+    return "-".join(parts)
+
+
+def scrape_realtime_odds(race_id, ticket_types):
+    """指定した券種の現在オッズをnetkeibaのオッズAPIから取得する（購入前のガミリチェック用）。
+
+    戻り値: {券種: {"馬番-馬番(-馬番)": {"odds": 最低オッズ, "odds_max": 最高オッズ}}}
+    複勝・ワイドは最低〜最高のレンジオッズで返ってくるため、両方を保持する。
+    """
+    url = "https://race.netkeiba.com/api/api_get_jra_odds.html"
+    result = {}
+    for ticket_type in ticket_types:
+        if ticket_type in result:
+            continue
+        type_code = ODDS_TYPE_CODE.get(ticket_type)
+        if not type_code:
+            continue
+        try:
+            res = session.get(
+                url, headers=HEADERS,
+                params={"race_id": race_id, "type": type_code, "housiki": "c99"},
+                timeout=10,
+            )
+            payload = res.json()
+        except Exception:
+            continue
+
+        odds_map = (payload.get("data") or {}).get("odds", {}).get(type_code, {})
+        combo_odds = {}
+        for key, row in odds_map.items():
+            try:
+                combo = _format_odds_combo_key(key)
+                odds_min = float(str(row[0]).replace(",", ""))
+                odds_max_raw = float(str(row[1]).replace(",", "")) if len(row) > 1 and str(row[1]).strip() else 0.0
+                odds_max = odds_max_raw if odds_max_raw > 0 else odds_min
+                combo_odds[combo] = {"odds": odds_min, "odds_max": odds_max}
+            except Exception:
+                continue
+        if combo_odds:
+            result[ticket_type] = combo_odds
+    return result
+
+
 def scrape_race_result_page(race_id):
     url = f"https://db.netkeiba.com/race/{race_id}/"
     payouts = {}

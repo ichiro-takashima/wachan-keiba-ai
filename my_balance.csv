@@ -1,0 +1,3 @@
+﻿entry_id,saved_at,race_date,race_id,race_name,source,ticket_type,bet_count,hits,total_bet,total_return,profit,ticket_stats,memo
+f57d65eaedfa,2026-07-24 00:30:34,2026/01/12,202608010511,シンザン記念,手動入力,単勝,1,0,400,0,-400,"{""単勝"": {""bet"": 400, ""return"": 0, ""hits"": 0}}",
+134475c4364a,2026-07-29 05:02:38,2025/08/03,202504020407,アイビスSD,Gemini,"ワイド,三連複",18,3,2000,10250,8250,"{""ワイド"": {""bet"": 800, ""return"": 3140, ""hits"": 2}, ""三連複"": {""bet"": 1200, ""return"": 7110, ""hits"": 1}}",
