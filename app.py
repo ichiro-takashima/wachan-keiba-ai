@@ -29,6 +29,7 @@ from race_analysis import (
     style_race_comparison as _style_race_comparison,
 )
 from race_volatility import analyze_race_volatility, format_volatility_for_prompt
+from jockey_form import build_jockey_day_form_table, format_jockey_day_form_for_prompt
 from tickets import (
     calculate_return,
     check_gamiri,
@@ -130,6 +131,13 @@ def collect_single_race_data(target_race_id, cutoff_date):
     race_info = scraper.scrape_race_info(target_race_id)
     past_trend_df = scraper.scrape_past_top3_trend(target_race_id, years=5)
 
+    status_text.write("🏇 騎手の当日成績を取得中...")
+    jockey_day_results_df = scraper.scrape_jockey_day_results(
+        target_race_id,
+        progress_callback=lambda no, total, rid: status_text.write(f"🏇 騎手の当日成績を取得中... {no}/{total}R ({rid})"),
+    )
+    jockey_day_form_df = build_jockey_day_form_table(jockey_day_results_df, shutuba_df)
+
     status_text.empty()
     progress_bar.empty()
 
@@ -140,6 +148,8 @@ def collect_single_race_data(target_race_id, cutoff_date):
         "race_info": race_info,
         "past_trend_df": past_trend_df,
         "race_volatility": analyze_race_volatility(shutuba_df, past_trend_df),
+        "jockey_day_form": jockey_day_form_df,
+        "jockey_day_races": jockey_day_results_df["レース番号"].nunique() if not jockey_day_results_df.empty else 0,
     }
 
 
@@ -150,6 +160,8 @@ def save_single_race_data(data):
     st.session_state.race_info = data["race_info"]
     st.session_state.past_trend_df = data["past_trend_df"]
     st.session_state.race_volatility = data["race_volatility"]
+    st.session_state.jockey_day_form = data["jockey_day_form"]
+    st.session_state.jockey_day_races = data["jockey_day_races"]
     st.session_state.chat_messages = []
     st.session_state.analysis_results = {}
     st.session_state.full_ai_reports = {}
@@ -321,6 +333,10 @@ def build_full_ai_betting_prompt(race_id, max_budget, plan_blocks=None, use_full
 
     if st.session_state.past_trend_df is not None and not st.session_state.past_trend_df.empty:
         sections.extend(["", "【同レース過去5年の1〜3着傾向】", _df_to_prompt_table(st.session_state.past_trend_df, max_rows=15, max_cols=10)])
+
+    jockey_prompt = format_jockey_day_form_for_prompt(st.session_state.jockey_day_form, st.session_state.jockey_day_races)
+    if jockey_prompt:
+        sections.extend(["", jockey_prompt])
 
     sections.append("")
     sections.append("【各馬データ: 血統 + 過去10戦】")
@@ -566,6 +582,12 @@ if app_mode == "バックテスト":
         value=True,
         key="bt_use_backtest_ml",
         help="backtest_results.csv の買い目履歴を使い、同一レースID系統で回収率が高かった馬券種・馬番構成をプロンプトへ追加します。"
+    )
+    bt_use_jockey_day_form = st.checkbox(
+        "騎手の当日成績を予想に反映する",
+        value=False,
+        key="bt_use_jockey_day_form",
+        help="同日・同競馬場で対象レースより前のレース結果を取得し、騎手の当日成績をプロンプトとルールベース評価に追加します（1レースあたり最大11ページ取得するため時間がかかります）。"
     )
 
     with st.expander("バックテストML傾向プレビュー", expanded=False):
@@ -841,6 +863,18 @@ if app_mode == "バックテスト":
                 if bt_use_shutuba_table and not shutuba_df.empty:
                     selected_shutuba_df = get_selected_shutuba_df(shutuba_df, bt_selected_features)
                     ctx += "[出馬表]\n" + selected_shutuba_df.to_csv(index=False, sep='|') + "\n"
+
+                bt_jockey_day_form_df = None
+                if bt_use_jockey_day_form:
+                    prog_text.write(f"{r_id} の騎手当日成績を取得中...")
+                    bt_jockey_day_results_df = scraper.scrape_jockey_day_results(r_id)
+                    bt_jockey_day_form_df = build_jockey_day_form_table(bt_jockey_day_results_df, shutuba_df)
+                    jockey_prompt = format_jockey_day_form_for_prompt(
+                        bt_jockey_day_form_df,
+                        bt_jockey_day_results_df["レース番号"].nunique() if not bt_jockey_day_results_df.empty else 0,
+                    )
+                    if jockey_prompt:
+                        ctx += jockey_prompt + "\n"
                     
                 is_classic = any(keyword in race_info['name'] for keyword in ["桜花賞", "皐月賞", "優駿牝馬", "オークス", "東京優駿", "日本ダービー", "菊花賞"])
                 classic_instruction = ""
@@ -931,6 +965,7 @@ if app_mode == "バックテスト":
                                 race_info,
                                 r_id,
                                 include_blood=bt_use_blood,
+                                jockey_day_form_df=bt_jockey_day_form_df,
                             )
                             rule_result["_volatility"] = bt_volatility
                             ai_res = generate_rule_based_summary(
@@ -1181,12 +1216,18 @@ if "past_trend_df" not in st.session_state:
     st.session_state.past_trend_df = None
 if "race_volatility" not in st.session_state:
     st.session_state.race_volatility = None
+if "jockey_day_form" not in st.session_state:
+    st.session_state.jockey_day_form = None
+if "jockey_day_races" not in st.session_state:
+    st.session_state.jockey_day_races = 0
 if "hard_race_scan_results" not in st.session_state:
     st.session_state.hard_race_scan_results = []
 if "bet_plan_blocks" not in st.session_state:
     st.session_state.bet_plan_blocks = []
 if "gamiri_check_result" not in st.session_state:
     st.session_state.gamiri_check_result = None
+if "generated_ai_prompt" not in st.session_state:
+    st.session_state.generated_ai_prompt = None
 
 with st.expander("当日レースID一覧から「堅い」レースを探す", expanded=False):
     st.caption("当日のレースIDを複数貼り付けると、出馬表と過去5年傾向から荒れ具合を判定します。堅いレースはそのまま総合予想と買い目提案へ進めます。")
@@ -1333,6 +1374,18 @@ if st.session_state.all_horse_data:
         st.caption("馬番・騎手・コーナー通過順・人気を重点表示")
         st.dataframe(st.session_state.past_trend_df, use_container_width=True)
 
+    st.subheader("🏇 騎手の当日成績")
+    jockey_form_df = st.session_state.jockey_day_form
+    if jockey_form_df is None or jockey_form_df.empty or not (jockey_form_df["当日騎乗"] > 0).any():
+        st.caption("同日・同競馬場で本レースより前の結果が見つかりませんでした（第1レース、または当日の結果が未確定です）。")
+    else:
+        st.caption(
+            f"同日・同競馬場の1R〜{st.session_state.jockey_day_races}Rの結果から集計。"
+            "着別度数は1着-2着-3着-着外、人気差平均は(人気-着順)の平均でプラスほど人気以上に好走。"
+            "この表はAI予想のプロンプトにも含まれます。"
+        )
+        st.dataframe(jockey_form_df, use_container_width=True, hide_index=True)
+
     # ① 出馬表（血統情報）
     st.subheader("🧬 出馬表（血統情報）")
     df_pedigree = pd.DataFrame(st.session_state.pedigree_list)
@@ -1416,6 +1469,36 @@ if st.session_state.all_horse_data:
         for model_name, response in st.session_state.full_ai_reports.items():
             with st.expander(f"{model_name} の分析・推奨賭け金・買い目", expanded=True):
                 st.write(response)
+
+    st.markdown("---")
+    st.subheader("📋 他のAI（Claudeなど）に渡すプロンプトを出力")
+    st.caption(
+        "GeminiやChatGPTのAPIを使わず、血統・過去10戦・出馬表など取得済みデータをすべて含んだプロンプトをテキストで出力します。"
+        "これをコピーしてClaudeなど任意のAIチャットに貼り付けるだけで、同じ分析・買い目提案を依頼できます。"
+    )
+    if st.button("📋 AIに渡すプロンプトを出力", use_container_width=True, key="generate_shareable_prompt"):
+        st.session_state.generated_ai_prompt = build_full_ai_betting_prompt(
+            race_id,
+            int(full_max_budget),
+            plan_blocks,
+            use_full_budget,
+        )
+        st.rerun()
+
+    if st.session_state.generated_ai_prompt:
+        st.text_area(
+            "生成されたプロンプト（全選択してコピーし、Claudeなど任意のAIに貼り付けてください）",
+            value=st.session_state.generated_ai_prompt,
+            height=400,
+            key="generated_ai_prompt_display",
+        )
+        st.download_button(
+            "📥 プロンプトをテキストファイルでダウンロード",
+            data=st.session_state.generated_ai_prompt,
+            file_name=f"ai_prompt_{race_id}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
 
         st.markdown("---")
         st.subheader("🔍 オッズ確認・ガミリチェック（購入前）")

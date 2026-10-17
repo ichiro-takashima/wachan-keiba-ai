@@ -33,6 +33,9 @@ TURN_MAP = {"右": 0, "左": 1, "芝": 2, "直": 2}
 WEATHER_RULES = [("晴", 0), ("曇", 1), ("小", 2), ("雨", 3), ("雪", 4)]
 GOING_RULES = [("良", 0), ("稍", 1), ("重", 2), ("不", 3)]
 
+# 距離区分: 短距離(0)<=1400 / マイル(1)1401-1800 / 中距離(2)1801-2200 / 長距離(3)2201以上。
+DISTANCE_CATEGORY_BINS = [(1400, 0), (1800, 1), (2200, 2)]
+
 
 def encode_class(text):
     text = "" if pd.isna(text) else str(text)
@@ -103,6 +106,17 @@ def encode_going(value):
 
 def encode_weather(value):
     return _encode_by_rules(value, WEATHER_RULES)
+
+
+def encode_distance_category(value):
+    """距離(m)を距離区分(短距離0/マイル1/中距離2/長距離3)へ変換する。"""
+    distance = pd.to_numeric(value, errors="coerce")
+    if pd.isna(distance):
+        return np.nan
+    for upper, code in DISTANCE_CATEGORY_BINS:
+        if distance <= upper:
+            return code
+    return 3
 
 
 def split_date(value):

@@ -6,6 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from data_features import find_matching_column
+from jockey_form import jockey_day_form_lookup, score_jockey_day_form
 from race_volatility import format_volatility_for_prompt
 
 def analyze_running_style(results_df):
@@ -219,6 +220,10 @@ def _score_rule_factors(results, shutuba_meta, current_dist, current_place, curr
             if latest_jockey and latest_jockey != current_jockey:
                 external -= 0.5
                 details.append("騎手乗り替わり -0.5")
+    jockey_day_points, jockey_day_reason = score_jockey_day_form(shutuba_meta.get("jockey_day_form"))
+    if jockey_day_reason:
+        external += jockey_day_points
+        details.append(jockey_day_reason)
     frame = _to_number(shutuba_meta.get("frame"))
     if frame is not None and frame in {1, 2, 7, 8}:
         external += 0.5
@@ -319,7 +324,7 @@ def _candidate_custom_combos(ticket_type, ranked_umabans, axis_text, betting_met
     return axis_horses[:1] or ranked_umabans[:1] or ["1"]
 
 
-def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=None, include_blood=True):
+def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=None, include_blood=True, jockey_day_form_df=None):
     horses = []
     data_weight = 1.0
     ten_weight = 1.0
@@ -351,6 +356,8 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
     odds_col = find_matching_column(shutuba_df, ["オッズ", "単勝"]) if shutuba_df is not None else None
     popularity_col = find_matching_column(shutuba_df, ["人気"]) if shutuba_df is not None else None
 
+    jockey_form_by_umaban = jockey_day_form_lookup(jockey_day_form_df)
+
     current_place = None
     if race_id and len(str(race_id)) >= 6:
         place_code = str(race_id)[4:6]
@@ -379,6 +386,7 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
                     "weight_carried": matched.get(carried_weight_col, "") if carried_weight_col else "",
                     "odds": matched.get(odds_col, "") if odds_col else "",
                     "popularity": matched.get(popularity_col, "") if popularity_col else "",
+                    "jockey_day_form": jockey_form_by_umaban.get(umaban.strip()),
                 }
 
         data_score = 0

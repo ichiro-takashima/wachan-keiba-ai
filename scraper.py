@@ -814,6 +814,101 @@ def get_race_date(race_id):
     return pd.Timestamp.now().strftime("%Y/%m/%d")
 
 
+def _result_page_urls(race_id):
+    jra_url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
+    nar_url = f"https://nar.netkeiba.com/race/result.html?race_id={race_id}"
+    return [nar_url, jra_url] if is_local_race_id(race_id) else [jra_url, nar_url]
+
+
+def _parse_result_page_rows(soup):
+    """レース結果ページ(race/nar.netkeiba)の結果テーブルを行ごとの辞書で返す。"""
+    table = soup.select_one("#All_Result_Table") or soup.select_one("table.RaceTable01")
+    if not table:
+        return []
+
+    headers = [_normalize_label(th.get_text(strip=True)) for th in table.find_all("th")]
+
+    def col_index(*names):
+        for name in names:
+            if name in headers:
+                return headers.index(name)
+        return None
+
+    idx = {
+        "着順": col_index("着順"),
+        "馬番": col_index("馬番"),
+        "馬名": col_index("馬名"),
+        "騎手": col_index("騎手"),
+        "人気": col_index("人気"),
+        "単勝オッズ": col_index("単勝オッズ", "単勝"),
+    }
+
+    rows = []
+    for tr in table.select("tr.HorseList") or table.find_all("tr")[1:]:
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+
+        def cell(key):
+            i = idx.get(key)
+            return tds[i].get_text(" ", strip=True) if i is not None and i < len(tds) else ""
+
+        jockey_td = tr.select_one("td.Jockey")
+        jockey = jockey_td.get_text(strip=True) if jockey_td else cell("騎手")
+        jockey_a = jockey_td.find("a", href=True) if jockey_td else None
+        jockey_id_match = re.search(r"/jockey/(?:result/recent/)?(\w+)", jockey_a["href"]) if jockey_a else None
+        if not jockey:
+            continue
+
+        rows.append({
+            "着順": cell("着順"),
+            "馬番": cell("馬番"),
+            "馬名": re.sub(r"\s+", "", cell("馬名")),
+            "騎手": jockey,
+            "騎手ID": jockey_id_match.group(1) if jockey_id_match else "",
+            "人気": cell("人気"),
+            "単勝オッズ": cell("単勝オッズ"),
+        })
+    return rows
+
+
+def scrape_jockey_day_results(race_id, progress_callback=None):
+    """
+    対象レースと同じ開催日・同じ競馬場で、対象レースより前に行われたレースの結果を取得する。
+    race_id は YYYY + 場 + 回(月) + 日 + R の12桁なので、先頭10桁が同じなら同一開催日。
+    対象レース以降の結果は含めないため、過去レースのバックテストでも未来情報は混入しない。
+    """
+    race_id = str(race_id or "")
+    if len(race_id) != 12 or not race_id.isdigit():
+        return pd.DataFrame()
+
+    day_prefix = race_id[:10]
+    target_no = int(race_id[10:])
+    rows = []
+    for race_no in range(1, target_no):
+        rid = f"{day_prefix}{race_no:02d}"
+        if progress_callback:
+            progress_callback(race_no, target_no - 1, rid)
+        for url in _result_page_urls(rid):
+            try:
+                time.sleep(0.7)
+                res = session.get(url, headers=HEADERS, timeout=12)
+                res.encoding = res.apparent_encoding or "utf-8"
+                soup = BeautifulSoup(res.text, "html.parser")
+                race_rows = _parse_result_page_rows(soup)
+                if not race_rows:
+                    continue
+                name_tag = soup.select_one(".RaceList_Item02 .RaceName") or soup.select_one(".RaceName")
+                race_name = _clean_race_text(name_tag.get_text(" ", strip=True)) if name_tag else ""
+                for row in race_rows:
+                    rows.append({"レース番号": race_no, "race_id": rid, "レース名": race_name, **row})
+                break
+            except Exception:
+                continue
+
+    return pd.DataFrame(rows)
+
+
 def scrape_past_top3_trend(race_id, years=5):
     """
     race.netkeiba の「過去10年」ページから、直近 years 年分の

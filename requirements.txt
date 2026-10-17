@@ -13,3 +13,4 @@ tqdm
 optuna
 optuna-integration[lightgbm]
 matplotlib
+shap
