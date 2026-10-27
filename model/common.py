@@ -71,11 +71,14 @@ def train_and_evaluate(
     random_state=42,
     feature_cols=None,
     lgb_params=None,
+    train_idx=None,
+    test_idx=None,
 ):
     """LightGBMで二値分類を学習し、評価指標一式とテスト結果を返す。
 
     split="random"なら層化ランダム7:3分割(既定)、split="time"なら日付でソートし
-    後方をテストにする時系列分割。
+    後方をテストにする時系列分割。train_idx/test_idxを渡した場合はその分割をそのまま使う
+    (カテゴリ別モデルと全体モデルを同じテスト行で比較するため)。
     """
     working = df[df[target_col].notna()].copy()
     y_all = working[target_col].astype(int)
@@ -83,7 +86,11 @@ def train_and_evaluate(
     feature_cols = feature_cols or get_feature_columns(working)
     x_all = _to_numeric_matrix(working, feature_cols)
 
-    train_idx, test_idx = _split_indices(working, split, test_size, random_state, y_all)
+    if train_idx is not None and test_idx is not None:
+        train_idx = working.index.intersection(train_idx)
+        test_idx = working.index.intersection(test_idx)
+    else:
+        train_idx, test_idx = _split_indices(working, split, test_size, random_state, y_all)
     x_train, x_test = x_all.loc[train_idx], x_all.loc[test_idx]
     y_train, y_test = y_all.loc[train_idx], y_all.loc[test_idx]
 

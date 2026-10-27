@@ -1,0 +1,35 @@
+{
+  "accuracy": 0.7712177121771218,
+  "precision": 0.5294117647058824,
+  "recall": 0.14285714285714285,
+  "f1": 0.225,
+  "auc": 0.7045177045177046,
+  "confusion_matrix": [
+    [
+      200,
+      8
+    ],
+    [
+      54,
+      9
+    ]
+  ],
+  "n_train": 542,
+  "n_test": 271,
+  "category": "turf_long",
+  "label": "芝長距離 (2500〜3200m)",
+  "split": "time",
+  "lgb_params": {
+    "n_estimators": 200,
+    "learning_rate": 0.03,
+    "num_leaves": 7,
+    "min_child_samples": 40,
+    "reg_lambda": 5.0,
+    "colsample_bytree": 0.7
+  },
+  "top1_place_rate": 0.5238095238095238,
+  "top1_fukusho_roi": 82.4,
+  "global_model_auc": 0.7311507936507936,
+  "global_top1_place_rate": 0.47619047619047616,
+  "global_top1_fukusho_roi": 69.0
+}

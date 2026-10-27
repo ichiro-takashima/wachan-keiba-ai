@@ -1,0 +1,28 @@
+{
+  "accuracy": 0.7767110560545061,
+  "precision": 0.49557522123893805,
+  "recall": 0.233983286908078,
+  "f1": 0.31788079470198677,
+  "auc": 0.7406303628935191,
+  "confusion_matrix": [
+    [
+      2340,
+      171
+    ],
+    [
+      550,
+      168
+    ]
+  ],
+  "n_train": 7771,
+  "n_test": 3229,
+  "category": "dirt_long",
+  "label": "ダート中長距離 (1700〜2500m)",
+  "split": "time",
+  "lgb_params": {},
+  "top1_place_rate": 0.5368852459016393,
+  "top1_fukusho_roi": 79.9,
+  "global_model_auc": 0.7608577967250505,
+  "global_top1_place_rate": 0.5655737704918032,
+  "global_top1_fukusho_roi": 78.4
+}

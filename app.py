@@ -37,8 +37,15 @@ from tickets import (
     parse_ids_input as _parse_ids_input,
 )
 from ui_helpers import load_css, memo_ui
+import ml_ui
+from model.live_predict import load_reference_data, predict_race
 
 load_css("style.css")
+
+
+@st.cache_resource(show_spinner="AIモデル用の参照データを読み込み中...")
+def _load_ml_reference():
+    return load_reference_data()
 
 # --- 設定 ---
 # コマンドプロンプトで setx した値を取得
@@ -1322,90 +1329,139 @@ if st.button("データ取得開始"):
 
 # --- ここから表示フェーズ（データがあるときだけ自動で表示される） ---
 if st.session_state.all_horse_data:
-    # 🆕 レース情報の表示
-    if st.session_state.race_info:
-        r_info = st.session_state.race_info
-        st.markdown(f"## 🏆 {r_info['name']}")
-        st.markdown(f"**{r_info['data']}**")
-        race_meta = []
-        if r_info.get("start_time"):
-            race_meta.append(f"発走: {r_info['start_time']}")
-        if r_info.get("course"):
-            race_meta.append(f"条件: {r_info['course']}")
-        if r_info.get("place"):
-            race_meta.append(f"競馬場: {r_info['place']}")
-        if r_info.get("entries"):
-            race_meta.append(f"頭数: {r_info['entries']}")
-        if race_meta:
-            st.caption(" / ".join(race_meta))
-        st.markdown("---")
+    r_info = st.session_state.race_info or {}
+    volatility = st.session_state.race_volatility
+    shutuba_df_view = st.session_state.shutuba_table
 
-    # 🆕 取得した公式出馬表の表示
-    if st.session_state.shutuba_table is not None and not st.session_state.shutuba_table.empty:
-        st.subheader("📊 本レース出馬表（馬番・騎手・斤量・馬体重など）")
-        st.dataframe(st.session_state.shutuba_table, use_container_width=True)
-
-    if st.session_state.race_volatility:
-        volatility = st.session_state.race_volatility
-        st.subheader("🎯 荒れ具合と推奨購入点数")
-        c1, c2, c3 = st.columns([1, 1, 3])
-        c1.metric("荒れ指数", f"{volatility['score']}/100")
-        c2.metric("判定", volatility["level"])
-        c3.info(volatility["summary"])
-        if volatility.get("reasons"):
-            st.caption("根拠: " + " / ".join(volatility["reasons"]))
-        st.dataframe(pd.DataFrame(volatility["ticket_rows"]), use_container_width=True)
-
-    st.subheader("⚔️ 出走馬の対戦表（過去同一レース比較）")
-    race_compare_count = st.slider("表示する比較レース数", min_value=3, max_value=12, value=8, step=1)
-    race_comparison_df = _build_race_comparison_table(
-        st.session_state.all_horse_data,
-        st.session_state.shutuba_table,
-        max_races=race_compare_count
+    # --- LightGBM カテゴリ別モデルによる予測（レース・モデル・基準日が変わったときだけ再計算） ---
+    model_mode_label = st.radio(
+        "予測モデル",
+        ["カテゴリ別モデル（芝・ダート×距離帯）", "全体モデル（全条件共通）"],
+        horizontal=True,
+        key="ml_model_mode",
+        help="カテゴリ別: ダート1200-1600m / ダート1700-2500m / 芝1200-1600m / 芝1700-2400m / 芝2500-3200m の5モデルから、レース条件に合うものを自動選択します。",
     )
-    if race_comparison_df.empty:
-        st.caption("今回の出走馬同士で共通出走したレースが見つかりませんでした。")
-    else:
-        st.caption("同じレースに出走していた馬の着順・タイムを横並びで比較できます（1〜3着は色付き）。")
-        st.dataframe(_style_race_comparison(race_comparison_df), use_container_width=True, height=600)
+    model_mode = "category" if model_mode_label.startswith("カテゴリ") else "global"
+    current_race_id = r_info.get("race_id") or race_id
+    ml_cache_key = (current_race_id, model_mode, str(prediction_date), id(st.session_state.all_horse_data))
+    if st.session_state.get("ml_prediction_key") != ml_cache_key:
+        try:
+            st.session_state.ml_prediction = predict_race(
+                current_race_id,
+                r_info,
+                shutuba_df_view,
+                st.session_state.all_horse_data,
+                pd.Timestamp(prediction_date),
+                _load_ml_reference(),
+                model_mode=model_mode,
+            )
+            st.session_state.ml_prediction_error = None
+        except Exception as e:
+            st.session_state.ml_prediction = None
+            st.session_state.ml_prediction_error = str(e)
+        st.session_state.ml_prediction_key = ml_cache_key
+    ml_prediction = st.session_state.get("ml_prediction")
 
-    if st.session_state.past_trend_df is not None and not st.session_state.past_trend_df.empty:
-        st.subheader("🕰️ 同レース過去5年（1〜3着の傾向）")
-        st.caption("馬番・騎手・コーナー通過順・人気を重点表示")
-        st.dataframe(st.session_state.past_trend_df, use_container_width=True)
+    # 【Step 1】レース概況・適用モデルバッジ
+    ml_ui.render_race_overview(r_info, ml_prediction, volatility)
+    if volatility:
+        st.info(f"波乱度の方針: {volatility['summary']}"
+                + (f"（根拠: {' / '.join(volatility['reasons'])}）" if volatility.get("reasons") else ""))
 
-    st.subheader("🏇 騎手の当日成績")
-    jockey_form_df = st.session_state.jockey_day_form
-    if jockey_form_df is None or jockey_form_df.empty or not (jockey_form_df["当日騎乗"] > 0).any():
-        st.caption("同日・同競馬場で本レースより前の結果が見つかりませんでした（第1レース、または当日の結果が未確定です）。")
+    if ml_prediction is None:
+        st.warning(f"AIモデルでの予測ができませんでした: {st.session_state.get('ml_prediction_error')}")
     else:
-        st.caption(
-            f"同日・同競馬場の1R〜{st.session_state.jockey_day_races}Rの結果から集計。"
-            "着別度数は1着-2着-3着-着外、人気差平均は(人気-着順)の平均でプラスほど人気以上に好走。"
-            "この表はAI予想のプロンプトにも含まれます。"
+        pred_df = ml_prediction["predictions"]
+        st.markdown("---")
+        # 【Step 2】AI推奨馬ランキング（上位5頭）
+        ml_ui.render_top_horse_cards(pred_df, win_prob_method=ml_prediction["win_prob_method"])
+        st.markdown("---")
+        # 【Step 3】馬券戦略・買い目カード + 資金配分シミュレータ
+        ml_ui.render_ticket_strategy(pred_df, volatility)
+
+    st.markdown("---")
+    st.subheader("🔎 詳細分析")
+    (
+        tab_entries, tab_importance, tab_pace, tab_compare,
+        tab_trend, tab_jockey, tab_pedigree, tab_horses,
+    ) = st.tabs([
+        "出走表全データ", "特徴量重要度", "過去走ペース比較", "対戦表",
+        "過去5年傾向", "騎手当日成績", "血統", "各馬の戦績",
+    ])
+
+    with tab_entries:
+        if ml_prediction is not None:
+            st.markdown("**AI予測（全頭）**")
+            ml_ui.render_prediction_table(ml_prediction["predictions"])
+        if shutuba_df_view is not None and not shutuba_df_view.empty:
+            st.markdown("**本レース出馬表（馬番・騎手・斤量・馬体重など）**")
+            st.dataframe(shutuba_df_view, use_container_width=True)
+        if volatility:
+            st.markdown("**荒れ具合と推奨購入点数**")
+            st.dataframe(pd.DataFrame(volatility["ticket_rows"]), use_container_width=True, hide_index=True)
+
+    with tab_importance:
+        if ml_prediction is not None:
+            ml_ui.render_feature_importance(ml_prediction["model_key"])
+        else:
+            st.caption("予測モデルが利用できません。")
+
+    with tab_pace:
+        if ml_prediction is not None:
+            ml_ui.render_pace_comparison(ml_prediction["predictions"], st.session_state.all_horse_data)
+        else:
+            st.caption("予測モデルが利用できません。")
+
+    with tab_compare:
+        race_compare_count = st.slider("表示する比較レース数", min_value=3, max_value=12, value=8, step=1)
+        race_comparison_df = _build_race_comparison_table(
+            st.session_state.all_horse_data,
+            st.session_state.shutuba_table,
+            max_races=race_compare_count
         )
-        st.dataframe(jockey_form_df, use_container_width=True, hide_index=True)
+        if race_comparison_df.empty:
+            st.caption("今回の出走馬同士で共通出走したレースが見つかりませんでした。")
+        else:
+            st.caption("同じレースに出走していた馬の着順・タイムを横並びで比較できます（1〜3着は色付き）。")
+            st.dataframe(_style_race_comparison(race_comparison_df), use_container_width=True, height=600)
 
-    # ① 出馬表（血統情報）
-    st.subheader("🧬 出馬表（血統情報）")
-    df_pedigree = pd.DataFrame(st.session_state.pedigree_list)
-    df_pedigree = df_pedigree.rename(columns={
-        "horse_id": "馬ID", "name": "馬名", "sire": "父", "dam": "母", "broodmare_sire": "母父"
-    })
-    st.dataframe(df_pedigree, use_container_width=True)
+    with tab_trend:
+        if st.session_state.past_trend_df is not None and not st.session_state.past_trend_df.empty:
+            st.caption("同レース過去5年の1〜3着。馬番・騎手・コーナー通過順・人気を重点表示")
+            st.dataframe(st.session_state.past_trend_df, use_container_width=True)
+        else:
+            st.caption("同レースの過去傾向データがありません。")
 
-    # 各馬の詳細情報
-    st.subheader("🐎 各馬の詳細情報と直近戦績")
-    for horse in st.session_state.all_horse_data:
-        with st.expander(f"{horse['pedigree']['name']} (ID: {horse['id']})"):
-            running_style = analyze_running_style(horse['results'])
-            track_preference = analyze_track_preference(horse['results'])
-            st.write(f"**父:** {horse['pedigree']['sire']} / **母:** {horse['pedigree']['dam']} / **母父:** {horse['pedigree']['broodmare_sire']}")
-            st.write(f"**脚質:** {running_style} | **馬場適性:** {track_preference}")
-            if not horse['results'].empty:
-                st.dataframe(horse['results'].head(10), use_container_width=True)
-            else:
-                st.write("戦績データがありません。")
+    with tab_jockey:
+        jockey_form_df = st.session_state.jockey_day_form
+        if jockey_form_df is None or jockey_form_df.empty or not (jockey_form_df["当日騎乗"] > 0).any():
+            st.caption("同日・同競馬場で本レースより前の結果が見つかりませんでした（第1レース、または当日の結果が未確定です）。")
+        else:
+            st.caption(
+                f"同日・同競馬場の1R〜{st.session_state.jockey_day_races}Rの結果から集計。"
+                "着別度数は1着-2着-3着-着外、人気差平均は(人気-着順)の平均でプラスほど人気以上に好走。"
+                "この表はAI予想のプロンプトにも含まれます。"
+            )
+            st.dataframe(jockey_form_df, use_container_width=True, hide_index=True)
+
+    with tab_pedigree:
+        df_pedigree = pd.DataFrame(st.session_state.pedigree_list)
+        df_pedigree = df_pedigree.rename(columns={
+            "horse_id": "馬ID", "name": "馬名", "sire": "父", "dam": "母", "broodmare_sire": "母父"
+        })
+        st.dataframe(df_pedigree, use_container_width=True)
+
+    with tab_horses:
+        for horse in st.session_state.all_horse_data:
+            with st.expander(f"{horse['pedigree']['name']} (ID: {horse['id']})"):
+                running_style = analyze_running_style(horse['results'])
+                track_preference = analyze_track_preference(horse['results'])
+                st.write(f"**父:** {horse['pedigree']['sire']} / **母:** {horse['pedigree']['dam']} / **母父:** {horse['pedigree']['broodmare_sire']}")
+                st.write(f"**脚質:** {running_style} | **馬場適性:** {track_preference}")
+                if not horse['results'].empty:
+                    st.dataframe(horse['results'].head(10), use_container_width=True)
+                else:
+                    st.write("戦績データがありません。")
 
     st.markdown("---")
     st.subheader("🚀 AI総合予想と賭け方提案")

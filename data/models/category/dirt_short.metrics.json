@@ -1,0 +1,28 @@
+{
+  "accuracy": 0.8,
+  "precision": 0.5150684931506849,
+  "recall": 0.2543978349120433,
+  "f1": 0.34057971014492755,
+  "auc": 0.7607684159118292,
+  "confusion_matrix": [
+    [
+      2724,
+      177
+    ],
+    [
+      551,
+      188
+    ]
+  ],
+  "n_train": 8472,
+  "n_test": 3640,
+  "category": "dirt_short",
+  "label": "ダート短距離 (1200〜1600m)",
+  "split": "time",
+  "lgb_params": {},
+  "top1_place_rate": 0.5100401606425703,
+  "top1_fukusho_roi": 80.8,
+  "global_model_auc": 0.7685843013397928,
+  "global_top1_place_rate": 0.5582329317269076,
+  "global_top1_fukusho_roi": 84.8
+}
