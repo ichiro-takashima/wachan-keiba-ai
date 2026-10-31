@@ -324,8 +324,34 @@ def _candidate_custom_combos(ticket_type, ranked_umabans, axis_text, betting_met
     return axis_horses[:1] or ranked_umabans[:1] or ["1"]
 
 
-def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=None, include_blood=True, jockey_day_form_df=None):
+# ダート1400m以上で産駒の成績が優秀な種牡馬。該当する馬はプラス材料として加点する。
+DIRT_STRONG_SIRES = ("シニスターミニスター", "ダノンレジェンド", "ルヴァンスレーヴ")
+DIRT_STRONG_SIRE_MIN_DISTANCE = 1400
+DIRT_STRONG_SIRE_POINTS = 2.0
+
+
+def parse_course(race_info):
+    """race_info["data"] の「ダ1400m」「芝右2000m」などから (芝/ダ/障, 距離) を返す。"""
+    text = str((race_info or {}).get("data", ""))
+    match = re.search(r"(芝|ダ|障)\D{0,6}?(\d{3,4})\s*m", text)
+    if not match:
+        return None, None
+    return match.group(1), int(match.group(2))
+
+
+def dirt_strong_sire(sire, race_info):
+    """ダート1400m以上のレースで、父が優秀種牡馬ならその名前を返す(該当しなければNone)。"""
+    surface, distance = parse_course(race_info)
+    if surface != "ダ" or distance is None or distance < DIRT_STRONG_SIRE_MIN_DISTANCE:
+        return None
+    sire = re.sub(r"\s+", "", str(sire or ""))
+    return next((name for name in DIRT_STRONG_SIRES if name in sire), None)
+
+
+def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=None, include_blood=True, jockey_day_form_df=None, model_top3_probs=None):
+    """model_top3_probs: {馬番(str): 3着以内確率} を渡すと、学習済みモデルの評価を総合点に加える。"""
     horses = []
+    model_top3_probs = model_top3_probs or {}
     data_weight = 1.0
     ten_weight = 1.0
     blood_weight = 1.0 if include_blood else 0.0
@@ -450,11 +476,16 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
                             blood_score += (hits / len(place_df)) * 10
 
         rule_factors = _score_rule_factors(results, shutuba_meta, current_dist, current_place, current_track_type)
+        strong_sire = dirt_strong_sire(ped.get("sire"), race_info)
+        if strong_sire:
+            rule_factors["rule_score"] += DIRT_STRONG_SIRE_POINTS
+            rule_factors["rule_details"].insert(0, f"父{strong_sire}(ダート1400m以上の優秀種牡馬) +{DIRT_STRONG_SIRE_POINTS:g}")
 
         horses.append({
             "id": hid,
             "name": name,
             "umaban": umaban,
+            "model_prob": model_top3_probs.get(umaban.strip()),
             "data_score": data_score,
             "ten_score": ten_score,
             "blood_score": blood_score,
@@ -467,19 +498,32 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
     blood_devs = calculate_deviations([h["blood_score"] for h in horses])
     rule_devs = calculate_deviations([h["rule_score"] for h in horses])
 
+    # モデル確率がない馬は出走馬の平均確率で埋めて、偏差値50付近に置く
+    known_probs = [h["model_prob"] for h in horses if h["model_prob"] is not None]
+    use_model = bool(known_probs)
+    mean_prob = sum(known_probs) / len(known_probs) if use_model else 0
+    model_devs = calculate_deviations([
+        h["model_prob"] if h["model_prob"] is not None else mean_prob for h in horses
+    ])
+
     rule_weight = 0.8
-    total_weight = data_weight + ten_weight + blood_weight + rule_weight
+    model_weight = 1.5 if use_model else 0.0
+    total_weight = data_weight + ten_weight + blood_weight + rule_weight + model_weight
     for i, h in enumerate(horses):
         h["data_dev"] = data_devs[i]
         h["ten_dev"] = ten_devs[i]
         h["blood_dev"] = blood_devs[i]
         h["rule_dev"] = rule_devs[i]
+        h["model_dev"] = model_devs[i]
         h["total_dev"] = (
             data_devs[i] * data_weight
             + ten_devs[i] * ten_weight
             + blood_devs[i] * blood_weight
             + rule_devs[i] * rule_weight
+            + model_devs[i] * model_weight
         ) / total_weight
+        if h["model_prob"] is not None:
+            h.setdefault("rule_details", []).append(f"学習モデル3着内確率 {h['model_prob']:.0%}")
 
     strengths = [max(0.01, h["total_dev"] - 35) for h in horses]
     strength_total = sum(strengths) or 1
@@ -505,8 +549,10 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
         "🏇 展開重視": f"【テンの速さ・道中位置取り偏差値による評価】\n{format_ranking(sorted(horses, key=lambda x: x['ten_dev'], reverse=True), 'ten_dev')}",
         "💰 期待値・ルール評価": f"【能力・適性・期待値・外部要因の加点評価】\n{format_ranking(sorted(horses, key=lambda x: x['rule_dev'], reverse=True), 'rule_dev')}",
         "_raw_horses": horses,
-        "_weight_info": f"※適用された評価ウェイト: データ {data_weight:.1f} / 展開 {ten_weight:.1f} / 血統・適性 {blood_weight:.1f} / 期待値ルール {rule_weight:.1f}",
+        "_weight_info": f"※適用された評価ウェイト: データ {data_weight:.1f} / 展開 {ten_weight:.1f} / 血統・適性 {blood_weight:.1f} / 期待値ルール {rule_weight:.1f} / 学習モデル {model_weight:.1f}",
     }
+    if use_model:
+        analysis_result["🤖 学習モデル評価"] = f"【収集レースで学習したモデルの3着以内確率による評価】\n{format_ranking(sorted(horses, key=lambda x: x['model_dev'], reverse=True), 'model_dev')}"
     if include_blood:
         analysis_result = {
             "🩸 血統・適性重視": f"【独自適性スコアによる評価】\n{format_ranking(sorted(horses, key=lambda x: x['blood_dev'], reverse=True), 'blood_dev')}",

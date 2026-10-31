@@ -606,6 +606,9 @@ ODDS_TYPE_CODE = {
     "馬単": "6",
     "三連複": "7",
     "三連単": "8",
+    # AIの買い目JSONは「3連複」表記なので、同じコードで引けるようにする
+    "3連複": "7",
+    "3連単": "8",
 }
 
 
@@ -627,7 +630,9 @@ def scrape_realtime_odds(race_id, ticket_types):
             continue
         type_code = ODDS_TYPE_CODE.get(ticket_type)
         if not type_code:
+            print(f"[odds] {race_id} {ticket_type!r}: 未対応の券種名のためスキップ")
             continue
+        res = None
         try:
             res = session.get(
                 url, headers=HEADERS,
@@ -635,10 +640,19 @@ def scrape_realtime_odds(race_id, ticket_types):
                 timeout=10,
             )
             payload = res.json()
-        except Exception:
+        except Exception as e:
+            status = res.status_code if res is not None else "-"
+            head = res.text[:200].replace("\n", " ") if res is not None else ""
+            print(f"[odds] {race_id} {ticket_type}: 取得失敗 HTTP={status} {type(e).__name__}: {e} 応答先頭={head!r}")
             continue
 
         odds_map = (payload.get("data") or {}).get("odds", {}).get(type_code, {})
+        if not odds_map:
+            print(
+                f"[odds] {race_id} {ticket_type}: オッズが空 HTTP={res.status_code} "
+                f"status={payload.get('status')!r} reason={payload.get('reason')!r} "
+                f"data_keys={list((payload.get('data') or {}).keys())}"
+            )
         combo_odds = {}
         for key, row in odds_map.items():
             try:
@@ -649,6 +663,8 @@ def scrape_realtime_odds(race_id, ticket_types):
                 combo_odds[combo] = {"odds": odds_min, "odds_max": odds_max}
             except Exception:
                 continue
+        if odds_map and not combo_odds:
+            print(f"[odds] {race_id} {ticket_type}: {len(odds_map)}件あるが解析できず 例={next(iter(odds_map.items()))!r}")
         if combo_odds:
             result[ticket_type] = combo_odds
     return result

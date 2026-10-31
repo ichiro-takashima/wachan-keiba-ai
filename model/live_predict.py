@@ -363,7 +363,8 @@ def predict_race(race_id, race_info, shutuba_df, all_horse_data, race_date, refe
     out["過去走数"] = features[[c for c in features.columns if c.startswith("着順_")]].notna().sum(axis=1) if any(
         c.startswith("着順_") for c in features.columns) else 0
 
-    out = out.sort_values("3着内確率", ascending=False).reset_index(drop=True)
+    # 印(◎=本命)は1着になる見込みの高い順。推定勝率が同じ(・欠損)なら3着内確率で並べる。
+    out = out.sort_values(["推定勝率", "3着内確率"], ascending=False, na_position="last").reset_index(drop=True)
     out.insert(0, "AI順位", range(1, len(out) + 1))
     out.insert(1, "印", [MARKS[i] if i < len(MARKS) else "" for i in range(len(out))])
 
