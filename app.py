@@ -1,4 +1,5 @@
 ﻿import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import time
 import os
@@ -24,11 +25,13 @@ from race_analysis import (
     analyze_running_style,
     analyze_track_preference,
     build_race_comparison_table as _build_race_comparison_table,
+    dirt_strong_sire,
     generate_rule_based_summary,
     run_rule_based_analysis,
     style_race_comparison as _style_race_comparison,
 )
 from race_volatility import analyze_race_volatility, format_volatility_for_prompt
+from scraping.collect_dataset import fetch_race_ids_on_date
 from jockey_form import build_jockey_day_form_table, format_jockey_day_form_for_prompt
 from tickets import (
     calculate_return,
@@ -38,7 +41,10 @@ from tickets import (
 )
 from ui_helpers import load_css, memo_ui
 import ml_ui
-from model.live_predict import load_reference_data, predict_race
+from gami_prompt import GAMI_ODDS_TICKET_TYPES, build_gami_free_prompt
+from model.live_predict import PLACE_NAMES, load_reference_data, predict_race
+from model.shutuba_model import format_for_prompt as format_shutuba_model_for_prompt
+from model.shutuba_model import load_adopted_model, predict_shutuba
 
 load_css("style.css")
 
@@ -47,16 +53,43 @@ load_css("style.css")
 def _load_ml_reference():
     return load_reference_data()
 
+
+@st.cache_resource(show_spinner="学習済みモデル（収集レース）を読み込み中...")
+def _load_shutuba_model():
+    return load_adopted_model()
+
+
+@st.cache_data(ttl=600, show_spinner="開催レース一覧を取得中...")
+def _race_ids_on_date(target_date):
+    """開催日の中央競馬レースID一覧(未来の開催日も可)。"""
+    return fetch_race_ids_on_date(target_date, sleep_sec=0.5)
+
+
+def _shutuba_model_probs(result):
+    """モデルの予測結果を {馬番(str): 3着以内確率} にする（ルールベースの点数用）。"""
+    if not result:
+        return {}
+    pred = result["predictions"]
+    return {str(int(n)): float(p) for n, p in zip(pred["馬番"], pred["3着内確率"]) if pd.notna(n) and pd.notna(p)}
+
 # --- 設定 ---
 # コマンドプロンプトで setx した値を取得
 API_KEY_GEMINI = os.getenv("GEMINI_API_KEY")
-if API_KEY_GEMINI is None:
-    st.sidebar.error("⚠️ APIキーが読み込めていません。再度 setx コマンドを実行し、PCを再起動してください。")
 API_KEY_OPENAI = os.getenv("OPENAI_API_KEY")
-if API_KEY_OPENAI is None:
-    st.sidebar.error("⚠️ APIキーが読み込めていません。再度 setx コマンドを実行し、PCを再起動してください。")
+_missing_keys = [name for name, key in [("GEMINI_API_KEY", API_KEY_GEMINI), ("OPENAI_API_KEY", API_KEY_OPENAI)] if key is None]
+if _missing_keys:
+    st.sidebar.error(
+        f"{' / '.join(_missing_keys)} が読み込めていません。再度 setx コマンドを実行し、PCを再起動してください。",
+        icon=":material/key_off:",
+    )
 
-ai_choice = st.radio("使用するAIを選択", ["Gemini", "ChatGPT", "両方で比較", "ルールベース (AI不使用)"], horizontal=True)
+# サイドバーは「レース選択 → AI設定 → 補助ツール」の順に並べる（中身は下のほうで各ページが書き込む）
+sidebar_race = st.sidebar.container()
+sidebar_settings = st.sidebar.container()
+sidebar_finder = st.sidebar.container()
+sidebar_tools = st.sidebar.container()
+
+ai_choice = sidebar_settings.selectbox("使用するAI", ["Gemini", "ChatGPT", "両方で比較", "ルールベース (AI不使用)"])
 # --- 分析用ヘルパー関数 ---
 def ask_gemini(prompt):
     return call_gemini(prompt, API_KEY_GEMINI)
@@ -107,46 +140,52 @@ OUTPUT_FORMAT_INSTRUCTIONS = [
 
 
 def collect_single_race_data(target_race_id, cutoff_date):
-    """単一レース予想に必要なデータをまとめて取得する。"""
-    h_ids = scraper.get_horse_ids_from_race(target_race_id)
-    if not h_ids:
-        return None
+    """単一レース予想に必要なデータをまとめて取得する。進み具合は st.status に表示する。"""
+    with st.status(f"レース {target_race_id} のデータを取得中...", expanded=True) as status:
+        st.write(":material/format_list_bulleted: 出走馬の一覧を取得中...")
+        h_ids = scraper.get_horse_ids_from_race(target_race_id)
+        if not h_ids:
+            status.update(label="出走馬が見つかりませんでした", state="error")
+            return None
 
-    temp_horse_data = []
-    temp_pedigree_list = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+        temp_horse_data = []
+        temp_pedigree_list = []
+        st.write(f":material/pets: 出走馬{len(h_ids)}頭の血統・戦績を取得中...")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-    for i, hid in enumerate(h_ids):
-        status_text.write(f"🔍 {i+1}/{len(h_ids)}頭目 (ID: {hid}) を取得中...")
+        for i, hid in enumerate(h_ids):
+            status_text.caption(f"{i+1}/{len(h_ids)}頭目 (ID: {hid}) を取得中...")
 
-        ped_data = scraper.scrape_horse_ped(hid)
-        temp_pedigree_list.append(ped_data)
+            ped_data = scraper.scrape_horse_ped(hid)
+            temp_pedigree_list.append(ped_data)
 
-        results_df = scraper.scrape_race_results_dedicated(hid)
+            results_df = scraper.scrape_race_results_dedicated(hid)
 
-        if not results_df.empty:
-            results_df['日付'] = pd.to_datetime(results_df['日付'], errors='coerce')
-            results_df = results_df[results_df['日付'] < pd.Timestamp(cutoff_date)]
-            results_df['日付'] = results_df['日付'].dt.strftime('%Y/%m/%d')
+            if not results_df.empty:
+                results_df['日付'] = pd.to_datetime(results_df['日付'], errors='coerce')
+                results_df = results_df[results_df['日付'] < pd.Timestamp(cutoff_date)]
+                results_df['日付'] = results_df['日付'].dt.strftime('%Y/%m/%d')
 
-        temp_horse_data.append({"id": hid, "pedigree": ped_data, "results": results_df})
-        progress_bar.progress((i + 1) / len(h_ids))
+            temp_horse_data.append({"id": hid, "pedigree": ped_data, "results": results_df})
+            progress_bar.progress((i + 1) / len(h_ids))
+        status_text.empty()
 
-    status_text.write("📊 出馬表（レース情報）を取得中...")
-    shutuba_df = scraper.scrape_shutuba_table(target_race_id)
-    race_info = scraper.scrape_race_info(target_race_id)
-    past_trend_df = scraper.scrape_past_top3_trend(target_race_id, years=5)
+        st.write(":material/table_chart: 出馬表・レース情報・過去5年傾向を取得中...")
+        shutuba_df = scraper.scrape_shutuba_table(target_race_id)
+        race_info = scraper.scrape_race_info(target_race_id)
+        past_trend_df = scraper.scrape_past_top3_trend(target_race_id, years=5)
 
-    status_text.write("🏇 騎手の当日成績を取得中...")
-    jockey_day_results_df = scraper.scrape_jockey_day_results(
-        target_race_id,
-        progress_callback=lambda no, total, rid: status_text.write(f"🏇 騎手の当日成績を取得中... {no}/{total}R ({rid})"),
-    )
-    jockey_day_form_df = build_jockey_day_form_table(jockey_day_results_df, shutuba_df)
+        st.write(":material/person: 騎手の当日成績を取得中...")
+        jockey_status = st.empty()
+        jockey_day_results_df = scraper.scrape_jockey_day_results(
+            target_race_id,
+            progress_callback=lambda no, total, rid: jockey_status.caption(f"{no}/{total}R ({rid})"),
+        )
+        jockey_status.empty()
+        jockey_day_form_df = build_jockey_day_form_table(jockey_day_results_df, shutuba_df)
 
-    status_text.empty()
-    progress_bar.empty()
+        status.update(label=f"データ取得完了（{len(h_ids)}頭）", state="complete", expanded=False)
 
     return {
         "all_horse_data": temp_horse_data,
@@ -257,7 +296,7 @@ def render_bet_plan_selector():
         st.rerun()
 
     if st.session_state.bet_plan_blocks:
-        st.markdown("#### 現在の買い方プラン")
+        st.caption("現在の買い方プラン")
         grand_total = 0
         remove_idx = None
         for idx, b in enumerate(st.session_state.bet_plan_blocks):
@@ -338,6 +377,25 @@ def build_full_ai_betting_prompt(race_id, max_budget, plan_blocks=None, use_full
 
     sections.extend(["", "【出馬表】", _df_to_prompt_table(shutuba_df, max_rows=24, max_cols=14)])
 
+    shutuba_model = _load_shutuba_model()
+    shutuba_model_prompt = format_shutuba_model_for_prompt(
+        st.session_state.get("shutuba_model_prediction"),
+        shutuba_model["metrics"] if shutuba_model else None,
+    )
+    if shutuba_model_prompt:
+        sections.extend(["", shutuba_model_prompt])
+
+    # 画面のStep1〜3（適用モデル・AI推奨馬ランキング・推奨買い目と資金配分）も同じ内容を渡す
+    steps_prompt = ml_ui.format_steps_for_prompt(
+        st.session_state.get("ml_prediction"),
+        st.session_state.race_volatility,
+        budget=int(st.session_state.get("ml_alloc_budget", 3000)),
+        top_k=int(st.session_state.get("ml_alloc_topk", 5)),
+        method=st.session_state.get("ml_alloc_method", "推奨度比例"),
+    )
+    if steps_prompt:
+        sections.extend(["", steps_prompt])
+
     if st.session_state.past_trend_df is not None and not st.session_state.past_trend_df.empty:
         sections.extend(["", "【同レース過去5年の1〜3着傾向】", _df_to_prompt_table(st.session_state.past_trend_df, max_rows=15, max_cols=10)])
 
@@ -352,10 +410,12 @@ def build_full_ai_betting_prompt(race_id, max_budget, plan_blocks=None, use_full
         name = ped.get("name", "不明")
         number = horse_number_by_name.get(str(name).replace(" ", "").strip(), "")
         results_df = horse.get("results", pd.DataFrame())
+        strong_sire = dirt_strong_sire(ped.get("sire"), race_info)
+        sire_note = f" ★父{strong_sire}はダート1400m以上の優秀種牡馬(プラス材料)" if strong_sire else ""
         sections.extend([
             "",
             f"■ {number}番 {name} (horse_id: {horse.get('id', '')})",
-            f"血統: 父={ped.get('sire', '不明')} / 母={ped.get('dam', '不明')} / 母父={ped.get('broodmare_sire', '不明')}",
+            f"血統: 父={ped.get('sire', '不明')} / 母={ped.get('dam', '不明')} / 母父={ped.get('broodmare_sire', '不明')}{sire_note}",
             f"簡易分析: 脚質={analyze_running_style(results_df)} / 馬場適性={analyze_track_preference(results_df)}",
             "過去10戦:",
             _df_to_prompt_table(results_df, max_rows=10, max_cols=14),
@@ -364,8 +424,20 @@ def build_full_ai_betting_prompt(race_id, max_budget, plan_blocks=None, use_full
     return "\n".join(sections)
 
 
-def run_full_ai_betting_analysis(race_id, max_budget, plan_blocks, use_full_budget=False):
-    prompt = build_full_ai_betting_prompt(race_id, max_budget, plan_blocks, use_full_budget)
+def build_gami_betting_prompt(race_id, budget, use_full_budget=False):
+    """Step1〜3の評価と現在オッズから、ガミが出ない買い方を組ませるプロンプト。AI予測がなければNone。"""
+    prediction = st.session_state.get("ml_prediction")
+    if prediction is None:
+        return None
+    with st.spinner("現在オッズを取得中..."):
+        odds_table = scraper.scrape_realtime_odds(race_id, GAMI_ODDS_TICKET_TYPES)
+    return build_gami_free_prompt(
+        race_id, st.session_state.race_info, prediction, st.session_state.race_volatility,
+        odds_table, budget, use_full_budget,
+    )
+
+
+def run_full_ai_betting_analysis(race_id, max_budget, prompt):
     targets = []
     if ai_choice in ["Gemini", "両方で比較"]:
         targets.append(("Gemini", ask_gemini))
@@ -374,7 +446,7 @@ def run_full_ai_betting_analysis(race_id, max_budget, plan_blocks, use_full_budg
 
     reports = {}
     for ai_name, ask_func in targets:
-        with st.spinner(f"{ai_name} が血統・過去10戦・出馬表から分析中..."):
+        with st.spinner(f"{ai_name} がAI評価と現在オッズからガミの出ない買い方を検討中..."):
             response = ask_func(prompt)
         reports[ai_name] = response
 
@@ -390,10 +462,24 @@ def run_full_ai_betting_analysis(race_id, max_budget, plan_blocks, use_full_budg
 
 
 # --- Streamlit UI ---
-st.sidebar.title("🏇 メニュー")
-app_mode = st.sidebar.radio("モード選択", ["単一レース予想", "バックテスト", "予想履歴", "My収支"], index=0)
+# ページ分け: 各ページの中身はこのファイルの下の方で app_mode ごとに描画する
+def _nav_page(title, icon, url_path, default=False):
+    return st.Page(lambda: None, title=title, icon=icon, url_path=url_path, default=default)
 
-with st.sidebar.expander("🗂️ HTML保存 / 一括テーブル生成", expanded=False):
+
+current_page = st.navigation({
+    "今日の予想": [_nav_page("単一レース予想", ":material/flag:", "predict", default=True)],
+    "成績分析": [
+        _nav_page("バックテスト", ":material/science:", "backtest"),
+        _nav_page("予想履歴", ":material/history:", "history"),
+        _nav_page("My収支", ":material/account_balance_wallet:", "balance"),
+    ],
+    "モデル説明": [_nav_page("モデル説明", ":material/psychology:", "model")],
+}, position="top")
+current_page.run()
+app_mode = current_page.title
+
+with sidebar_tools.expander("HTML保存 / 一括テーブル生成", icon=":material/folder_open:", expanded=False):
     st.caption("保存済みHTMLから一括でテーブルを作るための管理パネルです。")
     race_html_dir = st.text_input("レースHTML保存先", value="data/html/race")
     race_ids_text = st.text_area(
@@ -507,14 +593,13 @@ if app_mode == "バックテスト":
     @st.cache_data(ttl=3600, show_spinner=False)
     def get_race_date(race_id): return scraper.get_race_date(race_id)
 
-    st.title("🔄 予想バックテスト機能")
-    st.markdown("過去のレースIDを入力し、AI・ルールベースの予想精度（的中率・回収率）を検証します。結果はCSVに保存されます。")
+    st.caption("過去のレースIDを入力し、AI・ルールベースの予想精度（的中率・回収率）を検証します。結果はCSVに保存されます。")
     bt_models = st.multiselect("検証するモデル", ["Gemini", "ChatGPT", "ルールベース (AI不使用)"], default=["Gemini"])
     
     if "bt_race_ids_input" not in st.session_state:
         st.session_state.bt_race_ids_input = "202405020811\n202305020811"
 
-    with st.expander("💡 過去の同レースIDを一括生成する", expanded=False):
+    with st.expander("過去の同レースIDを一括生成する", icon=":material/lightbulb:", expanded=False):
         st.markdown("基準となるレースID（最新のIDなど）から、年数だけを遡ったレースIDを自動生成します。\n※年によって開催回や日数がずれるレースは正しくデータが取得できない場合があります（存在しないIDは自動スキップされます）。")
         col_gen1, col_gen2, col_gen3 = st.columns([2, 1, 1])
         with col_gen1:
@@ -533,7 +618,7 @@ if app_mode == "バックテスト":
                 else:
                     st.error("12桁の数字を入力してください。")
 
-    with st.expander("🏟️ その日の同会場の全レースIDを一括生成する", expanded=False):
+    with st.expander("その日の同会場の全レースIDを一括生成する", icon=":material/stadium:", expanded=False):
         st.markdown("基準となるレースID（例: 202610020601）から、同じ開催日・同じ会場の全レースIDを自動生成します（1Rから指定Rまで）。\n※実際の開催レース数より多く指定した場合、存在しないIDは自動スキップされます。")
         col_gen4, col_gen5, col_gen6 = st.columns([2, 1, 1])
         with col_gen4:
@@ -565,7 +650,7 @@ if app_mode == "バックテスト":
 
     col_bt_op1, col_bt_op2 = st.columns([4, 1])
     with col_bt_op1:
-        st.markdown("**✍️ あなたの予想・注目馬（AIへの指示や意見があれば入力してください）**")
+        st.caption(":material/edit: あなたの予想・注目馬（AIへの指示や意見があれば入力してください）")
 
     bt_user_opinion = st.text_area(
         "あなたの予想・注目馬",
@@ -574,7 +659,7 @@ if app_mode == "バックテスト":
         label_visibility="collapsed"
     )
 
-    st.markdown("#### 予算設定 (バックテスト用)")
+    st.caption("予算設定（バックテスト用）")
     bt_effective_budget = st.number_input(
         "1レースあたりの最大予算 (円)",
         min_value=0,
@@ -614,7 +699,7 @@ if app_mode == "バックテスト":
             except Exception as e:
                 st.error(f"バックテストML傾向の作成に失敗しました: {e}")
 
-    with st.expander("📊 EvaluatorクラスでCSV検証（AI vs 人気順）", expanded=False):
+    with st.expander("EvaluatorクラスでCSV検証（AI vs 人気順）", icon=":material/rule:", expanded=False):
         st.caption("prediction CSV と payout CSV をアップロードすると、evaluator.py のロジックで客観的指標を算出します。")
         ev_col1, ev_col2, ev_col3 = st.columns(3)
         with ev_col1:
@@ -725,14 +810,14 @@ if app_mode == "バックテスト":
                             summary_view[c] = summary_view[c].round(2)
 
                     st.success("Evaluatorでの比較が完了しました。")
-                    st.markdown("#### 全体サマリー")
+                    st.caption("全体サマリー")
                     st.dataframe(summary_view, use_container_width=True)
                     st.caption("戦略: model=AI予測スコア順 / popularity=人気順")
 
                     meta_candidates = {"distance", "track_condition", "field_size", "距離", "馬場", "馬場状態", "頭数"}
                     meta_cols = list(meta_candidates.intersection(detail_df.columns))
                     if meta_cols:
-                        st.markdown("#### レース条件別サマリー")
+                        st.caption("レース条件別サマリー")
                         tabs = st.tabs(meta_cols)
                         for tab, m_col in zip(tabs, meta_cols):
                             with tab:
@@ -767,13 +852,13 @@ if app_mode == "バックテスト":
                     summary_download = summary_view.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
                     dl_col1, dl_col2 = st.columns(2)
                     with dl_col1:
-                        st.download_button("📥 summary CSV", summary_download, file_name="evaluator_summary.csv", mime="text/csv")
+                        st.download_button("summary CSV", summary_download, icon=":material/download:", file_name="evaluator_summary.csv", mime="text/csv")
                     with dl_col2:
-                        st.download_button("📥 detail CSV", detail_download, file_name="evaluator_detail.csv", mime="text/csv")
+                        st.download_button("detail CSV", detail_download, icon=":material/download:", file_name="evaluator_detail.csv", mime="text/csv")
                 except Exception as e:
                     st.error(f"Evaluator実行中にエラーが発生しました: {e}")
 
-    with st.expander("📈 Feature Importance（LightGBM特徴量重要度）", expanded=False):
+    with st.expander("Feature Importance（LightGBM特徴量重要度）", icon=":material/insights:", expanded=False):
         st.caption("保存済みの data/race_html/*.html からレース結果表を読み取り、AIへ渡すデータ要素から result_rank を除外してLightGBMを一度学習します。result_time など結果後にしか分からない列は、実運用予測では引き続きリークに注意してください。")
         fi_col1, fi_col2 = st.columns([2, 1])
         with fi_col1:
@@ -896,6 +981,8 @@ if app_mode == "バックテスト":
                     blood_parts = []
                     if "blood_sire" in bt_selected_features:
                         blood_parts.append(f"父:{ped['sire']}")
+                        if dirt_strong_sire(ped.get("sire"), race_info):
+                            blood_parts.append("★ダート1400m以上の優秀種牡馬産駒(プラス材料)")
                     if "blood_dam" in bt_selected_features:
                         blood_parts.append(f"母:{ped['dam']}")
                     if "blood_broodmare_sire" in bt_selected_features:
@@ -966,6 +1053,17 @@ if app_mode == "バックテスト":
                     ai_res, bets = "", []
                     try:
                         if model == "ルールベース (AI不使用)":
+                            # 学習期間内のレースにモデルを使うと答えを知っている状態になるため、学習期間より後のレースだけ加点する
+                            bt_model_probs = {}
+                            bt_shutuba_model = _load_shutuba_model()
+                            train_end = (bt_shutuba_model or {}).get("metrics", {}).get("学習期間", [None, None])[1]
+                            if bt_shutuba_model and train_end and pd.Timestamp(race_date) > pd.Timestamp(train_end):
+                                try:
+                                    bt_model_probs = _shutuba_model_probs(predict_shutuba(
+                                        bt_shutuba_model, r_id, race_info, shutuba_df, horses_data, pd.Timestamp(race_date),
+                                    ))
+                                except Exception:
+                                    bt_model_probs = {}
                             rule_result = run_rule_based_analysis(
                                 horses_data,
                                 shutuba_df,
@@ -973,6 +1071,7 @@ if app_mode == "バックテスト":
                                 r_id,
                                 include_blood=bt_use_blood,
                                 jockey_day_form_df=bt_jockey_day_form_df,
+                                model_top3_probs=bt_model_probs,
                             )
                             rule_result["_volatility"] = bt_volatility
                             ai_res = generate_rule_based_summary(
@@ -1002,11 +1101,19 @@ if app_mode == "バックテスト":
                     results_log.append({"RaceID": r_id, "Model": model, "TotalBet": t_bet, "TotalReturn": t_ret, "Hits": hits, "HitRate": f"{h_rate:.1f}%", "ReturnRate": f"{r_rate:.1f}%"})
                 prog_bar.progress((i + 1) / len(bt_race_ids))
                 
-            prog_text.write("✅ バックテスト完了！")
-            st.subheader("📊 バックテスト結果サマリー")
+            prog_text.write(":material/check_circle: バックテスト完了")
             if results_log:
                 df_res = pd.DataFrame(results_log)
                 grp = df_res.groupby("Model").agg({"TotalBet": "sum", "TotalReturn": "sum"}).reset_index()
+                for model_name, model_rows in df_res.groupby("Model"):
+                    st.markdown(f"**{model_name}**")
+                    model_bet = model_rows["TotalBet"].sum()
+                    ml_ui.render_score_cards(
+                        len(model_rows),
+                        (model_rows["Hits"] > 0).mean(),
+                        model_rows["TotalReturn"].sum() / model_bet * 100 if model_bet > 0 else None,
+                        hit_label="的中レース率",
+                    )
                 grp["ReturnRate"] = (grp["TotalReturn"] / grp["TotalBet"] * 100).fillna(0).apply(lambda x: f"{x:.1f}%")
                 st.write("■ モデル別成績"); st.dataframe(grp, use_container_width=True)
                 tk_df = pd.DataFrame.from_dict(all_tk_stats, orient='index').reset_index().rename(columns={"index": "券種", "bet": "TotalBet", "return": "TotalReturn", "hits": "Hits"})
@@ -1014,11 +1121,10 @@ if app_mode == "バックテスト":
                     tk_df["ReturnRate"] = (tk_df["TotalReturn"] / tk_df["TotalBet"] * 100).fillna(0).apply(lambda x: f"{x:.1f}%")
                     st.write("■ 券種別成績"); st.dataframe(tk_df, use_container_width=True)
                 st.write("■ 詳細履歴"); st.dataframe(df_res, use_container_width=True)
-            with open(csv_file, 'rb') as f: st.download_button("📥 CSVをダウンロード", f, file_name="backtest_results.csv")
+            with open(csv_file, 'rb') as f: st.download_button("CSVをダウンロード", f, file_name="backtest_results.csv", icon=":material/download:")
     st.stop()
 
 if app_mode == "予想履歴":
-    st.title("📂 予想履歴")
     st.markdown("これまでにAIが予想した内容の履歴を確認できます。")
     
     log_file = "prediction_log.csv"
@@ -1035,7 +1141,7 @@ if app_mode == "予想履歴":
                     use_container_width=True
                 )
                 
-                st.markdown("### 📝 詳細確認")
+                st.caption(":material/search: 詳細確認")
                 selected_idx = st.selectbox(
                     "確認したい予想を選択してください", 
                     df_log.index, 
@@ -1049,7 +1155,7 @@ if app_mode == "予想履歴":
                     with st.expander("AIへの指示（プロンプト）"):
                         st.text(row.get("Prompt", "データなし"))
                         
-                    st.markdown("#### 🎯 AIの予想結果")
+                    st.caption("AIの予想結果")
                     st.write(row.get("Response", "データなし"))
         except Exception as e:
             st.error(f"履歴の読み込み中にエラーが発生しました: {e}")
@@ -1058,13 +1164,12 @@ if app_mode == "予想履歴":
     st.stop()
 
 if app_mode == "My収支":
-    st.title("💰 My収支")
     st.caption(
         "単一レース予想の「結果照合」でチェックを入れて保存した予想と、"
         "手動で入力した実際の購入結果をもとに、月別・年別・券種別の収支を確認できます。"
     )
 
-    with st.expander("✏️ 実際の購入結果を手動で追加", expanded=False):
+    with st.expander("実際の購入結果を手動で追加", icon=":material/edit:", expanded=False):
         st.caption("AIの提案どおりに買わなかった場合や、アプリ外で購入した馬券もここから記録できます。")
         mc1, mc2, mc3 = st.columns(3)
         with mc1:
@@ -1128,13 +1233,13 @@ if app_mode == "My収支":
     if period_df.empty:
         st.info("集計できる日付データがありません。")
     else:
-        st.markdown(f"#### {period_label}収支")
+        st.caption(f"{period_label}収支")
         st.bar_chart(period_df.set_index("period")[["収支"]])
         display_df = period_df.rename(columns={"period": "期間"}).copy()
         display_df["回収率"] = display_df["回収率"].astype(str) + "%"
         st.dataframe(display_df, use_container_width=True)
 
-    st.markdown("#### 🎫 券種別の収支（全期間）")
+    st.caption("券種別の収支（全期間）")
     ticket_summary_df = balance.summarize_by_ticket_type(balance_df)
     if ticket_summary_df.empty:
         st.caption("券種別のデータがありません。")
@@ -1143,7 +1248,7 @@ if app_mode == "My収支":
         ticket_display["回収率"] = ticket_display["回収率"].astype(str) + "%"
         st.dataframe(ticket_display, use_container_width=True)
 
-    with st.expander("📋 記録一覧（削除も可能）", expanded=False):
+    with st.expander("記録一覧（削除も可能）", icon=":material/list:", expanded=False):
         list_df = balance_df.sort_values("race_date", ascending=False).copy()
         list_df["race_date"] = list_df["race_date"].dt.strftime("%Y/%m/%d")
         show_cols = ["entry_id", "race_date", "race_id", "race_name", "source", "ticket_type", "total_bet", "total_return", "profit", "memo"]
@@ -1167,36 +1272,18 @@ if app_mode == "My収支":
 
     st.stop()
 
-st.markdown(
-    '<h1 class="app-title">競馬予想AI</h1>',
-    unsafe_allow_html=True,
-)
+if app_mode == "モデル説明":
+    ml_ui.render_model_explanation()
+    st.stop()
 
 if "race_id_input" not in st.session_state:
     st.session_state.race_id_input = ""
+if "prediction_date_input" not in st.session_state:
+    st.session_state.prediction_date_input = pd.Timestamp.now().date()
 if "pending_race_id_input" in st.session_state:
     st.session_state.race_id_input = st.session_state.pop("pending_race_id_input")
-
-race_id = st.text_input("Race IDを入力 (例: 202405020811)", key="race_id_input")
-prediction_date = st.date_input(
-    "予想の基準日（この日より前のデータのみ使用）", 
-    value=pd.Timestamp.now(),
-    min_value=pd.Timestamp("1980-01-01")
-)
-
-if "race_info_preview" not in st.session_state:
-    st.session_state.race_info_preview = None
-
-if st.button("このRace IDのレース情報を確認", use_container_width=True):
-    if not race_id:
-        st.warning("Race IDを入力してください")
-    else:
-        with st.spinner("レース情報を取得中..."):
-            st.session_state.race_info_preview = scraper.scrape_race_info(race_id)
-
-if st.session_state.race_info_preview and st.session_state.race_info_preview.get("race_id") == race_id:
-    preview = st.session_state.race_info_preview
-    st.info(f"{preview.get('name', '')} / {preview.get('data', '')}")
+if "pending_prediction_date" in st.session_state:
+    st.session_state.prediction_date_input = st.session_state.pop("pending_prediction_date")
 
 # --- データの保存場所を準備（コードの上のほう、ボタンより前に書いておく） ---
 if "all_horse_data" not in st.session_state:
@@ -1235,83 +1322,126 @@ if "gamiri_check_result" not in st.session_state:
     st.session_state.gamiri_check_result = None
 if "generated_ai_prompt" not in st.session_state:
     st.session_state.generated_ai_prompt = None
+if "race_info_preview" not in st.session_state:
+    st.session_state.race_info_preview = None
+if "ai_view" not in st.session_state:
+    st.session_state.ai_view = "AIの提案"
 
-with st.expander("当日レースID一覧から「堅い」レースを探す", expanded=False):
-    st.caption("当日のレースIDを複数貼り付けると、出馬表と過去5年傾向から荒れ具合を判定します。堅いレースはそのまま総合予想と買い目提案へ進めます。")
-    day_race_ids_text = st.text_area(
-        "当日レースID（改行 or カンマ区切り）",
-        value="",
-        height=100,
-        key="hard_race_ids_input",
-        placeholder="例:\n202405020811\n202405020812"
+# --- サイドバー: レースを選ぶ（開催日 → 競馬場 → レース番号、またはRace ID直接入力）→ データ取得 ---
+with sidebar_race:
+    pick_date = st.date_input("開催日", value=pd.Timestamp.now().date(), key="pick_race_date")
+    pick_race_ids = _race_ids_on_date(pick_date)
+    if not pick_race_ids:
+        st.caption("この日の中央競馬のレースが見つかりませんでした。")
+    else:
+        pick_cols = st.columns(2)
+        venues = sorted({rid[4:6] for rid in pick_race_ids})
+        pick_venue = pick_cols[0].selectbox(
+            "競馬場", venues, format_func=lambda code: PLACE_NAMES.get(int(code), code), key="pick_race_venue",
+        )
+        venue_race_ids = [rid for rid in pick_race_ids if rid[4:6] == pick_venue]
+        pick_race_id = pick_cols[1].selectbox(
+            "レース", venue_race_ids, format_func=lambda rid: f"{int(rid[10:12])}R", key="pick_race_number",
+        )
+        if st.button("このレースを選ぶ", icon=":material/check:", use_container_width=True, key="pick_race_apply"):
+            st.session_state.pending_race_id_input = pick_race_id
+            st.session_state.pending_prediction_date = pick_date
+            st.rerun()
+
+    race_id_cols = st.columns([5, 1], vertical_alignment="bottom")
+    race_id = race_id_cols[0].text_input("Race ID (例: 202405020811)", key="race_id_input")
+    preview_clicked = race_id_cols[1].button("", icon=":material/info:", type="tertiary",
+                                             help="このRace IDのレース情報を確認")
+    prediction_date = st.date_input(
+        "予想の基準日（この日より前のデータのみ使用）",
+        min_value=pd.Timestamp("1980-01-01"),
+        key="prediction_date_input",
     )
-
-    if st.button("堅いレースを判定", key="scan_hard_races", use_container_width=True):
-        day_race_ids = _parse_ids_input(day_race_ids_text)
-        if not day_race_ids:
-            st.warning("レースIDを入力してください。")
+    fetch_clicked = st.button("データ取得開始", type="primary", icon=":material/download:", use_container_width=True)
+    if preview_clicked:
+        if not race_id:
+            st.warning("Race IDを入力してください")
         else:
-            scan_rows = []
-            scan_progress = st.progress(0)
-            scan_status = st.empty()
-            for idx, rid in enumerate(day_race_ids, start=1):
-                scan_status.write(f"判定中: {rid} ({idx}/{len(day_race_ids)})")
-                try:
-                    scan_shutuba_df = scraper.scrape_shutuba_table(rid)
-                    scan_race_info = scraper.scrape_race_info(rid)
-                    scan_past_trend_df = scraper.scrape_past_top3_trend(rid, years=5)
-                    volatility = analyze_race_volatility(scan_shutuba_df, scan_past_trend_df)
-                    scan_rows.append({
-                        "race_id": rid,
-                        "レース名": scan_race_info.get("name", ""),
-                        "条件": scan_race_info.get("data", ""),
-                        "荒れ指数": volatility["score"],
-                        "判定": volatility["level"],
-                        "方針": volatility["summary"],
-                        "根拠": " / ".join(volatility.get("reasons", [])),
-                    })
-                except Exception as e:
-                    scan_rows.append({
-                        "race_id": rid,
-                        "レース名": "",
-                        "条件": "",
-                        "荒れ指数": None,
-                        "判定": "取得失敗",
-                        "方針": "",
-                        "根拠": str(e),
-                    })
-                scan_progress.progress(idx / len(day_race_ids))
-            scan_status.empty()
-            scan_progress.empty()
-            st.session_state.hard_race_scan_results = scan_rows
+            with st.spinner("レース情報を取得中..."):
+                st.session_state.race_info_preview = scraper.scrape_race_info(race_id)
+    if st.session_state.race_info_preview and st.session_state.race_info_preview.get("race_id") == race_id:
+        preview = st.session_state.race_info_preview
+        st.caption(f"{preview.get('name', '')} / {preview.get('data', '')}")
 
-    if st.session_state.hard_race_scan_results:
-        scan_df = pd.DataFrame(st.session_state.hard_race_scan_results)
-        hard_df = scan_df[scan_df["判定"] == "堅い"].copy()
-        st.dataframe(scan_df, use_container_width=True)
+    with sidebar_finder.expander("当日の「堅い」レースを探す", icon=":material/shield:", expanded=False):
+        st.caption("当日のレースIDを複数貼り付けると、出馬表と過去5年傾向から荒れ具合を判定します。堅いレースはそのまま総合予想と買い目提案へ進めます。")
+        day_race_ids_text = st.text_area(
+            "当日レースID（改行 or カンマ区切り）",
+            value="",
+            height=100,
+            key="hard_race_ids_input",
+            placeholder="例:\n202405020811\n202405020812"
+        )
 
-        if hard_df.empty:
-            st.info("今回の一覧には、判定が「堅い」のレースは見つかりませんでした。")
-        else:
-            st.success(f"堅いレース候補: {len(hard_df)}件")
-            selected_hard_race = st.selectbox(
-                "総合予想へ進むレース",
-                hard_df["race_id"].tolist(),
-                format_func=lambda rid: f"{rid} - {hard_df.loc[hard_df['race_id'] == rid, 'レース名'].iloc[0]}",
-                key="selected_hard_race_id"
-            )
-            if st.button("この堅いレースで総合予想へ進む", key="load_selected_hard_race", use_container_width=True):
-                st.session_state.pending_race_id_input = selected_hard_race
-                with st.spinner("選択した堅いレースの詳細データを取得中..."):
+        if st.button("堅いレースを判定", key="scan_hard_races", use_container_width=True):
+            day_race_ids = _parse_ids_input(day_race_ids_text)
+            if not day_race_ids:
+                st.warning("レースIDを入力してください。")
+            else:
+                scan_rows = []
+                scan_progress = st.progress(0)
+                scan_status = st.empty()
+                for idx, rid in enumerate(day_race_ids, start=1):
+                    scan_status.write(f"判定中: {rid} ({idx}/{len(day_race_ids)})")
+                    try:
+                        scan_shutuba_df = scraper.scrape_shutuba_table(rid)
+                        scan_race_info = scraper.scrape_race_info(rid)
+                        scan_past_trend_df = scraper.scrape_past_top3_trend(rid, years=5)
+                        volatility = analyze_race_volatility(scan_shutuba_df, scan_past_trend_df)
+                        scan_rows.append({
+                            "race_id": rid,
+                            "レース名": scan_race_info.get("name", ""),
+                            "条件": scan_race_info.get("data", ""),
+                            "荒れ指数": volatility["score"],
+                            "判定": volatility["level"],
+                            "方針": volatility["summary"],
+                            "根拠": " / ".join(volatility.get("reasons", [])),
+                        })
+                    except Exception as e:
+                        scan_rows.append({
+                            "race_id": rid,
+                            "レース名": "",
+                            "条件": "",
+                            "荒れ指数": None,
+                            "判定": "取得失敗",
+                            "方針": "",
+                            "根拠": str(e),
+                        })
+                    scan_progress.progress(idx / len(day_race_ids))
+                scan_status.empty()
+                scan_progress.empty()
+                st.session_state.hard_race_scan_results = scan_rows
+
+        if st.session_state.hard_race_scan_results:
+            scan_df = pd.DataFrame(st.session_state.hard_race_scan_results)
+            hard_df = scan_df[scan_df["判定"] == "堅い"].copy()
+            st.dataframe(scan_df, use_container_width=True)
+
+            if hard_df.empty:
+                st.info("今回の一覧には、判定が「堅い」のレースは見つかりませんでした。")
+            else:
+                st.success(f"堅いレース候補: {len(hard_df)}件")
+                selected_hard_race = st.selectbox(
+                    "総合予想へ進むレース",
+                    hard_df["race_id"].tolist(),
+                    format_func=lambda rid: f"{rid} - {hard_df.loc[hard_df['race_id'] == rid, 'レース名'].iloc[0]}",
+                    key="selected_hard_race_id"
+                )
+                if st.button("この堅いレースで総合予想へ進む", key="load_selected_hard_race", use_container_width=True):
+                    st.session_state.pending_race_id_input = selected_hard_race
                     race_data = collect_single_race_data(selected_hard_race, prediction_date)
-                if race_data is None:
-                    st.error("出走馬が見つかりませんでした。")
-                else:
-                    save_single_race_data(race_data)
-                    st.rerun()
-
-# --- AI予想開始ボタン ---
-if st.button("データ取得開始"):
+                    if race_data is None:
+                        st.error("出走馬が見つかりませんでした。")
+                    else:
+                        save_single_race_data(race_data)
+                        st.rerun()
+# --- データ取得（進み具合は本文に表示する） ---
+if fetch_clicked:
     if ai_choice in ["Gemini", "両方で比較"] and not API_KEY_GEMINI:
         st.error("Gemini APIキーがありません")
     elif ai_choice in ["ChatGPT", "両方で比較"] and not API_KEY_OPENAI:
@@ -1319,33 +1449,51 @@ if st.button("データ取得開始"):
     elif not race_id:
         st.warning("Race IDを入力してください")
     else:
-        with st.spinner("出走馬データを収集中..."):
-            race_data = collect_single_race_data(race_id, prediction_date)
-            if race_data is None:
-                st.error("出走馬が見つかりませんでした。")
-            else:
-                save_single_race_data(race_data)
-                st.rerun()
+        race_data = collect_single_race_data(race_id, prediction_date)
+        if race_data is None:
+            st.error("出走馬が見つかりませんでした。")
+        else:
+            save_single_race_data(race_data)
+            st.rerun()
 
-# --- ここから表示フェーズ（データがあるときだけ自動で表示される） ---
-if st.session_state.all_horse_data:
-    r_info = st.session_state.race_info or {}
-    volatility = st.session_state.race_volatility
-    shutuba_df_view = st.session_state.shutuba_table
+# レース未取得のあいだは netkeiba をそのまま埋め込んで表示する(netkeiba 側は iframe 表示を禁止していない)
+NETKEIBA_EMBED_PAGES = {
+    ":material/event: 開催レース": "https://race.netkeiba.com/top/",
+    ":material/newspaper: ニュース": "https://news.netkeiba.com/",
+    ":material/database: データベース": "https://db.netkeiba.com/",
+}
 
-    # --- LightGBM カテゴリ別モデルによる予測（レース・モデル・基準日が変わったときだけ再計算） ---
-    model_mode_label = st.radio(
-        "予測モデル",
-        ["カテゴリ別モデル（芝・ダート×距離帯）", "全体モデル（全条件共通）"],
-        horizontal=True,
-        key="ml_model_mode",
-        help="カテゴリ別: ダート1200-1600m / ダート1700-2500m / 芝1200-1600m / 芝1700-2400m / 芝2500-3200m の5モデルから、レース条件に合うものを自動選択します。",
-    )
-    model_mode = "category" if model_mode_label.startswith("カテゴリ") else "global"
-    current_race_id = r_info.get("race_id") or race_id
-    ml_cache_key = (current_race_id, model_mode, str(prediction_date), id(st.session_state.all_horse_data))
-    if st.session_state.get("ml_prediction_key") != ml_cache_key:
-        try:
+if not st.session_state.all_horse_data:
+    embed_cols = st.columns([3, 2], vertical_alignment="center")
+    with embed_cols[0]:
+        embed_page = st.segmented_control(
+            "netkeiba", list(NETKEIBA_EMBED_PAGES), key="netkeiba_embed_page", label_visibility="collapsed"
+        ) or next(iter(NETKEIBA_EMBED_PAGES))
+    with embed_cols[1]:
+        st.caption(":material/left_panel_open: サイドバーでレースを選び、「データ取得開始」を押すと予想画面に切り替わります。")
+    with st.container(key="netkeiba_embed"):
+        components.iframe(NETKEIBA_EMBED_PAGES[embed_page], height=640, scrolling=True)
+    st.stop()
+
+# --- ここから表示フェーズ（データがあるときだけ表示）。1画面に収まるよう、タブ + 高さ固定のパネルで構成する ---
+r_info = st.session_state.race_info or {}
+volatility = st.session_state.race_volatility
+shutuba_df_view = st.session_state.shutuba_table
+
+# --- LightGBM カテゴリ別モデルによる予測（レース・モデル・基準日が変わったときだけ再計算） ---
+model_mode_label = sidebar_settings.selectbox(
+    "予測モデル",
+    ["カテゴリ別", "全体"],
+    key="ml_model_choice",
+    help="カテゴリ別: ダート1200-1600m / ダート1700-2500m / 芝1200-1600m / 芝1700-2400m / 芝2500-3200m の5モデルから、"
+         "レース条件に合うものを自動選択します。全体: 全条件共通のモデルです。",
+)
+model_mode = "category" if model_mode_label.startswith("カテゴリ") else "global"
+current_race_id = r_info.get("race_id") or race_id
+ml_cache_key = (current_race_id, model_mode, str(prediction_date), id(st.session_state.all_horse_data))
+if st.session_state.get("ml_prediction_key") != ml_cache_key:
+    try:
+        with st.spinner("AIモデル（カテゴリ別/全体）で予測中..."):
             st.session_state.ml_prediction = predict_race(
                 current_race_id,
                 r_info,
@@ -1355,64 +1503,111 @@ if st.session_state.all_horse_data:
                 _load_ml_reference(),
                 model_mode=model_mode,
             )
-            st.session_state.ml_prediction_error = None
+        st.session_state.ml_prediction_error = None
+    except Exception as e:
+        st.session_state.ml_prediction = None
+        st.session_state.ml_prediction_error = str(e)
+    st.session_state.ml_prediction_key = ml_cache_key
+ml_prediction = st.session_state.get("ml_prediction")
+
+# --- 収集レースで学習した出馬表モデル（検証に合格して採用されたもの）による3着以内確率 ---
+shutuba_model = _load_shutuba_model()
+shutuba_model_key = (current_race_id, str(prediction_date), id(st.session_state.all_horse_data))
+if st.session_state.get("shutuba_model_key") != shutuba_model_key:
+    st.session_state.shutuba_model_prediction = None
+    st.session_state.shutuba_model_error = None
+    if shutuba_model is not None:
+        try:
+            with st.spinner("出馬表モデルで予測中..."):
+                st.session_state.shutuba_model_prediction = predict_shutuba(
+                    shutuba_model,
+                    current_race_id,
+                    r_info,
+                    shutuba_df_view,
+                    st.session_state.all_horse_data,
+                    pd.Timestamp(prediction_date),
+                )
         except Exception as e:
-            st.session_state.ml_prediction = None
-            st.session_state.ml_prediction_error = str(e)
-        st.session_state.ml_prediction_key = ml_cache_key
-    ml_prediction = st.session_state.get("ml_prediction")
+            st.session_state.shutuba_model_error = f"出馬表モデルで予測できませんでした: {e}"
+    st.session_state.shutuba_model_key = shutuba_model_key
+shutuba_model_prediction = st.session_state.get("shutuba_model_prediction")
 
-    # 【Step 1】レース概況・適用モデルバッジ
-    ml_ui.render_race_overview(r_info, ml_prediction, volatility)
-    if volatility:
-        st.info(f"波乱度の方針: {volatility['summary']}"
-                + (f"（根拠: {' / '.join(volatility['reasons'])}）" if volatility.get("reasons") else ""))
+# 【Step 1】レース概況・適用モデル（バッジ1行 + 注記1行）
+ml_ui.render_race_overview(r_info, ml_prediction, volatility)
 
+# key を付けて、ボタン操作で再実行されても選んでいたタブのまま表示する
+tab_predict, tab_entries, tab_history, tab_tickets, tab_ai, tab_chat, tab_result = st.tabs([
+    ":material/star: 予想", ":material/table_chart: 出馬表", ":material/history: 過去成績",
+    ":material/confirmation_number: 買い目", ":material/auto_awesome: AI提案", ":material/forum: 相談",
+    ":material/fact_check: 結果照合",
+], key="race_view_tabs")
+
+with tab_predict, st.container(key="panel_predict"):
     if ml_prediction is None:
-        st.warning(f"AIモデルでの予測ができませんでした: {st.session_state.get('ml_prediction_error')}")
+        st.warning(f"AIモデルでの予測ができませんでした: {st.session_state.get('ml_prediction_error')}",
+                   icon=":material/warning:")
     else:
-        pred_df = ml_prediction["predictions"]
-        st.markdown("---")
         # 【Step 2】AI推奨馬ランキング（上位5頭）
-        ml_ui.render_top_horse_cards(pred_df, win_prob_method=ml_prediction["win_prob_method"])
-        st.markdown("---")
-        # 【Step 3】馬券戦略・買い目カード + 資金配分シミュレータ
-        ml_ui.render_ticket_strategy(pred_df, volatility)
+        ml_ui.render_top_horse_cards(ml_prediction["predictions"], win_prob_method=ml_prediction["win_prob_method"])
 
-    st.markdown("---")
-    st.subheader("🔎 詳細分析")
-    (
-        tab_entries, tab_importance, tab_pace, tab_compare,
-        tab_trend, tab_jockey, tab_pedigree, tab_horses,
-    ) = st.tabs([
-        "出走表全データ", "特徴量重要度", "過去走ペース比較", "対戦表",
-        "過去5年傾向", "騎手当日成績", "血統", "各馬の戦績",
-    ])
-
-    with tab_entries:
-        if ml_prediction is not None:
-            st.markdown("**AI予測（全頭）**")
-            ml_ui.render_prediction_table(ml_prediction["predictions"])
-        if shutuba_df_view is not None and not shutuba_df_view.empty:
-            st.markdown("**本レース出馬表（馬番・騎手・斤量・馬体重など）**")
-            st.dataframe(shutuba_df_view, use_container_width=True)
-        if volatility:
-            st.markdown("**荒れ具合と推奨購入点数**")
-            st.dataframe(pd.DataFrame(volatility["ticket_rows"]), use_container_width=True, hide_index=True)
-
-    with tab_importance:
+    horse_numbers = _horse_number_lookup(shutuba_df_view)
+    strong_sire_horses = []
+    for horse in st.session_state.all_horse_data:
+        sire_name = dirt_strong_sire(horse["pedigree"].get("sire"), r_info)
+        if sire_name:
+            horse_name = horse["pedigree"].get("name", "")
+            number = horse_numbers.get(str(horse_name).replace(" ", "").strip(), "")
+            strong_sire_horses.append(f"{number}番 {horse_name}（父{sire_name}）")
+    info_cols = st.columns([3, 1], vertical_alignment="center")
+    if strong_sire_horses:
+        info_cols[0].success("ダート1400m以上の優秀種牡馬産駒（プラス材料）: " + " / ".join(strong_sire_horses),
+                             icon=":material/genetics:")
+    with info_cols[1].popover("モデルの根拠", icon=":material/insights:", use_container_width=True):
         if ml_prediction is not None:
             ml_ui.render_feature_importance(ml_prediction["model_key"])
         else:
             st.caption("予測モデルが利用できません。")
 
-    with tab_pace:
+with tab_entries, st.container(key="panel_entries"):
+    entry_views = ["AI予測（全頭）", "出馬表モデル", "出馬表", "荒れ具合と推奨点数"]
+    entry_view = st.segmented_control(
+        "表示する表", entry_views, default=entry_views[0], key="entries_view", label_visibility="collapsed",
+    ) or entry_views[0]
+    if entry_view == "AI予測（全頭）":
+        if ml_prediction is not None:
+            ml_ui.render_prediction_table(ml_prediction["predictions"])
+        else:
+            st.caption("予測モデルが利用できません。")
+    elif entry_view == "出馬表モデル":
+        ml_ui.render_shutuba_model(
+            shutuba_model_prediction,
+            shutuba_model["metrics"] if shutuba_model else None,
+            st.session_state.get("shutuba_model_error"),
+        )
+    elif entry_view == "出馬表":
+        if shutuba_df_view is not None and not shutuba_df_view.empty:
+            st.dataframe(shutuba_df_view, use_container_width=True, hide_index=True)
+        else:
+            st.caption("出馬表がありません。")
+    elif volatility:
+        st.dataframe(pd.DataFrame(volatility["ticket_rows"]), use_container_width=True, hide_index=True)
+        if volatility.get("reasons"):
+            st.caption("根拠: " + " / ".join(volatility["reasons"]))
+    else:
+        st.caption("荒れ具合を判定できませんでした。")
+
+with tab_history, st.container(key="panel_history"):
+    (
+        sub_pace, sub_compare, sub_trend, sub_jockey, sub_pedigree, sub_horses,
+    ) = st.tabs(["過去走ペース比較", "対戦表", "過去5年傾向", "騎手当日成績", "血統", "各馬の戦績"], key="history_tabs")
+
+    with sub_pace:
         if ml_prediction is not None:
             ml_ui.render_pace_comparison(ml_prediction["predictions"], st.session_state.all_horse_data)
         else:
             st.caption("予測モデルが利用できません。")
 
-    with tab_compare:
+    with sub_compare:
         race_compare_count = st.slider("表示する比較レース数", min_value=3, max_value=12, value=8, step=1)
         race_comparison_df = _build_race_comparison_table(
             st.session_state.all_horse_data,
@@ -1423,16 +1618,16 @@ if st.session_state.all_horse_data:
             st.caption("今回の出走馬同士で共通出走したレースが見つかりませんでした。")
         else:
             st.caption("同じレースに出走していた馬の着順・タイムを横並びで比較できます（1〜3着は色付き）。")
-            st.dataframe(_style_race_comparison(race_comparison_df), use_container_width=True, height=600)
+            st.dataframe(_style_race_comparison(race_comparison_df), use_container_width=True)
 
-    with tab_trend:
+    with sub_trend:
         if st.session_state.past_trend_df is not None and not st.session_state.past_trend_df.empty:
             st.caption("同レース過去5年の1〜3着。馬番・騎手・コーナー通過順・人気を重点表示")
             st.dataframe(st.session_state.past_trend_df, use_container_width=True)
         else:
             st.caption("同レースの過去傾向データがありません。")
 
-    with tab_jockey:
+    with sub_jockey:
         jockey_form_df = st.session_state.jockey_day_form
         if jockey_form_df is None or jockey_form_df.empty or not (jockey_form_df["当日騎乗"] > 0).any():
             st.caption("同日・同競馬場で本レースより前の結果が見つかりませんでした（第1レース、または当日の結果が未確定です）。")
@@ -1444,14 +1639,14 @@ if st.session_state.all_horse_data:
             )
             st.dataframe(jockey_form_df, use_container_width=True, hide_index=True)
 
-    with tab_pedigree:
+    with sub_pedigree:
         df_pedigree = pd.DataFrame(st.session_state.pedigree_list)
         df_pedigree = df_pedigree.rename(columns={
             "horse_id": "馬ID", "name": "馬名", "sire": "父", "dam": "母", "broodmare_sire": "母父"
         })
-        st.dataframe(df_pedigree, use_container_width=True)
+        st.dataframe(df_pedigree, use_container_width=True, hide_index=True)
 
-    with tab_horses:
+    with sub_horses:
         for horse in st.session_state.all_horse_data:
             with st.expander(f"{horse['pedigree']['name']} (ID: {horse['id']})"):
                 running_style = analyze_running_style(horse['results'])
@@ -1463,28 +1658,40 @@ if st.session_state.all_horse_data:
                 else:
                     st.write("戦績データがありません。")
 
-    st.markdown("---")
-    st.subheader("🚀 AI総合予想と賭け方提案")
-    st.caption("血統、各馬の過去10戦、出馬表をAIへ渡してレース分析を行います。買い方プランを指定しない場合は、最大予算内でAIが自由に買い目を提案します。")
+with tab_tickets, st.container(key="panel_tickets"):
+    if ml_prediction is None:
+        st.caption("予測モデルが利用できないため、買い目を作れません。")
+    else:
+        # 【Step 3】馬券戦略・買い目（左）+ 資金配分シミュレータ（右）
+        ticket_left, ticket_right = st.columns(2)
+        with ticket_left:
+            ml_ui.render_ticket_strategy(ml_prediction["predictions"], volatility)
+        with ticket_right:
+            ml_ui.render_budget_simulator(ml_prediction["predictions"])
 
-    with st.expander("🎯 買い方セレクト（券種・方式・目標点数・配分）", expanded=True):
-        render_bet_plan_selector()
+with tab_ai, st.container(key="panel_ai"):
+    ai_left, ai_right = st.columns([1, 2])
+    with ai_left:
+        st.caption(
+            "各馬の能力評価はStep1〜3の機械学習モデルに任せ、AIにはその評価と現在オッズを渡して、"
+            "どの買い目が的中しても払戻が購入合計を下回らない（ガミが出ない）券種・組み合わせ・金額配分を組ませます。"
+        )
+        with st.expander("買い方プラン（任意）", icon=":material/tune:", expanded=False):
+            render_bet_plan_selector()
 
-    plan_blocks = st.session_state.bet_plan_blocks
-    plan_total = sum(bet_plans.block_total_amount(b) for b in plan_blocks)
+        plan_blocks = st.session_state.bet_plan_blocks
+        plan_total = sum(bet_plans.block_total_amount(b) for b in plan_blocks)
 
-    full_cols = st.columns([1, 1])
-    with full_cols[0]:
         full_max_budget = st.number_input(
-            "最大予算 (円) ※買い方プラン未指定時にAIが自由提案する上限",
+            "最大予算 (円)",
             min_value=0,
             max_value=1000000,
             value=1000,
             step=100,
             key="full_ai_max_budget",
             disabled=bool(plan_blocks),
+            help="買い方プランを指定していないときに、AIが買い方を組む上限です。",
         )
-    with full_cols[1]:
         use_full_budget = st.checkbox(
             "最大予算をすべて使う",
             value=False,
@@ -1492,178 +1699,211 @@ if st.session_state.all_horse_data:
             disabled=bool(plan_blocks),
         )
 
-    if plan_blocks:
-        st.success(f"買い方プランが指定されています（見積合計{plan_total}円）。この点数・配分を目安にAIが馬番を選んで買い目を提案します。")
-    else:
-        st.caption("買い方プランが未指定のため、AIが最大予算内で買い方を自由に提案します。")
+        # ガミ回避の提案では、買い方プランの見積合計を予算として使う（券種・点数はガミ回避を優先してAIが決める）
+        gami_budget = int(plan_total) if plan_blocks else int(full_max_budget)
+        if plan_blocks:
+            st.caption(f":material/check: 買い方プランの見積合計{plan_total}円を予算にします。")
 
-    if st.button("血統・過去10戦・出馬表からAI分析して買い方を提案", use_container_width=True):
-        if ai_choice == "ルールベース (AI不使用)":
-            st.warning("AI総合予想はGeminiまたはChatGPTを選んでください。")
-        elif ai_choice in ["Gemini", "両方で比較"] and not API_KEY_GEMINI:
-            st.error("Gemini APIキーがありません")
-        elif ai_choice in ["ChatGPT", "両方で比較"] and not API_KEY_OPENAI:
-            st.error("OpenAI APIキーがありません")
-        else:
-            st.session_state.full_ai_reports = run_full_ai_betting_analysis(
-                race_id,
-                int(full_max_budget),
-                plan_blocks,
-                use_full_budget,
-            )
-            for model_name, response in st.session_state.full_ai_reports.items():
-                st.session_state.latest_predictions[model_name] = {
+        if st.button("AIに買い方を提案させる", type="primary", icon=":material/auto_awesome:",
+                     use_container_width=True, help="ガミが出ない券種・組み合わせ・金額配分をAIが組みます。"):
+            if ai_choice == "ルールベース (AI不使用)":
+                rule_result = run_rule_based_analysis(
+                    st.session_state.all_horse_data,
+                    st.session_state.shutuba_table,
+                    st.session_state.race_info,
+                    race_id,
+                    jockey_day_form_df=st.session_state.jockey_day_form,
+                    # 出馬表モデルが未採用のときは、Step2のAI推奨ランキングの3着内確率を使う
+                    model_top3_probs=_shutuba_model_probs(shutuba_model_prediction) or _shutuba_model_probs(ml_prediction),
+                )
+                rule_result["_volatility"] = st.session_state.race_volatility
+                response = generate_rule_based_summary(rule_result, int(full_max_budget), [], "おまかせ")
+                st.session_state.full_ai_reports = {"ルールベース (AI不使用)": response}
+                st.session_state.latest_predictions["ルールベース (AI不使用)"] = {
                     "race_id": race_id,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "bets": extract_bets_from_text(response),
                     "response": response,
                 }
-            st.rerun()
+                st.session_state.ai_view = "AIの提案"
+                st.rerun()
+            elif ai_choice in ["Gemini", "両方で比較"] and not API_KEY_GEMINI:
+                st.error("Gemini APIキーがありません")
+            elif ai_choice in ["ChatGPT", "両方で比較"] and not API_KEY_OPENAI:
+                st.error("OpenAI APIキーがありません")
+            elif (gami_prompt := build_gami_betting_prompt(race_id, gami_budget, use_full_budget)) is None:
+                st.error("Step1〜3のAI予測が出ていないため、ガミ回避の買い方を組めません。")
+            else:
+                st.session_state.full_ai_reports = run_full_ai_betting_analysis(race_id, gami_budget, gami_prompt)
+                for model_name, response in st.session_state.full_ai_reports.items():
+                    st.session_state.latest_predictions[model_name] = {
+                        "race_id": race_id,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "bets": extract_bets_from_text(response),
+                        "response": response,
+                    }
+                st.session_state.ai_view = "AIの提案"
+                st.rerun()
 
-    if st.session_state.full_ai_reports:
-        st.markdown("### AI総合予想結果")
-        for model_name, response in st.session_state.full_ai_reports.items():
-            with st.expander(f"{model_name} の分析・推奨賭け金・買い目", expanded=True):
-                st.write(response)
+        if st.button("プロンプトを出力", icon=":material/content_copy:",
+                     use_container_width=True, key="generate_shareable_prompt",
+                     help="APIを使わず、上のボタンと同じプロンプトをテキストで出力します。任意のAIチャットに貼り付けて使えます。"):
+            shareable_prompt = build_gami_betting_prompt(race_id, gami_budget, use_full_budget)
+            if shareable_prompt is None:
+                st.error("Step1〜3のAI予測が出ていないため、プロンプトを作れません。")
+            else:
+                st.session_state.generated_ai_prompt = shareable_prompt
+                st.session_state.ai_view = "プロンプト"
+                st.rerun()
 
-    st.markdown("---")
-    st.subheader("📋 他のAI（Claudeなど）に渡すプロンプトを出力")
-    st.caption(
-        "GeminiやChatGPTのAPIを使わず、血統・過去10戦・出馬表など取得済みデータをすべて含んだプロンプトをテキストで出力します。"
-        "これをコピーしてClaudeなど任意のAIチャットに貼り付けるだけで、同じ分析・買い目提案を依頼できます。"
-    )
-    if st.button("📋 AIに渡すプロンプトを出力", use_container_width=True, key="generate_shareable_prompt"):
-        st.session_state.generated_ai_prompt = build_full_ai_betting_prompt(
-            race_id,
-            int(full_max_budget),
-            plan_blocks,
-            use_full_budget,
-        )
-        st.rerun()
+    with ai_right:
+        ai_view = st.segmented_control(
+            "表示", ["AIの提案", "プロンプト", "ガミチェック"], key="ai_view", label_visibility="collapsed",
+        ) or "AIの提案"
 
-    if st.session_state.generated_ai_prompt:
-        st.text_area(
-            "生成されたプロンプト（全選択してコピーし、Claudeなど任意のAIに貼り付けてください）",
-            value=st.session_state.generated_ai_prompt,
-            height=400,
-            key="generated_ai_prompt_display",
-        )
-        st.download_button(
-            "📥 プロンプトをテキストファイルでダウンロード",
-            data=st.session_state.generated_ai_prompt,
-            file_name=f"ai_prompt_{race_id}.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
+        if ai_view == "AIの提案":
+            if not st.session_state.full_ai_reports:
+                st.caption("左のボタンを押すと、ここにAIの提案（買い目・金額・ガミ検算）が表示されます。")
+            for model_name, response in st.session_state.full_ai_reports.items():
+                if len(st.session_state.full_ai_reports) > 1:
+                    st.caption(model_name)
+                with st.container(border=True):
+                    st.write(response)
 
-        st.markdown("---")
-        st.subheader("🔍 オッズ確認・ガミリチェック（購入前）")
-        st.caption(
-            "現在のオッズを取得し、買い目のどれかが的中しても購入合計額を下回ってしまう"
-            "「ガミリ」が起きていないかを購入前にチェックします。"
-        )
-        gamiri_target_models = [
-            model_name for model_name, pred in st.session_state.latest_predictions.items()
-            if pred.get("race_id") == race_id and pred.get("bets")
-        ]
-        if not gamiri_target_models:
-            st.caption("買い目JSONが取得できているAI予想がないため、チェックできません。")
+        elif ai_view == "プロンプト":
+            if not st.session_state.generated_ai_prompt:
+                st.caption("左の「プロンプトを出力」を押すと、ここに表示されます。")
+            else:
+                st.text_area(
+                    "生成されたプロンプト（全選択してコピーし、Claudeなど任意のAIに貼り付けてください）",
+                    value=st.session_state.generated_ai_prompt,
+                    height=320,
+                    key="generated_ai_prompt_display",
+                )
+                st.download_button(
+                    "テキストファイルでダウンロード",
+                    data=st.session_state.generated_ai_prompt,
+                    file_name=f"ai_prompt_{race_id}.txt",
+                    mime="text/plain",
+                    icon=":material/download:",
+                    use_container_width=True,
+                )
+
         else:
-            gamiri_model = st.selectbox("チェックする予想", gamiri_target_models, key="gamiri_model_select")
-            if st.button("最新オッズを取得してガミリをチェック", key="gamiri_check_button"):
-                target_bets = st.session_state.latest_predictions[gamiri_model]["bets"]
-                ticket_types_needed = sorted({b.get("type", "") for b in target_bets if b.get("type")})
-                with st.spinner("最新オッズを取得中..."):
-                    odds_data = scraper.scrape_realtime_odds(race_id, ticket_types_needed)
-                rows, total_bet = check_gamiri(target_bets, odds_data)
-                st.session_state.gamiri_check_result = {
-                    "model": gamiri_model, "race_id": race_id, "rows": rows, "total_bet": total_bet,
-                }
+            st.caption(
+                "現在のオッズを取得し、買い目のどれかが的中しても購入合計額を下回ってしまう"
+                "「ガミリ」が起きていないかを購入前にチェックします。"
+            )
+            gamiri_target_models = [
+                model_name for model_name, pred in st.session_state.latest_predictions.items()
+                if pred.get("race_id") == race_id and pred.get("bets")
+            ]
+            if not gamiri_target_models:
+                st.caption("買い目JSONが取得できているAI予想がないため、チェックできません。")
+            else:
+                gamiri_cols = st.columns([2, 1], vertical_alignment="bottom")
+                gamiri_model = gamiri_cols[0].selectbox("チェックする予想", gamiri_target_models, key="gamiri_model_select")
+                if gamiri_cols[1].button("最新オッズでチェック", icon=":material/refresh:", key="gamiri_check_button",
+                                         use_container_width=True):
+                    target_bets = st.session_state.latest_predictions[gamiri_model]["bets"]
+                    ticket_types_needed = sorted({b.get("type", "") for b in target_bets if b.get("type")})
+                    with st.spinner("最新オッズを取得中..."):
+                        odds_data = scraper.scrape_realtime_odds(race_id, ticket_types_needed)
+                    rows, total_bet = check_gamiri(target_bets, odds_data)
+                    st.session_state.gamiri_check_result = {
+                        "model": gamiri_model, "race_id": race_id, "rows": rows, "total_bet": total_bet,
+                    }
 
-            gamiri_result = st.session_state.get("gamiri_check_result")
-            if gamiri_result and gamiri_result.get("model") == gamiri_model and gamiri_result.get("race_id") == race_id:
-                rows = gamiri_result["rows"]
-                total_bet = gamiri_result["total_bet"]
-                if not rows:
-                    st.info("有効な買い目がありません。")
-                else:
-                    df_rows = pd.DataFrame(rows)
-                    display_df = df_rows.rename(columns={
-                        "type": "券種", "combo": "組み合わせ", "amount": "購入額",
-                        "odds": "現在オッズ", "est_return": "的中時の推定払戻", "profit": "購入合計との損益",
-                    }).copy()
-                    display_df["判定"] = df_rows["is_gamiri"].map(
-                        lambda x: "⚠️ ガミリ" if x is True else ("✅ 問題なし" if x is False else "オッズ取得不可")
-                    )
-                    st.dataframe(display_df.drop(columns=["is_gamiri"]), use_container_width=True)
-                    st.caption(f"購入合計: {total_bet}円（ワイド・複勝は最低オッズで保守的に計算しています）")
-
-                    gamiri_rows = df_rows[df_rows["is_gamiri"] == True]
-                    not_found_rows = df_rows[df_rows["is_gamiri"].isna()]
-                    if not gamiri_rows.empty:
-                        st.warning(
-                            f"⚠️ {len(gamiri_rows)}点で、的中しても購入合計{total_bet}円を下回る「ガミリ」の"
-                            "可能性があります。配分金額の見直しをおすすめします。"
+                gamiri_result = st.session_state.get("gamiri_check_result")
+                if gamiri_result and gamiri_result.get("model") == gamiri_model and gamiri_result.get("race_id") == race_id:
+                    rows = gamiri_result["rows"]
+                    total_bet = gamiri_result["total_bet"]
+                    if not rows:
+                        st.info("有効な買い目がありません。", icon=":material/info:")
+                    else:
+                        df_rows = pd.DataFrame(rows)
+                        display_df = df_rows.rename(columns={
+                            "type": "券種", "combo": "組み合わせ", "amount": "購入額",
+                            "odds": "現在オッズ", "est_return": "的中時の推定払戻", "profit": "購入合計との損益",
+                        }).copy()
+                        display_df["判定"] = df_rows["is_gamiri"].map(
+                            lambda x: "ガミリ" if x is True else ("問題なし" if x is False else "オッズ取得不可")
                         )
-                    elif not_found_rows.empty:
-                        st.success("現在のオッズでは、どの買い目が的中しても購入合計を下回らない見込みです。")
-                    if not not_found_rows.empty:
-                        st.caption(f"{len(not_found_rows)}点はオッズが取得できませんでした（発売前・対象外の可能性があります）。")
+                        st.dataframe(display_df.drop(columns=["is_gamiri"]), use_container_width=True, hide_index=True)
+                        st.caption(f"購入合計: {total_bet}円（ワイド・複勝は最低オッズで保守的に計算しています）")
 
-    data_context = build_full_ai_betting_prompt(
-        race_id,
-        int(st.session_state.get("full_ai_max_budget", 1000)),
-        plan_blocks,
-        st.session_state.get("full_ai_use_full_budget", False),
-    )
+                        gamiri_rows = df_rows[df_rows["is_gamiri"] == True]
+                        not_found_rows = df_rows[df_rows["is_gamiri"].isna()]
+                        if not gamiri_rows.empty:
+                            st.warning(
+                                f"{len(gamiri_rows)}点で、的中しても購入合計{total_bet}円を下回る「ガミリ」の"
+                                "可能性があります。配分金額の見直しをおすすめします。",
+                                icon=":material/warning:",
+                            )
+                        elif not_found_rows.empty:
+                            st.success("現在のオッズでは、どの買い目が的中しても購入合計を下回らない見込みです。",
+                                       icon=":material/check_circle:")
+                        if not not_found_rows.empty:
+                            st.caption(f"{len(not_found_rows)}点はオッズが取得できませんでした（発売前・対象外の可能性があります）。")
 
-    # --- 💬 AIと相談機能の追加 ---
-    st.markdown("---")
-    st.subheader("💬 AIアシスタントと相談して決める")
-    st.caption("集めたデータや予想結果をもとに、AIアシスタントと対話しながら最終的な買い目を検討できます。")
-    
-    for msg in st.session_state.chat_messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            
-    if chat_prompt := st.chat_input(""):
+with tab_chat:
+    # 会話はパネルの中だけでスクロールし、入力欄はパネルのすぐ下に置く
+    chat_box = st.container(border=True, key="chat_panel")
+    with chat_box:
+        if not st.session_state.chat_messages:
+            st.caption("集めたデータや予想結果をもとに、AIアシスタントと対話しながら最終的な買い目を検討できます。")
+        for msg in st.session_state.chat_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+    if chat_prompt := st.chat_input("買い目について相談する", key="race_chat_input"):
+        data_context = build_full_ai_betting_prompt(
+            race_id,
+            int(st.session_state.get("full_ai_max_budget", 1000)),
+            st.session_state.bet_plan_blocks,
+            st.session_state.get("full_ai_use_full_budget", False),
+        )
         st.session_state.chat_messages.append({"role": "user", "content": chat_prompt})
-        with st.chat_message("user"):
-            st.markdown(chat_prompt)
-            
-        with st.chat_message("assistant"):
-            with st.spinner("考え中..."):
-                chat_context = AI_PERSONA_PROMPT + "\n"
-                chat_context += "ユーザーの質問に答え、共に勝ち筋を探る共有型コンサルタントとして、冷静に最適な買い目を検討してください。\n\n"
-                chat_context += f"【対象レースのデータ・コンテキスト】\n{data_context}\n\n"
-                chat_context += "【これまでの会話】\n"
-                for m in st.session_state.chat_messages[:-1]:
-                    role_name = "ユーザー" if m["role"] == "user" else "アシスタント"
-                    chat_context += f"{role_name}: {m['content']}\n"
-                chat_context += f"ユーザー: {chat_prompt}\nアシスタント:"
-                
-                try:
-                    # 「両方で比較」を選んでいる場合はGeminiが応答します
-                    chat_ai = "ChatGPT" if ai_choice == "ChatGPT" else "Gemini"
-                    response = ask_chatgpt(chat_context) if chat_ai == "ChatGPT" else ask_gemini(chat_context)
-                        
-                    st.markdown(response)
-                    st.session_state.chat_messages.append({"role": "assistant", "content": response})
-                except Exception as e:
-                    st.error(f"返答の生成中にエラーが発生しました: {e}")
+        with chat_box:
+            with st.chat_message("user"):
+                st.markdown(chat_prompt)
 
+            with st.chat_message("assistant"):
+                with st.spinner("考え中..."):
+                    chat_context = AI_PERSONA_PROMPT + "\n"
+                    chat_context += "ユーザーの質問に答え、共に勝ち筋を探る共有型コンサルタントとして、冷静に最適な買い目を検討してください。\n\n"
+                    chat_context += f"【対象レースのデータ・コンテキスト】\n{data_context}\n\n"
+                    chat_context += "【これまでの会話】\n"
+                    for m in st.session_state.chat_messages[:-1]:
+                        role_name = "ユーザー" if m["role"] == "user" else "アシスタント"
+                        chat_context += f"{role_name}: {m['content']}\n"
+                    chat_context += f"ユーザー: {chat_prompt}\nアシスタント:"
+
+                    try:
+                        # 「両方で比較」を選んでいる場合はGeminiが応答します
+                        chat_ai = "ChatGPT" if ai_choice == "ChatGPT" else "Gemini"
+                        response = ask_chatgpt(chat_context) if chat_ai == "ChatGPT" else ask_gemini(chat_context)
+
+                        st.markdown(response)
+                        st.session_state.chat_messages.append({"role": "assistant", "content": response})
+                    except Exception as e:
+                        st.error(f"返答の生成中にエラーが発生しました: {e}")
+
+with tab_result, st.container(key="panel_result"):
     has_prediction_for_current_race = any(
         pred.get("race_id") == race_id
         for pred in st.session_state.latest_predictions.values()
     )
 
-    if has_prediction_for_current_race:
-        st.subheader("💴 結果照合（過去レース限定・任意実行）")
-        st.caption(
-            "予想後にボタンを押すと、結果・払戻ページを参照して的中と回収金額を計算します。"
+    if not has_prediction_for_current_race:
+        st.caption("「AI提案」で買い目を出すと、レース後にここで的中と回収金額を確認できます（過去レース限定）。")
+    else:
+        result_cols = st.columns([3, 1], vertical_alignment="center")
+        result_cols[0].caption(
+            "結果・払戻ページを参照して的中と回収金額を計算します（過去レース限定）。"
             "My収支に反映したい予想にチェックを入れて保存すると、月別・年別の収支に集計されます。"
         )
-        if st.button("結果ページで的中チェックを実行"):
+        if result_cols[1].button("的中チェックを実行", icon=":material/fact_check:", use_container_width=True):
             if not race_id:
                 st.warning("Race IDを入力してください。")
             else:
@@ -1673,9 +1913,9 @@ if st.session_state.all_horse_data:
                 else:
                     payouts = result_payload.get("payouts", {})
                     if not payouts:
-                        st.warning("払戻情報を取得できませんでした。")
+                        st.warning("払戻情報を取得できませんでした。", icon=":material/warning:")
                     else:
-                        st.success(f"結果ページを確認しました: {result_payload.get('url')}")
+                        st.success(f"結果ページを確認しました: {result_payload.get('url')}", icon=":material/check_circle:")
 
                     race_date = scraper.get_race_date(race_id)
                     race_name = (st.session_state.race_info or {}).get("name", "")
@@ -1686,7 +1926,8 @@ if st.session_state.all_horse_data:
 
                         bets = pred.get("bets", [])
                         if not bets:
-                            st.info(f"{model_name}: 買い目JSONが見つからないため、金額集計をスキップしました。")
+                            st.info(f"{model_name}: 買い目JSONが見つからないため、金額集計をスキップしました。",
+                                    icon=":material/info:")
                             continue
 
                         total_bet, total_return, hits, ticket_stats = calculate_return(bets, payouts)
@@ -1707,17 +1948,20 @@ if st.session_state.all_horse_data:
             for model_name, r in cached_results.items():
                 hit_rate = (r["hits"] / r["bet_count"] * 100) if r["bet_count"] else 0
                 return_rate = (r["total_return"] / r["total_bet"] * 100) if r["total_bet"] > 0 else 0
-                st.markdown(f"#### {model_name} 的中結果")
-                st.write(f"購入合計: {r['total_bet']}円 / 払戻合計: {r['total_return']}円 / 回収率: {return_rate:.1f}% / 的中率: {hit_rate:.1f}%")
+                st.caption(f"{model_name}（購入合計 {r['total_bet']}円 / 払戻合計 {r['total_return']}円）")
+                ml_ui.render_score_cards(
+                    r["bet_count"], hit_rate / 100, return_rate if r["total_bet"] > 0 else None,
+                    races_label="買い目数",
+                )
                 if r["ticket_stats"]:
                     ticket_df = pd.DataFrame.from_dict(r["ticket_stats"], orient='index').reset_index().rename(
                         columns={"index": "券種", "bet": "購入額", "return": "払戻額", "hits": "的中数"}
                     )
                     ticket_df["回収率"] = (ticket_df["払戻額"] / ticket_df["購入額"] * 100).fillna(0).round(1).astype(str) + "%"
-                    st.dataframe(ticket_df, use_container_width=True)
+                    st.dataframe(ticket_df, use_container_width=True, hide_index=True)
 
                 if r["saved"]:
-                    st.success("✅ My収支に追加済みです。")
+                    st.success("My収支に追加済みです。", icon=":material/check_circle:")
                 else:
                     r["include_in_balance"] = st.checkbox(
                         f"この{model_name}の結果をMy収支に追加する",
@@ -1728,7 +1972,7 @@ if st.session_state.all_horse_data:
                 (model_name, r) for model_name, r in cached_results.items()
                 if not r["saved"] and r.get("include_in_balance")
             ]
-            if to_save and st.button("チェックした結果をMy収支に保存", key=f"balance_save_{race_id}"):
+            if to_save and st.button("チェックした結果をMy収支に保存", icon=":material/save:", key=f"balance_save_{race_id}"):
                 entries = []
                 for model_name, r in to_save:
                     entries.append({
@@ -1746,5 +1990,5 @@ if st.session_state.all_horse_data:
                     })
                     r["saved"] = True
                 balance.append_entries(entries)
-                st.success(f"{len(entries)}件をMy収支に追加しました。")
+                st.success(f"{len(entries)}件をMy収支に追加しました。", icon=":material/check_circle:")
                 st.rerun()

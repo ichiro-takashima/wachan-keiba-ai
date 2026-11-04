@@ -11,6 +11,7 @@
     python -m scraping.collect_dataset                 # 最新5年分を取得（直近1年をテスト）
     python -m scraping.collect_dataset --list-only     # レースID一覧(manifest)の作成のみ
     python -m scraping.collect_dataset --years 5 --test-years 1 --sleep 1.0
+    python -m scraping.collect_dataset --add-period 2025-07-14 2026-07-17   # 抜けた期間を学習用に追加
 
 保存先:
     data/train/race_html/{race_id}.html
@@ -240,6 +241,43 @@ def download_races(manifest, sleep_sec):
     return saved, skipped, failed
 
 
+def add_period(start_date, end_date, split, sleep_sec, source_dirs=EXISTING_HTML_DIRS):
+    """期間内のレースをmanifestに追加し、指定splitのディレクトリへそろえる。
+
+    source_dirs に結果入りのHTMLがあればコピーし、なければnetkeibaから取得する。
+    戻り値: (追加レース数, コピー数, 新規取得数, 失敗数)
+    """
+    manifest = load_manifest()
+    race_dates = collect_race_calendar(start_date, end_date, sleep_sec)
+    new_ids = [rid for rid in race_dates if rid not in manifest]
+    out_dir = {"train": TRAIN_HTML_DIR, "test": TEST_HTML_DIR}[split]
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    copied = downloaded = failed = 0
+    for i, race_id in enumerate(_progress(sorted(new_ids), len(new_ids), "レースHTML"), start=1):
+        output_path = out_dir / f"{race_id}.html"
+        row = {"race_id": race_id, "date": race_dates[race_id].isoformat(), "split": split, "status": "saved"}
+        if not output_path.is_file():
+            source = next((Path(d) / f"{race_id}.html" for d in source_dirs
+                           if (Path(d) / f"{race_id}.html").is_file()), None)
+            # 結果テーブルのない(発走前に保存した)ページは使えないので取り直す
+            if source is not None and b"race_table_01" in source.read_bytes():
+                output_path.write_bytes(source.read_bytes())
+                copied += 1
+            else:
+                try:
+                    output_path.write_bytes(_get(f"https://db.netkeiba.com/race/{race_id}/", sleep_sec).content)
+                    downloaded += 1
+                except requests.RequestException:
+                    row["status"] = "failed"
+                    failed += 1
+        manifest[race_id] = row
+        if i % 100 == 0:
+            save_manifest(manifest)
+    save_manifest(manifest)
+    return len(new_ids), copied, downloaded, failed
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="最新N年分のレースHTMLを学習用/テスト用に分けて取得します。")
     parser.add_argument("--years", type=int, default=5, help="取得する年数（既定: 5）")
@@ -252,7 +290,18 @@ def main(argv=None):
         "--exclude-dir", action="append", default=[],
         help="取得済みとして除外するHTMLディレクトリ（複数指定可。data/race_html は常に除外）",
     )
+    parser.add_argument(
+        "--add-period", nargs=2, metavar=("START", "END"),
+        help="抜けている期間 YYYY-MM-DD YYYY-MM-DD のレースを既存manifestに追加する（data/race_html にあればコピー）",
+    )
+    parser.add_argument("--add-split", choices=["train", "test"], default="train", help="--add-period で追加する区分")
     args = parser.parse_args(argv)
+
+    if args.add_period:
+        start, end = (datetime.strptime(d, "%Y-%m-%d").date() for d in args.add_period)
+        added, copied, downloaded, failed = add_period(start, end, args.add_split, args.sleep)
+        print(f"追加: {added}レース（コピー {copied} / 新規取得 {downloaded} / 失敗 {failed}） → {MANIFEST_PATH}")
+        return 1 if failed else 0
 
     if not 0 < args.test_years < args.years:
         parser.error("--test-years は 1 以上かつ --years 未満にしてください。")

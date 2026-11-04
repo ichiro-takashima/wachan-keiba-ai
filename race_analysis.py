@@ -545,17 +545,17 @@ def run_rule_based_analysis(all_horse_data, shutuba_df, race_info=None, race_id=
         return "\n".join(lines)
 
     analysis_result = {
-        "📊 指数・データ重視": f"【過去着順・上りタイム偏差値による評価】\n{format_ranking(sorted(horses, key=lambda x: x['data_dev'], reverse=True), 'data_dev')}",
-        "🏇 展開重視": f"【テンの速さ・道中位置取り偏差値による評価】\n{format_ranking(sorted(horses, key=lambda x: x['ten_dev'], reverse=True), 'ten_dev')}",
-        "💰 期待値・ルール評価": f"【能力・適性・期待値・外部要因の加点評価】\n{format_ranking(sorted(horses, key=lambda x: x['rule_dev'], reverse=True), 'rule_dev')}",
+        "指数・データ重視": f"【過去着順・上りタイム偏差値による評価】\n{format_ranking(sorted(horses, key=lambda x: x['data_dev'], reverse=True), 'data_dev')}",
+        "展開重視": f"【テンの速さ・道中位置取り偏差値による評価】\n{format_ranking(sorted(horses, key=lambda x: x['ten_dev'], reverse=True), 'ten_dev')}",
+        "期待値・ルール評価": f"【能力・適性・期待値・外部要因の加点評価】\n{format_ranking(sorted(horses, key=lambda x: x['rule_dev'], reverse=True), 'rule_dev')}",
         "_raw_horses": horses,
         "_weight_info": f"※適用された評価ウェイト: データ {data_weight:.1f} / 展開 {ten_weight:.1f} / 血統・適性 {blood_weight:.1f} / 期待値ルール {rule_weight:.1f} / 学習モデル {model_weight:.1f}",
     }
     if use_model:
-        analysis_result["🤖 学習モデル評価"] = f"【収集レースで学習したモデルの3着以内確率による評価】\n{format_ranking(sorted(horses, key=lambda x: x['model_dev'], reverse=True), 'model_dev')}"
+        analysis_result["学習モデル評価"] = f"【収集レースで学習したモデルの3着以内確率による評価】\n{format_ranking(sorted(horses, key=lambda x: x['model_dev'], reverse=True), 'model_dev')}"
     if include_blood:
         analysis_result = {
-            "🩸 血統・適性重視": f"【独自適性スコアによる評価】\n{format_ranking(sorted(horses, key=lambda x: x['blood_dev'], reverse=True), 'blood_dev')}",
+            "血統・適性重視": f"【独自適性スコアによる評価】\n{format_ranking(sorted(horses, key=lambda x: x['blood_dev'], reverse=True), 'blood_dev')}",
             **analysis_result,
         }
     return analysis_result
@@ -598,7 +598,7 @@ def generate_rule_based_summary(analysis_res, effective_budget, custom_requests,
         if is_crowded:
             reasons.append("1位と5位の総合偏差値差が2.5未満でスコアが極端に密集しているため")
 
-        summary_text += "\n🚨 **【見送り推奨】** 🚨\n以下の理由により、本レースは**購入見送り（ケン）**を推奨します。\n"
+        summary_text += "\n**【見送り推奨】**\n以下の理由により、本レースは**購入見送り（ケン）**を推奨します。\n"
         for reason in reasons:
             summary_text += f"・{reason}\n"
         summary_text += "\n```json\n{\"bets\": []}\n```\n"

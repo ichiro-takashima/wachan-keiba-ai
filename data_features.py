@@ -89,7 +89,7 @@ AI_DATA_FEATURES = [
 
 
 def render_ai_data_feature_selector(key_prefix, caption):
-    st.markdown("#### ⚙️ AIへ渡すデータ要素の選択 (過学習・ノイズ防止)")
+    st.caption(":material/tune: AIへ渡すデータ要素の選択（過学習・ノイズ防止）")
     st.caption(caption)
 
     categories = {}
@@ -101,7 +101,7 @@ def render_ai_data_feature_selector(key_prefix, caption):
 
     selected = set()
     for cat, items in categories.items():
-        with st.expander(f"📁 {cat}", expanded=False):
+        with st.expander(cat, icon=":material/folder:", expanded=False):
             cols = st.columns(3)
             for i, (key, name) in enumerate(items):
                 with cols[i % 3]:

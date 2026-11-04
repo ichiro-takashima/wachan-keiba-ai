@@ -21,7 +21,8 @@ from model.live_predict import CATEGORY_MODEL_DIR, GLOBAL_MODEL_PATH, load_categ
 
 MARK_LABELS = {"◎": "本命", "○": "対抗", "▲": "単穴", "△": "連下", "☆": "穴"}
 VOLATILITY_COLORS = {"堅い": "green", "標準": "blue", "荒れ気味": "orange", "大荒れ警戒": "red"}
-VOLATILITY_ICONS = {"堅い": "🛡️", "標準": "⚖️", "荒れ気味": "⚠️", "大荒れ警戒": "🌪️"}
+VOLATILITY_ICONS = {"堅い": ":material/shield:", "標準": ":material/balance:", "荒れ気味": ":material/warning:",
+                    "大荒れ警戒": ":material/thunderstorm:"}
 GRADE_COLORS = {"S": "red", "A": "orange", "B": "blue", "C": "gray", "-": "gray"}
 # 荒れ具合に応じて、軸(◎)から流す相手の頭数を増減する。
 PARTNER_COUNT_BY_LEVEL = {"堅い": 3, "標準": 4, "荒れ気味": 5, "大荒れ警戒": 6}
@@ -73,82 +74,71 @@ def course_condition_label(race_info):
 
 
 def render_race_overview(race_info, prediction, volatility):
-    """Step1: レース名・条件と、馬場/距離・使用モデル・波乱度のバッジを表示する。"""
-    st.markdown("### 【Step 1】レース概況・適用モデル")
-    if race_info:
-        st.markdown(f"## 🏆 {race_info.get('name', '')}")
-        label = course_condition_label(race_info)
-        if label:
-            st.markdown(label)
-        meta = [race_info.get("data", "")]
-        if race_info.get("entries"):
-            meta.append(race_info["entries"])
-        st.caption(" / ".join(m for m in meta if m))
-
-    badge_cols = st.columns(3)
+    """Step1: レース名・馬場/距離・使用モデル・波乱度を1行のバッジに、条件と補足を1行の注記にまとめる。"""
+    badges = []
+    if race_info and race_info.get("name"):
+        badges.append(f"**{race_info['name']}**")
+    label = course_condition_label(race_info) if race_info else ""
+    if label:
+        badges.append(label)
     if prediction:
-        cond = prediction["conditions"]
-        course = f"{cond['surface'] or '?'}{int(cond['distance']) if pd.notna(cond['distance']) else '?'}m"
-        if cond.get("going"):
-            course += f"（{cond['going']}）"
-        badge_cols[0].badge(course, icon="🏟️", color="violet")
-        badge_cols[1].badge(f"使用モデル: {prediction['model_key']} ⚡", color="primary")
+        going = prediction["conditions"].get("going")
+        if going:
+            badges.append(f":violet-badge[:material/landscape: {going}]")
+        badges.append(f":blue-badge[:material/bolt: {prediction['model_key']}]")
     if volatility:
         level = volatility["level"]
-        badge_cols[2].badge(
-            f"波乱度: {level} {VOLATILITY_ICONS.get(level, '')}（{volatility['score']}/100）",
-            color=VOLATILITY_COLORS.get(level, "gray"),
+        badges.append(
+            f":{VOLATILITY_COLORS.get(level, 'gray')}-badge[{VOLATILITY_ICONS.get(level, '')} "
+            f"波乱度 {level} {volatility['score']}/100]"
         )
+    if badges:
+        st.markdown(" ".join(badges))
 
-    if not prediction:
-        return
-    st.caption(f"予測モデル: {prediction['model_label']}")
-    if prediction.get("fallback_reason"):
-        st.warning(f"カテゴリ別モデルを使えないため全体モデルで予測しました: {prediction['fallback_reason']}")
-
-    metrics = _model_metrics(prediction["model_key"])
-    if metrics and pd.notna(metrics.get("global_model_auc")):
-        cat_auc, global_auc = metrics["auc"], metrics["global_model_auc"]
-        note = "カテゴリ別モデルの方が良好" if cat_auc > global_auc else "全体モデルの方が良好"
-        st.caption(
-            f"検証データでの精度(AUC): カテゴリ別 {cat_auc:.3f} / 全体 {global_auc:.3f} → {note}"
-            f"（学習{metrics['n_train']:,}行、評価{metrics['n_test']:,}行）"
-        )
-        if metrics.get("n_train", 0) < 1000:
-            st.caption("⚠️ このカテゴリは学習データが少ないため、予測のぶれが大きくなりがちです。")
+    notes = []
+    if race_info:
+        notes += [race_info.get("data", ""), race_info.get("entries", "")]
+    if prediction:
+        metrics = _model_metrics(prediction["model_key"])
+        if metrics and pd.notna(metrics.get("global_model_auc")):
+            notes.append(f"AUC カテゴリ別 {metrics['auc']:.3f} / 全体 {metrics['global_model_auc']:.3f}")
+            if metrics.get("n_train", 0) < 1000:
+                notes.append("学習データが少なく予測がぶれやすい")
+        if prediction.get("fallback_reason"):
+            notes.append(f"全体モデルで予測（{prediction['fallback_reason']}）")
+    if volatility:
+        notes.append(f"方針: {volatility['summary']}")
+    st.caption(" / ".join(n for n in notes if n))
 
 
 # ---------------------------------------------------------------- Step2
 
 def render_top_horse_cards(pred_df, top_n=5, win_prob_method="blend"):
-    """Step2: AIの推奨上位馬をカード形式で表示する。"""
-    st.markdown("### 【Step 2】AI推奨馬ランキング")
+    """Step2: AIの推奨上位馬をカード形式で表示する。説明は数値のツールチップに入れて縦幅を取らない。"""
     if win_prob_method == "blend":
-        win_note = "推定勝率は3着内確率と単勝オッズを検証データで補正して組み合わせた値"
+        win_note = "推定勝率は3着内確率と単勝オッズを検証データで補正して組み合わせた値です。"
     else:
-        win_note = "推定勝率は3着内確率を全頭合計で割った目安（オッズ未取得のため補正なし。人気薄を過大評価しやすい）"
-    st.caption(
-        f"順位・印は推定勝率の順。{win_note}、"
-        "期待値は 推定勝率×単勝オッズ（1.0超で妙味あり）です。"
-    )
+        win_note = "推定勝率は3着内確率を全頭合計で割った目安です（オッズ未取得のため補正なし。人気薄を過大評価しやすい）。"
+    help_text = f"順位・印はLightGBMの3着内確率の順。{win_note}期待値は 推定勝率×単勝オッズ（1.0超で妙味あり）。"
     top = pred_df.head(top_n)
     cols = st.columns(len(top)) if len(top) else []
     for col, (_, row) in zip(cols, top.iterrows()):
         with col.container(border=True):
             mark = row["印"]
-            st.markdown(f"#### {mark} {MARK_LABELS.get(mark, '')}")
-            st.markdown(f"**{_horse_label(row)}**")
+            st.markdown(f"**{mark} {MARK_LABELS.get(mark, '')}**　{_horse_label(row)}")
             st.caption(f"{row['騎手']} / {_fmt_odds(row['オッズ'])}"
                        + (f"（{int(row['人気'])}人気）" if pd.notna(row["人気"]) else ""))
-            st.metric("3着内確率", _fmt_pct(row["3着内確率"]))
-            st.markdown(f"推定勝率 **{_fmt_pct(row['推定勝率'])}**")
+            st.metric("3着内確率", _fmt_pct(row["3着内確率"]), help=help_text)
             grade = row["期待値ランク"]
             ev_text = "-" if pd.isna(row["期待値"]) else f"{row['期待値']:.2f}"
-            st.badge(f"期待値 {grade}（{ev_text}）", color=GRADE_COLORS.get(grade, "gray"))
+            st.markdown(
+                f"推定勝率 **{_fmt_pct(row['推定勝率'])}** "
+                f":{GRADE_COLORS.get(grade, 'gray')}-badge[期待値 {grade}（{ev_text}）]"
+            )
             if row["根拠"]:
-                st.caption("評価ポイント: " + "・".join(row["根拠"]))
+                st.caption("・".join(row["根拠"]))
             if row.get("過去走数", 5) == 0:
-                st.caption("⚠️ 過去走データなし")
+                st.caption(":material/warning: 過去走データなし")
 
 
 # ---------------------------------------------------------------- Step3
@@ -181,17 +171,17 @@ def build_ticket_suggestions(pred_df, volatility_level=None):
 
 
 def render_ticket_strategy(pred_df, volatility):
-    """Step3: 券種ごとの推奨買い目をアコーディオンで表示する。"""
-    st.markdown("### 【Step 3】馬券戦略・買い目")
+    """Step3: 券種ごとの推奨買い目を1つの表にまとめる(資金配分シミュレータは呼び出し側で横に並べる)。"""
     level = volatility["level"] if volatility else None
     if level:
         st.caption(f"波乱度「{level}」に合わせて、◎から流す相手を{PARTNER_COUNT_BY_LEVEL.get(level, 4)}頭にしています。")
-    for i, sug in enumerate(build_ticket_suggestions(pred_df, level)):
-        points = len(sug["買い目"])
-        with st.expander(f"🎫 {sug['券種']}：{sug['方式']}　{points}点（各100円なら{points * 100:,}円）", expanded=(i == 0)):
-            st.code("  ".join(sug["買い目"]), language="text")
-
-    render_budget_simulator(pred_df)
+    rows = [
+        {"券種": sug["券種"], "方式": sug["方式"], "点数": len(sug["買い目"]),
+         "各100円": f"{len(sug['買い目']) * 100:,}円", "買い目": "  ".join(sug["買い目"])}
+        for sug in build_ticket_suggestions(pred_df, level)
+    ]
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True,
+                 column_config={"買い目": st.column_config.TextColumn("買い目", width="large")})
 
 
 def allocate_budget(pred_df, budget, method, top_k=5, unit=100):
@@ -228,13 +218,12 @@ def allocate_budget(pred_df, budget, method, top_k=5, unit=100):
 
 def render_budget_simulator(pred_df):
     with st.container(border=True):
-        st.markdown("#### 💴 資金配分シミュレータ（単勝）")
-        c1, c2, c3 = st.columns([1, 1, 2])
-        budget = c1.number_input("予算 (円)", min_value=100, step=100, value=3000, key="ml_alloc_budget")
+        c1, c2 = st.columns(2)
+        budget = c1.number_input("単勝の予算 (円)", min_value=100, step=100, value=3000, key="ml_alloc_budget")
         top_k = c2.slider("対象頭数（AI上位）", min_value=1, max_value=min(8, max(1, len(pred_df))),
                           value=min(5, max(1, len(pred_df))), key="ml_alloc_topk")
-        method = c3.radio("配分方法", list(ALLOCATION_METHODS), key="ml_alloc_method", horizontal=True)
-        st.caption(ALLOCATION_METHODS[method])
+        method = st.radio("配分方法", list(ALLOCATION_METHODS), key="ml_alloc_method", horizontal=True,
+                          captions=list(ALLOCATION_METHODS.values()))
 
         alloc = allocate_budget(pred_df, budget, method, top_k=top_k)
         if alloc.empty:
@@ -318,7 +307,7 @@ def probability_bar(label, max_value=100):
     return st.column_config.ProgressColumn(label, format="%.1f%%", min_value=0, max_value=max_value)
 
 
-def render_prediction_table(pred_df):
+def render_prediction_table(pred_df, height="auto"):
     display = pred_df.copy()
     display["3着内確率"] = display["3着内確率"] * 100
     display["推定勝率"] = display["推定勝率"] * 100
@@ -326,7 +315,7 @@ def render_prediction_table(pred_df):
     display["根拠"] = display["根拠"].map(lambda r: "・".join(r))
     win_max = max(float(display["推定勝率"].max()), 1.0) if display["推定勝率"].notna().any() else 100
     st.dataframe(
-        display, width="stretch", hide_index=True,
+        display, width="stretch", height=height, hide_index=True,
         column_config={
             "3着内確率": probability_bar("3着内確率"),
             # 勝率は値が小さいので、最大の馬を棒いっぱいにして差を見やすくする
@@ -352,7 +341,7 @@ def render_feature_importance(model_key):
     if imp.empty:
         st.caption("モデルファイルが見つかりません。")
         return
-    st.markdown(f"**使用モデル（{model_key}）の特徴量重要度 Top15**（gain の割合）")
+    st.caption(f"使用モデル（{model_key}）の特徴量重要度 Top15（gain の割合）")
     st.bar_chart(imp.set_index("feature")["割合(%)"], horizontal=True)
 
     shares = {}
@@ -361,14 +350,14 @@ def render_feature_importance(model_key):
         if not cat_imp.empty:
             shares[key] = cat_imp.set_index("feature")["割合(%)"]
     if shares:
-        st.markdown("**カテゴリ別モデルの重み比較**（各特徴量の重要度割合 %、全カテゴリ平均の高い順）")
+        st.caption("カテゴリ別モデルの重み比較（各特徴量の重要度割合 %、全カテゴリ平均の高い順）")
         table = pd.DataFrame(shares)
         table = table.loc[table.mean(axis=1).sort_values(ascending=False).index].head(15).round(1)
         st.dataframe(table.style.background_gradient(axis=None, cmap="Blues"), width="stretch")
 
     comparison = load_category_comparison()
     if not comparison.empty:
-        st.markdown("**カテゴリ別モデル vs 全体モデル（同じ検証データでの比較）**")
+        st.caption("カテゴリ別モデル vs 全体モデル（同じ検証データでの比較）")
         st.dataframe(comparison, width="stretch", hide_index=True)
 
 
@@ -451,28 +440,27 @@ def render_model_score_cards(metrics):
         return_delta=f"{m.get('複勝回収率', 0) - b.get('複勝回収率', 0):+.1f}pt",
     )
 
-def render_shutuba_model(result, metrics, error=None):
-    """収集レースで学習した出馬表モデルの3着以内確率と、テスト期間での検証結果を表示する。"""
-    st.markdown("### 📈 学習済みモデル（収集レース）の3着以内確率")
+def render_shutuba_model(result, metrics, error=None, height="auto"):
+    """収集レースで学習した出馬表モデルの3着以内確率。検証成績と重視する情報はポップオーバーに畳む。"""
     if result is None:
         st.caption(error or "採用済みのモデルがありません（python -m model.shutuba_model で学習・検証してください）。")
         return
 
-    if metrics:
-        render_model_score_cards(metrics)
     if result.get("odds_missing"):
-        st.warning("オッズが未発表のため、オッズ・人気なしで計算しています（精度が下がります）。")
+        st.warning("オッズが未発表のため、オッズ・人気なしで計算しています（精度が下がります）。", icon=":material/warning:")
+    if metrics:
+        with st.popover("検証成績・重視する情報", icon=":material/insights:"):
+            render_model_score_cards(metrics)
+            importance = metrics.get("特徴量重要度(gain%)")
+            if importance:
+                st.caption("「根拠」列は各馬の確率を押し上げた上位の情報。グラフはモデル全体で重視している情報の割合(%)。")
+                st.bar_chart(pd.Series(importance).head(10), horizontal=True)
 
     display = result["predictions"].copy()
     display["3着内確率"] = display["3着内確率"] * 100
     display["単勝オッズ"] = display["単勝オッズ"].map(_fmt_odds)
-    st.dataframe(display, width="stretch", hide_index=True,
+    st.dataframe(display, width="stretch", height=height, hide_index=True,
                  column_config={"3着内確率": probability_bar("3着内確率")})
-    importance = (metrics or {}).get("特徴量重要度(gain%)")
-    if importance:
-        with st.expander("このモデルが重視している情報（特徴量重要度）", expanded=False):
-            st.caption("「根拠」列は各馬の確率を押し上げた上位の情報です。下のグラフはモデル全体で重視している情報の割合(%)です。")
-            st.bar_chart(pd.Series(importance).head(10), horizontal=True)
 
 
 # ---------------------------------------------------------------- モデル説明ページ
@@ -490,53 +478,56 @@ def render_model_explanation():
     from model.shutuba_model import CANDIDATE_PATH, METRICS_PATH
     from race_analysis import DIRT_STRONG_SIRE_MIN_DISTANCE, DIRT_STRONG_SIRE_POINTS, DIRT_STRONG_SIRES
 
-    st.title("🤖 モデル説明")
-    st.caption("予想画面で使っている各モデルが、何を材料に・どのくらいの精度で予想しているかをまとめています。")
-
-    st.subheader("📈 出馬表モデル（収集レースで学習）")
-    adopted = _load_json(METRICS_PATH)
-    metrics = adopted or _load_json(CANDIDATE_PATH.with_suffix(".metrics.json"))
-    if metrics is None:
-        st.info("まだ学習されていません（python -m model.shutuba_model で学習・検証します）。")
-    else:
-        if adopted:
-            st.success("検証に合格し、予想画面で使われています。")
-        else:
-            st.warning(f"不採用のため予想画面では使っていません（{metrics.get('採用理由', '')}）。"
-                       "python -m model.shutuba_model --force で採用できます。")
+    tab_shutuba, tab_category, tab_rule = st.tabs([
+        ":material/table_chart: 出馬表モデル", ":material/category: カテゴリ別 / 全体モデル", ":material/rule: ルールベースの加点",
+    ])
+    with tab_shutuba:
+        _render_shutuba_model_explanation(METRICS_PATH, CANDIDATE_PATH)
+    with tab_category:
+        st.caption("各馬の直近5走・騎手勝率・レース条件から3着以内確率を出すモデルです（オッズ・人気は使いません）。"
+                   "芝・ダート×距離帯ごとに分けたカテゴリ別モデルと、全条件共通の全体モデルがあります。")
+        comparison = load_category_comparison()
+        if not comparison.empty:
+            st.dataframe(comparison, width="stretch", hide_index=True)
+        with st.popover("全体モデルの特徴量重要度", icon=":material/insights:"):
+            render_feature_importance("global")
+    with tab_rule:
         st.markdown(
-            "出馬表に載る情報（オッズ・人気・枠・斤量・馬体重・騎手の過去成績・近走成績・レース条件）から、"
-            "各馬が **3着以内に入る確率** を出すLightGBMモデルです。"
+            f"- ダート{DIRT_STRONG_SIRE_MIN_DISTANCE}m以上のレースで、父が {'・'.join(DIRT_STRONG_SIRES)} の馬は "
+            f"+{DIRT_STRONG_SIRE_POINTS:g}点（期待値・ルール評価）\n"
+            "- 出馬表モデルが採用されている場合は、その3着以内確率も総合評価に加えます（重み1.5）"
         )
-        render_model_score_cards(metrics)
-        auc_cols = st.columns(3)
-        auc_cols[0].metric("AUC（モデル）", f"{metrics.get('AUC', 0):.3f}",
-                           delta=f"{metrics.get('AUC', 0) - metrics.get('AUC(人気順)', 0):+.3f}", border=True,
-                           help="3着以内の馬をどれだけ上位に並べられたか(0.5=でたらめ、1.0=完璧)。差は人気順との比較。")
-        auc_cols[1].metric("AUC（人気順）", f"{metrics.get('AUC(人気順)', 0):.3f}", border=True)
-        auc_cols[2].metric("学習レース数", f"{metrics.get('学習レース数', 0):,}", border=True)
 
-        with st.expander("使っている特徴量・使っていない情報", expanded=False):
-            st.markdown("**特徴量:** " + "、".join(metrics.get("特徴量", [])))
-            st.markdown("**使っていない情報（レース後にしか分からないため）:** "
-                        + "、".join(metrics.get("除外した結果系の列", [])))
-        importance = metrics.get("特徴量重要度(gain%)")
-        if importance:
-            with st.expander("特徴量重要度（どの情報を重視しているか）", expanded=False):
-                st.bar_chart(pd.Series(importance).head(15), horizontal=True)
 
-    st.subheader("🏇 カテゴリ別モデル / 全体モデル")
-    st.markdown("各馬の直近5走・騎手勝率・レース条件から3着以内確率を出すモデルです（オッズ・人気は使いません）。"
-                "芝・ダート×距離帯ごとに分けたカテゴリ別モデルと、全条件共通の全体モデルがあります。")
-    comparison = load_category_comparison()
-    if not comparison.empty:
-        st.dataframe(comparison, width="stretch", hide_index=True)
-    with st.expander("全体モデルの特徴量重要度", expanded=False):
-        render_feature_importance("global")
-
-    st.subheader("📐 ルールベースの加点")
-    st.markdown(
-        f"- ダート{DIRT_STRONG_SIRE_MIN_DISTANCE}m以上のレースで、父が {'・'.join(DIRT_STRONG_SIRES)} の馬は "
-        f"+{DIRT_STRONG_SIRE_POINTS:g}点（期待値・ルール評価）\n"
-        "- 出馬表モデルが採用されている場合は、その3着以内確率も総合評価に加えます（重み1.5）"
+def _render_shutuba_model_explanation(metrics_path, candidate_path):
+    adopted = _load_json(metrics_path)
+    metrics = adopted or _load_json(candidate_path.with_suffix(".metrics.json"))
+    if metrics is None:
+        st.info("まだ学習されていません（python -m model.shutuba_model で学習・検証します）。", icon=":material/info:")
+        return
+    if adopted:
+        st.success("検証に合格し、予想画面で使われています。", icon=":material/check_circle:")
+    else:
+        st.warning(f"不採用のため予想画面では使っていません（{metrics.get('採用理由', '')}）。"
+                   "python -m model.shutuba_model --force で採用できます。", icon=":material/warning:")
+    st.caption(
+        "出馬表に載る情報（オッズ・人気・枠・斤量・馬体重・騎手の過去成績・近走成績・レース条件）から、"
+        "各馬が3着以内に入る確率を出すLightGBMモデルです。"
     )
+    render_model_score_cards(metrics)
+    auc_cols = st.columns(3)
+    auc_cols[0].metric("AUC（モデル）", f"{metrics.get('AUC', 0):.3f}",
+                       delta=f"{metrics.get('AUC', 0) - metrics.get('AUC(人気順)', 0):+.3f}", border=True,
+                       help="3着以内の馬をどれだけ上位に並べられたか(0.5=でたらめ、1.0=完璧)。差は人気順との比較。")
+    auc_cols[1].metric("AUC（人気順）", f"{metrics.get('AUC(人気順)', 0):.3f}", border=True)
+    auc_cols[2].metric("学習レース数", f"{metrics.get('学習レース数', 0):,}", border=True)
+
+    pop_cols = st.columns(2)
+    with pop_cols[0].popover("使っている特徴量・使っていない情報", icon=":material/list:", use_container_width=True):
+        st.markdown("**特徴量:** " + "、".join(metrics.get("特徴量", [])))
+        st.markdown("**使っていない情報（レース後にしか分からないため）:** "
+                    + "、".join(metrics.get("除外した結果系の列", [])))
+    importance = metrics.get("特徴量重要度(gain%)")
+    if importance:
+        with pop_cols[1].popover("特徴量重要度", icon=":material/insights:", use_container_width=True):
+            st.bar_chart(pd.Series(importance).head(15), horizontal=True)

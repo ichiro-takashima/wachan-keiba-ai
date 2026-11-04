@@ -10,7 +10,7 @@ def load_css(file_name):
 
 
 def memo_ui(text_area_key):
-    st.markdown("###### 📝 予想メモ機能")
+    st.caption(":material/edit_note: 予想メモ")
 
     if text_area_key not in st.session_state:
         st.session_state[text_area_key] = ""

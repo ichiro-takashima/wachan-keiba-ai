@@ -1,3 +1,16 @@
+/* 余白・角丸・影はすべて 8px の倍数で揃える */
+:root {
+    --space-1: 8px;
+    --space-2: 16px;
+    --space-3: 24px;
+    --space-4: 32px;
+    --radius: 8px;
+    /* 上部ヘッダー(ページ切り替えメニュー)の高さ + 余白 */
+    --header-offset: 80px;
+    /* 1画面に収めるパネルの高さ: 画面の高さ - (ヘッダー + レース概況 + タブ + 間隔 + 下余白) */
+    --panel-height: calc(100vh - 264px);
+}
+
 /* アプリ全体の背景色やフォント設定 */
 .stApp {
     font-family: 'Helvetica Neue', Arial, 'Hiragino Kaku Gothic ProN', 'Hiragino Sans', Meiryo, sans-serif;
@@ -5,62 +18,120 @@
     color: #2C3E50;
 }
 
-.app-title {
-    font-size: 1.75rem;
-    line-height: 1.25;
-    font-weight: 700;
-    margin: 0 0 1rem;
-    color: #263747;
+/* 本文はページ切り替えメニュー(上部ヘッダー)のすぐ下から始める */
+.block-container,
+[data-testid="stMainBlockContainer"] {
+    padding: var(--header-offset) var(--space-4) var(--space-3);
+    max-width: 100%;
 }
 
-@media (min-width: 900px) {
-    .app-title {
-        font-size: 2rem;
-        white-space: nowrap;
-    }
+[data-testid="stVerticalBlock"] {
+    gap: var(--space-2);
 }
 
-/* ボタンのデザインをモダンにする */
-.stButton > button {
-    background-color: #2980B9;
-    color: white;
-    border-radius: 8px;
-    border: none;
-    padding: 10px 24px;
+[data-testid="stHorizontalBlock"] {
+    gap: var(--space-2);
+}
+
+/* 段落・注記の下余白 */
+.stMarkdown p,
+[data-testid="stCaptionContainer"] p {
+    margin-bottom: 0;
+}
+
+/* タブ: 見出しの下の余白を詰める */
+[data-baseweb="tab-list"] {
+    gap: var(--space-1);
+}
+
+[data-baseweb="tab-panel"] {
+    padding-top: var(--space-2);
+}
+
+/* 1画面に収めるパネル(st.container(key="panel_...")): 中身が多いときはパネルの中だけスクロールする */
+/* Streamlitは縦ブロックを flex: 1 1 0% で並べるため、flex を外さないと height が効かない */
+[class*="st-key-panel_"] {
+    flex: none !important;
+    height: var(--panel-height) !important;
+    min-height: 320px;
+    overflow-y: auto;
+}
+
+/* 相談タブは下に入力欄があるので、その分だけ低くする */
+.st-key-chat_panel {
+    flex: none !important;
+    height: calc(var(--panel-height) - 72px) !important;
+    min-height: 248px;
+    overflow-y: auto;
+}
+
+/* ボタン */
+.stButton button,
+.stDownloadButton button {
+    border-radius: var(--radius);
+    padding: var(--space-1) var(--space-3);
     font-weight: bold;
     transition: all 0.2s ease-in-out;
 }
 
-.stButton > button:hover {
-    background-color: #1A5276;
-    box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-    transform: translateY(-2px);
+.stButton button[kind="primary"] {
+    background-color: #2980B9;
+    border: none;
     color: white;
 }
 
-/* データフレーム（表）の周りに影をつけて浮き上がらせる */
-[data-testid="stDataFrame"] {
-    background-color: white;
-    border-radius: 8px;
-    box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-    padding: 10px;
+.stButton button[kind="primary"]:hover {
+    background-color: #1A5276;
+    box-shadow: 0 var(--space-1) var(--space-2) rgba(0, 0, 0, 0.12);
+    color: white;
 }
 
-/* サイドバーのデザイン */
+/* データフレーム（表） */
+[data-testid="stDataFrame"] {
+    background-color: white;
+    border-radius: var(--radius);
+    box-shadow: 0 0 var(--space-1) rgba(0, 0, 0, 0.05);
+}
+
+/* サイドバー */
 [data-testid="stSidebar"] {
     background-color: #ffffff;
     border-right: 1px solid #e1e4e8;
 }
 
-/* エクスパンダー（折りたたみ）の見出し */
-.streamlit-expanderHeader {
-    font-weight: bold;
-    color: #2c3e50;
-    background-color: #f8f9fa;
-    border-radius: 6px;
+[data-testid="stSidebarUserContent"] {
+    padding: var(--space-2) var(--space-3) var(--space-3);
 }
 
-/* テキスト入力枠などのデザイン調整 */
-.stTextInput > div > div > input {
-    border-radius: 6px;
+/* 枠付きコンテナ・エクスパンダー・入力枠の角丸 */
+[data-testid="stVerticalBlockBorderWrapper"],
+[data-testid="stExpander"] details,
+.stTextInput input,
+.stNumberInput input {
+    border-radius: var(--radius);
+}
+
+[data-testid="stExpander"] summary {
+    padding: var(--space-1) var(--space-2);
+}
+
+/* レース未取得時に表示する netkeiba の埋め込み: 画面の高さいっぱいに広げる(ヘッダー + 切り替えボタン + 下余白を引く) */
+/* components.iframe は外側の要素にも height を固定で付けるので、外側ごと上書きする */
+.st-key-netkeiba_embed {
+    flex: none !important;
+    height: calc(100vh - 176px) !important;
+    min-height: 400px;
+}
+
+.st-key-netkeiba_embed [data-testid="stElementContainer"],
+.st-key-netkeiba_embed iframe {
+    flex: 1 1 auto !important;
+    height: 100% !important;
+    min-height: 0 !important;
+}
+
+.st-key-netkeiba_embed iframe {
+    border: 1px solid #e1e4e8 !important;
+    border-radius: var(--radius);
+    background-color: white;
 }
