@@ -6,8 +6,9 @@
         1番人気を買い続けた場合より良いときだけ採用(data/models/shutuba_model.txt)する
 - 予想: app.py の単一レース予想から predict_shutuba() を呼び出す
 
-走破タイム・上がり3F・通過順・着順はレースが終わらないと分からないため特徴量に使わない
-(着順は目的変数と、その馬の「次のレース」の前走成績としてだけ使う)。
+走破タイム・上がり3F・通過順・着順はレースが終わらないと分からないため、そのレースの特徴量には使わない
+(着順は目的変数として、またこれらはその馬の「次走以降」の前走成績としてだけ使う)。
+特徴量グループごとの効果は python -m model.shutuba_ablation で比較できる。
 
 使い方:
     python -m model.shutuba_model            # データ作成 → 学習 → テスト検証 → 合格なら採用
@@ -38,21 +39,53 @@ JOCKEY_STATS_PATH = MODEL_DIR / "shutuba_jockey_daily.csv"
 HISTORY_WINDOW = 5
 
 # レース後にしか分からない列。学習データには残るが、特徴量には絶対に入れない。
-POST_RACE_COLUMNS = {"走破時間", "上がり", "通過順", "着順"}
+POST_RACE_COLUMNS = {"走破時間", "上がり", "通過順", "着順", "タイム", "通過", "上り"}
+# そのうち、その馬の「次走以降」の前走成績(タイム差・位置取り・上がり)を作るのに使う列。
+PAST_RUN_SOURCE_COLUMNS = ["タイム", "通過", "上り"]
 
-FEATURE_COLUMNS = [
+BASE_FEATURE_COLUMNS = [
     "枠番", "馬番", "頭数", "斤量", "体重", "体重変化", "性", "齢",
     "単勝オッズ", "人気", "人気比", "市場確率",
     "芝・ダート", "距離", "回り", "馬場", "天気", "場id", "クラス",
     "騎手騎乗数", "騎手3着内率", "騎手勝率",
     "前走着順", "近走平均着順", "近走3着内率", "前走間隔",
 ]
-assert not POST_RACE_COLUMNS & set(FEATURE_COLUMNS)
+
+# 追加特徴量の候補。グループ単位の効果は python -m model.shutuba_ablation で比較する。
+# どれも出馬表と各馬の戦績(当日より前の走)だけから作れる。
+FEATURE_GROUPS = {
+    "近走の人気・着順率": [
+        "前走人気", "前走単勝オッズ", "前走頭数", "前走着順率",
+        "近走平均人気", "近走平均着順率", "近走人気超過", "近走数",
+    ],
+    "条件替わり": ["距離変化", "芝ダ替わり", "クラス変化", "斤量変化"],
+    "タイム差・位置取り": [
+        "前走タイム差", "近走平均タイム差", "近走最小タイム差",
+        "前走上がり", "前走4角位置率", "近走平均4角位置率",
+    ],
+    "レース内相対": ["斤量_対平均", "騎手3着内率_対平均", "近走平均着順率_対平均", "近走平均タイム差_対平均"],
+}
+ALL_FEATURE_COLUMNS = BASE_FEATURE_COLUMNS + [c for cols in FEATURE_GROUPS.values() for c in cols]
+
+# 学習・予想に使う特徴量(比較の結果、採用するグループ)。
+ADOPTED_GROUPS = list(FEATURE_GROUPS)
+FEATURE_COLUMNS = BASE_FEATURE_COLUMNS + [c for g in ADOPTED_GROUPS for c in FEATURE_GROUPS[g]]
+assert not POST_RACE_COLUMNS & set(ALL_FEATURE_COLUMNS)
 
 FEATURE_DISPLAY_NAMES = {
     "単勝オッズ": "単勝オッズ", "市場確率": "オッズから見た勝率", "人気比": "人気(頭数比)",
     "騎手3着内率": "騎手の3着内率", "騎手勝率": "騎手の勝率", "前走着順": "前走着順",
     "近走平均着順": "近5走の平均着順", "近走3着内率": "近5走の3着内率", "前走間隔": "レース間隔",
+    "前走人気": "前走の人気", "前走単勝オッズ": "前走の単勝オッズ", "前走頭数": "前走の頭数",
+    "前走着順率": "前走着順(頭数比)", "近走平均人気": "近5走の平均人気", "近走平均着順率": "近5走の着順(頭数比)",
+    "近走人気超過": "近5走で人気以上に走った度合い", "近走数": "近走の出走数",
+    "距離変化": "前走からの距離変化", "芝ダ替わり": "芝・ダート替わり", "クラス変化": "前走からのクラス変化",
+    "斤量変化": "前走からの斤量変化",
+    "前走タイム差": "前走の勝ち馬とのタイム差", "近走平均タイム差": "近5走の平均タイム差",
+    "近走最小タイム差": "近5走で最も小さいタイム差", "前走上がり": "前走の上がり3F",
+    "前走4角位置率": "前走の4角位置", "近走平均4角位置率": "近5走の4角位置",
+    "斤量_対平均": "斤量(出走馬平均との差)", "騎手3着内率_対平均": "騎手の3着内率(出走馬平均との差)",
+    "近走平均着順率_対平均": "近走着順(出走馬平均との差)", "近走平均タイム差_対平均": "近走タイム差(出走馬平均との差)",
 }
 
 
@@ -113,6 +146,9 @@ def parse_race_file(path):
             "単勝": r.get("単勝"),
             "人気": r.get("人気"),
             "着順": r.get("着順"),
+            "タイム": r.get("タイム"),
+            "通過": r.get("通過"),
+            "上り": r.get("上り"),
             "芝・ダート": meta["芝・ダート"],
             "距離": meta["距離"],
             "回り": meta["回り"],
@@ -130,7 +166,11 @@ def load_collected_rows(split, rebuild=False, workers=None):
     """data/{split}/race_html を解析した表を返す。解析結果はCSVにキャッシュする。"""
     cache = ROWS_CACHE[split]
     if cache.exists() and not rebuild:
-        return pd.read_csv(cache, encoding="utf-8-sig", dtype={"race_id": str, "場id": str})
+        df = pd.read_csv(cache, encoding="utf-8-sig", dtype={"race_id": str, "場id": str})
+        missing = [c for c in PAST_RUN_SOURCE_COLUMNS if c not in df.columns]
+        if not missing:
+            return df
+        print(f"{cache} に {missing} の列がないため、HTMLを解析し直します。")
 
     html_dir = TRAIN_HTML_DIR if split == "train" else TEST_HTML_DIR
     paths = sorted(html_dir.glob("*.html"))
@@ -208,20 +248,169 @@ def base_features(df):
     return out
 
 
-def _horse_history_from_ranks(dates, ranks, race_date):
-    """過去走の(日付, 着順)から前走着順・近走平均着順・近走3着内率・前走間隔を作る。"""
-    past = pd.DataFrame({"date": pd.to_datetime(pd.Series(dates, dtype=object), errors="coerce"),
-                         "rank": pd.to_numeric(pd.Series(ranks, dtype=object), errors="coerce")})
-    past = past[past["date"] < race_date].sort_values("date", ascending=False).head(HISTORY_WINDOW)
-    if past.empty:
-        return {"前走着順": np.nan, "近走平均着順": np.nan, "近走3着内率": np.nan, "前走間隔": np.nan}
-    ranks = past["rank"].dropna()
-    return {
-        "前走着順": past["rank"].iloc[0],
-        "近走平均着順": ranks.mean() if len(ranks) else np.nan,
-        "近走3着内率": (ranks <= 3).mean() if len(ranks) else np.nan,
-        "前走間隔": float((race_date - past["date"].iloc[0]).days),
-    }
+# ---- 馬の近走特徴量(学習・予想で共通の計算)
+#
+# 「1頭の1走=1行」の表(RUN_COLUMNS)を作り、horse_history_features() に渡す。
+# 学習時は収集データ全体、予想時は「戦績ページの過去走+今回の出走」を渡すので、計算式は1か所だけ。
+
+RUN_COLUMNS = [
+    "_horse", "_date", "_rank",  # 馬のキー・開催日・着順(その走の結果)
+    "頭数", "人気", "単勝オッズ", "距離", "芝・ダート", "クラス", "斤量",
+    "_margin", "_last3f", "_corner",  # 勝ち馬との秒差・上がり3F・最終コーナー位置(頭数比)
+]
+MARGIN_CLIP = 5.0  # 大差負け(追うのをやめた走)が平均を歪めないよう、タイム差は5秒で頭打ちにする
+
+
+def _last_corner(value):
+    """通過順「10-8-5」の最後(最終コーナー)の順位。"""
+    if pd.isna(value):
+        return np.nan
+    return pd.to_numeric(str(value).strip().split("-")[-1], errors="coerce")
+
+
+def _winner_margin(df):
+    """走破タイムから勝ち馬との秒差を作る(勝ち馬は2着馬との差で負の値)。戦績ページの「着差」と同じ定義。"""
+    seconds = df["タイム"].map(encode.parse_time_to_seconds)
+    best = seconds.groupby(df["race_id"]).transform("min")
+    runner_up = seconds.where(seconds > best).groupby(df["race_id"]).transform("min")
+    margin = seconds - best
+    sole_winner = (margin == 0) & ((margin == 0).groupby(df["race_id"]).transform("sum") == 1)
+    return margin.where(~sole_winner, best - runner_up)
+
+
+def horse_history_features(runs):
+    """RUN_COLUMNS の表から、各行の「その走より前」の成績だけで近走特徴量を作る(行の並びは入力のまま)。
+
+    各行自身の結果(_rank, _margin, _last3f, _corner, 人気など)はその行の特徴量には使わず、
+    1走ずらした値(前走)と直近 HISTORY_WINDOW 走の集計だけを使う。
+    今回の条件(距離・芝ダ・クラス・斤量)は前走との差を取るためにだけ参照する。
+    """
+    r = runs.sort_values(["_horse", "_date"], kind="stable")
+    horse = r["_horse"]
+    grp = r.groupby("_horse", sort=False)
+
+    def prev(series):
+        return series.groupby(horse, sort=False).shift(1)
+
+    def recent(series, how="mean"):
+        roll = series.groupby(horse, sort=False).rolling(HISTORY_WINDOW, min_periods=1)
+        return getattr(roll, how)().reset_index(level=0, drop=True)
+
+    prev_rank = prev(r["_rank"])
+    prev_field = prev(r["頭数"])
+    prev_pop = prev(r["人気"])
+    prev_rank_rate = prev_rank / prev_field
+    prev_margin = prev(r["_margin"]).clip(upper=MARGIN_CLIP)
+    prev_corner = prev(r["_corner"])
+    prev_surface = prev(r["芝・ダート"])
+
+    out = pd.DataFrame(index=r.index)
+    out["前走着順"] = prev_rank
+    out["近走平均着順"] = recent(prev_rank)
+    out["近走3着内率"] = recent((prev_rank <= 3).astype(float).where(prev_rank.notna()))
+    out["前走間隔"] = (r["_date"] - prev(r["_date"])).dt.days
+
+    out["前走人気"] = prev_pop
+    out["前走単勝オッズ"] = prev(r["単勝オッズ"])
+    out["前走頭数"] = prev_field
+    out["前走着順率"] = prev_rank_rate
+    out["近走平均人気"] = recent(prev_pop)
+    out["近走平均着順率"] = recent(prev_rank_rate)
+    out["近走人気超過"] = recent(prev_pop - prev_rank)  # 正なら人気より上の着順に来ている
+    out["近走数"] = grp.cumcount().clip(upper=HISTORY_WINDOW).astype(float)
+
+    out["距離変化"] = r["距離"] - prev(r["距離"])
+    out["芝ダ替わり"] = (r["芝・ダート"] != prev_surface).astype(float).where(
+        r["芝・ダート"].notna() & prev_surface.notna())
+    out["クラス変化"] = r["クラス"] - prev(r["クラス"])
+    out["斤量変化"] = r["斤量"] - prev(r["斤量"])
+
+    out["前走タイム差"] = prev_margin
+    out["近走平均タイム差"] = recent(prev_margin)
+    out["近走最小タイム差"] = recent(prev_margin, "min")
+    out["前走上がり"] = prev(r["_last3f"])
+    out["前走4角位置率"] = prev_corner
+    out["近走平均4角位置率"] = recent(prev_corner)
+    return out.reindex(runs.index)
+
+
+RELATIVE_SOURCE_COLUMNS = ["斤量", "騎手3着内率", "近走平均着順率", "近走平均タイム差"]
+
+
+def add_race_relative_features(feats, race_id):
+    """同じレースの出走馬の平均との差(相手関係)を付ける。取消馬を外す前の全出走馬で計算する。"""
+    feats = feats.copy()
+    for col in RELATIVE_SOURCE_COLUMNS:
+        feats[f"{col}_対平均"] = feats[col] - feats[col].groupby(race_id).transform("mean")
+    return feats
+
+
+def _training_runs(df, feats):
+    """学習用: 収集データ(add_jockey_history 済み)と base_features から RUN_COLUMNS の表を作る。"""
+    runs = pd.DataFrame({"_horse": df["_horse"], "_date": df["_date"], "_rank": df["_rank"]})
+    for col in ["頭数", "人気", "単勝オッズ", "距離", "芝・ダート", "クラス", "斤量"]:
+        runs[col] = feats[col]
+    runs["_margin"] = _winner_margin(df)
+    runs["_last3f"] = _num(df["上り"])
+    runs["_corner"] = df["通過"].map(_last_corner) / feats["頭数"]
+    return runs[RUN_COLUMNS]
+
+
+def _encode_results_page_class(race_name):
+    """戦績ページのレース名「○○S(OP)」「3歳未勝利」などをクラスコードにする。"""
+    code = encode.encode_class(race_name)
+    if pd.isna(code) and "OP" in str(race_name):
+        return float(encode.encode_class("オープン"))
+    return code
+
+
+def _past_runs_from_results(key, results, race_date):
+    """予想用: 戦績ページの表(scraper.scrape_race_results_dedicated)から race_date より前の走を RUN_COLUMNS にする。"""
+    if results is None or results.empty or "日付" not in results.columns or "着順" not in results.columns:
+        return None
+
+    def col(name):
+        return results[name] if name in results.columns else pd.Series(np.nan, index=results.index)
+
+    course = col("距離").astype(str).str.extract(r"(芝|ダ|障)\D*(\d{3,4})")
+    field = _num(col("頭数"))
+    runs = pd.DataFrame({
+        "_horse": key,
+        "_date": pd.to_datetime(results["日付"], errors="coerce"),
+        "_rank": results["着順"].map(encode.parse_rank),
+        "頭数": field,
+        "人気": _num(col("人気")),
+        "単勝オッズ": _num(col("オッズ")),
+        "距離": pd.to_numeric(course[1], errors="coerce"),
+        "芝・ダート": course[0].map({"芝": "芝", "ダ": "ダート", "障": "障害"}).map(encode.encode_surface),
+        "クラス": col("レース名").map(_encode_results_page_class),
+        "斤量": _num(col("斤量")),
+        "_margin": _num(col("着差")),
+        "_last3f": _num(col("上り")),
+        "_corner": col("通過").map(_last_corner) / field,
+    })
+    runs = runs[runs["_date"] < race_date]
+    return runs[RUN_COLUMNS] if len(runs) else None
+
+
+def entry_history_features(feats, results_list, race_date):
+    """予想用: 出走馬ごとの戦績ページ(results_list は feats と同じ並び)から近走特徴量を作る。
+
+    今回の出走を「最新の1走」として過去走の後ろに並べ、学習時と同じ horse_history_features() で計算する。
+    """
+    race_date = pd.Timestamp(race_date)
+    current = pd.DataFrame({"_horse": range(len(feats)), "_date": race_date, "_rank": np.nan})
+    for col in ["頭数", "人気", "単勝オッズ", "距離", "芝・ダート", "クラス", "斤量"]:
+        current[col] = feats[col].to_numpy(dtype=float)
+    for col in ["_margin", "_last3f", "_corner"]:
+        current[col] = np.nan
+    current = current[RUN_COLUMNS]
+
+    past = [_past_runs_from_results(key, results, race_date) for key, results in enumerate(results_list)]
+    frames = [current] + [p.astype({c: float for c in RUN_COLUMNS[2:]}) for p in past if p is not None]
+    history = horse_history_features(pd.concat(frames, ignore_index=True)).iloc[:len(current)]
+    history.index = feats.index
+    return history
 
 
 def jockey_daily_table(df):
@@ -237,8 +426,8 @@ def jockey_daily_table(df):
     return work.groupby(["騎手", "日付"], as_index=False)[["騎乗", "1着", "3着内"]].sum()
 
 
-def add_history_features(df):
-    """学習用: 同じデータ内の過去レースから騎手成績・馬の近走成績を付ける(当日以降は使わない)。"""
+def add_jockey_history(df):
+    """学習用: 同じデータ内の過去レースから騎手成績を付け、馬・開催日順に並べ替える(当日以降は使わない)。"""
     df = df.copy()
     df["_date"] = pd.to_datetime(df["日付"], format="%Y/%m/%d", errors="coerce")
     df["_rank"] = df["着順"].map(encode.parse_rank)
@@ -257,32 +446,32 @@ def add_history_features(df):
     df["騎手3着内率"] = df["_j_top3"] / rides
     df["騎手勝率"] = df["_j_win"] / rides
 
-    # 馬: 同じ馬名の直近5走(当日より前)
+    # 馬の近走特徴量(同じ馬名の当日より前の走)は horse_history_features() が馬・開催日順で計算する
     df = df.sort_values(["_horse", "_date"]).reset_index(drop=True)
-    grp = df.groupby("_horse")
-    prev_rank = grp["_rank"].shift(1)
-    df["前走着順"] = prev_rank
-    df["前走間隔"] = (df["_date"] - grp["_date"].shift(1)).dt.days
-    df["近走平均着順"] = prev_rank.groupby(df["_horse"]).transform(lambda s: s.rolling(HISTORY_WINDOW, min_periods=1).mean())
-    prev_top3 = (prev_rank <= 3).astype(float).where(prev_rank.notna())
-    df["近走3着内率"] = prev_top3.groupby(df["_horse"]).transform(lambda s: s.rolling(HISTORY_WINDOW, min_periods=1).mean())
     return df.drop(columns=["_j_win", "_j_top3"])
 
 
+def training_features(rows):
+    """収集データ(1頭1行)に特徴量候補すべてを付け、(馬・開催日順に並べた表, 特徴量)を返す。"""
+    df = add_jockey_history(rows)
+    feats = base_features(df)
+    for col in ["騎手騎乗数", "騎手3着内率", "騎手勝率"]:
+        feats[col] = df[col]
+    feats = feats.join(horse_history_features(_training_runs(df, feats)))
+    return df, add_race_relative_features(feats, df["race_id"])
+
+
 def build_training_table(rebuild=False):
-    """train/test を結合して履歴特徴量を付け、split 列付きで返す。"""
+    """train/test を結合して履歴特徴量を付け、split 列付きで返す(特徴量は候補すべて=ALL_FEATURE_COLUMNS)。"""
     train = load_collected_rows("train", rebuild=rebuild).assign(split="train")
     test = load_collected_rows("test", rebuild=rebuild).assign(split="test")
-    df = add_history_features(pd.concat([train, test], ignore_index=True))
-    # 頭数・市場確率は出馬表と同じく全出走馬で計算してから、取消・除外・中止の馬を外す
-    feats = base_features(df)
-    for col in ["騎手騎乗数", "騎手3着内率", "騎手勝率", "前走着順", "近走平均着順", "近走3着内率", "前走間隔"]:
-        feats[col] = df[col]
+    # 頭数・市場確率・レース内相対は出馬表と同じく全出走馬で計算してから、取消・除外・中止の馬を外す
+    df, feats = training_features(pd.concat([train, test], ignore_index=True))
     keep = df["_rank"].notna()
     df = df[keep].reset_index(drop=True)
     feats = feats[keep].reset_index(drop=True)
     df["top3"] = (df["_rank"] <= 3).astype(int)
-    return df, feats[FEATURE_COLUMNS]
+    return df, feats[ALL_FEATURE_COLUMNS]
 
 
 # ---------------------------------------------------------------- 学習・検証
@@ -301,32 +490,44 @@ def _pick_stats(df, score_col):
     }
 
 
-def train_and_validate(rebuild=False, force=False):
+LGB_PARAMS = dict(
+    objective="binary", learning_rate=0.03, num_leaves=31, min_child_samples=50,
+    subsample=0.8, subsample_freq=1, colsample_bytree=0.8, reg_lambda=1.0, verbosity=-1,
+)
+
+
+def fit_model(x, y, dates, train_mask, seed=42):
+    """train_mask(真偽の配列)の行で学習し、(モデル, 木の本数)を返す。
+
+    木の本数は、学習データの最後の15%(日付順)を検証にした早期終了で決め、その本数で全学習データを学習し直す。
+    """
     import lightgbm as lgb
-    from sklearn.metrics import log_loss, roc_auc_score
 
-    df, x = build_training_table(rebuild=rebuild)
-    is_train = (df["split"] == "train").to_numpy()
-    y = df["top3"]
+    params = dict(LGB_PARAMS, random_state=seed)
+    valid_start = dates[train_mask].quantile(0.85)
+    fit_mask = train_mask & (dates < valid_start).to_numpy()
+    valid_mask = train_mask & ~fit_mask
 
-    # 学習データの最後の15%(日付順)で早期終了の回数を決める
-    train_dates = df.loc[is_train, "_date"]
-    valid_start = train_dates.quantile(0.85)
-    fit_mask = is_train & (df["_date"] < valid_start).to_numpy()
-    valid_mask = is_train & ~fit_mask
-
-    params = dict(
-        objective="binary", learning_rate=0.03, num_leaves=31, min_child_samples=50,
-        subsample=0.8, subsample_freq=1, colsample_bytree=0.8, reg_lambda=1.0,
-        random_state=42, verbosity=-1,
-    )
     probe = lgb.LGBMClassifier(n_estimators=3000, **params)
     probe.fit(x[fit_mask], y[fit_mask], eval_set=[(x[valid_mask], y[valid_mask])],
               callbacks=[lgb.early_stopping(100, verbose=False)])
     best_iter = max(int(probe.best_iteration_ or 0), 50)
 
     model = lgb.LGBMClassifier(n_estimators=best_iter, **params)
-    model.fit(x[is_train], y[is_train])
+    model.fit(x[train_mask], y[train_mask])
+    return model, best_iter
+
+
+def train_and_validate(rebuild=False, force=False):
+    from sklearn.metrics import log_loss, roc_auc_score
+
+    df, x = build_training_table(rebuild=rebuild)
+    x = x[FEATURE_COLUMNS]
+    is_train = (df["split"] == "train").to_numpy()
+    y = df["top3"]
+    train_dates = df.loc[is_train, "_date"]
+
+    model, best_iter = fit_model(x, y, df["_date"], is_train)
 
     test = df[~is_train].copy()
     test["model_proba"] = model.predict_proba(x[~is_train])[:, 1]
@@ -435,17 +636,8 @@ def predict_shutuba(bundle, race_id, race_info, shutuba_df, all_horse_data, race
 
     results_by_name = {clean_horse_name(h["pedigree"].get("name")): h.get("results") for h in (all_horse_data or [])}
     names = shutuba_df.loc[entries.index, "馬名"].map(clean_horse_name)
-    history = []
-    for name in names:
-        res = results_by_name.get(name)
-        if res is None or res.empty or "日付" not in res.columns or "着順" not in res.columns:
-            history.append(_horse_history_from_ranks([], [], race_date))
-            continue
-        dates = pd.to_datetime(res["日付"], errors="coerce")
-        history.append(_horse_history_from_ranks(dates, res["着順"].map(encode.parse_rank), race_date))
-    history = pd.DataFrame(history, index=entries.index)
-    for col in history.columns:
-        feats[col] = history[col]
+    feats = feats.join(entry_history_features(feats, [results_by_name.get(name) for name in names], race_date))
+    feats = add_race_relative_features(feats, entries["race_id"])
 
     booster = bundle["booster"]
     x = feats[booster.feature_name()].apply(pd.to_numeric, errors="coerce")

@@ -617,12 +617,46 @@ def _format_odds_combo_key(key):
     return "-".join(parts)
 
 
+def _extract_jra_odds_map(payload, type_code):
+    """オッズAPIの応答から {組み合わせキー: 行} を取り出す。発売前は data が空文字などになるので空を返す。"""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    odds = data.get("odds") if isinstance(data, dict) else None
+    odds_map = odds.get(type_code) if isinstance(odds, dict) else None
+    return odds_map if isinstance(odds_map, dict) else {}
+
+
+def _scrape_local_win_odds(race_id):
+    """地方競馬の単勝オッズ。地方のオッズAPIは type を指定しても単勝しか返さない。"""
+    url = "https://nar.netkeiba.com/api/api_get_nar_odds.html"
+    try:
+        res = session.get(url, headers=HEADERS, params={"race_id": race_id, "type": "1", "action": "init"}, timeout=10)
+        payload = res.json()
+    except Exception as e:
+        print(f"[odds] {race_id} 地方単勝: 取得失敗 {type(e).__name__}: {e}")
+        return {}
+    rows = payload.get("ary_odds") if isinstance(payload, dict) else None
+    combo_odds = {}
+    for key, row in (rows if isinstance(rows, dict) else {}).items():
+        try:
+            odds = float(str(row["Odds"]).replace(",", ""))
+            if odds > 0:
+                combo_odds[str(int(key))] = {"odds": odds, "odds_max": odds}
+        except Exception:
+            continue  # 発売前は "---.-" などの非数値が入る
+    return combo_odds
+
+
 def scrape_realtime_odds(race_id, ticket_types):
     """指定した券種の現在オッズをnetkeibaのオッズAPIから取得する（購入前のガミリチェック用）。
 
     戻り値: {券種: {"馬番-馬番(-馬番)": {"odds": 最低オッズ, "odds_max": 最高オッズ}}}
     複勝・ワイドは最低〜最高のレンジオッズで返ってくるため、両方を保持する。
+    未発売の券種は戻り値に含まれない。地方競馬は単勝のみ取得できる。
     """
+    if is_local_race_id(race_id):
+        win_odds = _scrape_local_win_odds(race_id) if "単勝" in ticket_types else {}
+        return {"単勝": win_odds} if win_odds else {}
+
     url = "https://race.netkeiba.com/api/api_get_jra_odds.html"
     result = {}
     for ticket_type in ticket_types:
@@ -634,9 +668,10 @@ def scrape_realtime_odds(race_id, ticket_types):
             continue
         res = None
         try:
+            # action=init がないと確定後のオッズしか返らず、発売中は data が空になる
             res = session.get(
                 url, headers=HEADERS,
-                params={"race_id": race_id, "type": type_code, "housiki": "c99"},
+                params={"race_id": race_id, "type": type_code, "housiki": "c99", "action": "init"},
                 timeout=10,
             )
             payload = res.json()
@@ -646,25 +681,23 @@ def scrape_realtime_odds(race_id, ticket_types):
             print(f"[odds] {race_id} {ticket_type}: 取得失敗 HTTP={status} {type(e).__name__}: {e} 応答先頭={head!r}")
             continue
 
-        odds_map = (payload.get("data") or {}).get("odds", {}).get(type_code, {})
+        odds_map = _extract_jra_odds_map(payload, type_code)
         if not odds_map:
-            print(
-                f"[odds] {race_id} {ticket_type}: オッズが空 HTTP={res.status_code} "
-                f"status={payload.get('status')!r} reason={payload.get('reason')!r} "
-                f"data_keys={list((payload.get('data') or {}).keys())}"
-            )
+            status = payload.get("status") if isinstance(payload, dict) else None
+            reason = payload.get("reason") if isinstance(payload, dict) else None
+            print(f"[odds] {race_id} {ticket_type}: オッズが空 HTTP={res.status_code} status={status!r} reason={reason!r}")
         combo_odds = {}
         for key, row in odds_map.items():
             try:
                 combo = _format_odds_combo_key(key)
                 odds_min = float(str(row[0]).replace(",", ""))
+                if odds_min <= 0:  # 発売直後などの 0.0 は「オッズなし」として扱う
+                    continue
                 odds_max_raw = float(str(row[1]).replace(",", "")) if len(row) > 1 and str(row[1]).strip() else 0.0
                 odds_max = odds_max_raw if odds_max_raw > 0 else odds_min
                 combo_odds[combo] = {"odds": odds_min, "odds_max": odds_max}
             except Exception:
                 continue
-        if odds_map and not combo_odds:
-            print(f"[odds] {race_id} {ticket_type}: {len(odds_map)}件あるが解析できず 例={next(iter(odds_map.items()))!r}")
         if combo_odds:
             result[ticket_type] = combo_odds
     return result

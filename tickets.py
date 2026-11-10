@@ -1,4 +1,5 @@
 import json
+import math
 import re
 
 
@@ -103,10 +104,12 @@ def calculate_return(bets, payouts):
     return total_bet, total_return, hits, ticket_stats
 
 
-def check_gamiri(bets, odds_data):
+def check_gamiri(bets, odds_data, min_return_ratio=1.0):
     """現在オッズをもとに、買い目が的中しても購入合計額を下回ってしまう「ガミリ」を検出する。
 
     ガミリ = ある買い目が的中したときの推定払戻が、買い目全体の購入合計を下回る状態。
+    払戻が「購入合計×min_return_ratio」以上なら、許容範囲内のガミとして区別する。
+    オッズが未発表の買い目は判定を保留し、required_odds(この倍率以上なら許容範囲に収まる)だけを返す。
     戻り値: (rows, total_bet)
     """
     normalized_bets = normalize_bet_amounts(bets)
@@ -130,20 +133,28 @@ def check_gamiri(bets, odds_data):
                 odds_info = info
                 break
 
-        if odds_info is None:
+        # 小数第1位に切り上げ(表示どおりのオッズが付けば条件を満たす)
+        required_odds = math.ceil(total_bet * min_return_ratio / amount * 10 - 1e-9) / 10
+        odds_value = odds_info.get("odds") if odds_info else None
+        if not odds_value or odds_value <= 0:
             rows.append({
-                "type": raw_type, "combo": combo, "amount": amount,
-                "odds": None, "est_return": None, "profit": None, "is_gamiri": None,
+                "type": raw_type, "combo": combo, "amount": amount, "required_odds": required_odds,
+                "odds": None, "est_return": None, "profit": None, "is_gamiri": None, "status": "オッズ未発表",
             })
             continue
 
-        odds_value = odds_info.get("odds", 0)
         est_return = int(round(amount * odds_value))
         profit = est_return - total_bet
+        if profit >= 0:
+            status = "問題なし"
+        elif est_return >= total_bet * min_return_ratio:
+            status = "ガミ（許容内）"
+        else:
+            status = "ガミ"
         rows.append({
-            "type": raw_type, "combo": combo, "amount": amount,
+            "type": raw_type, "combo": combo, "amount": amount, "required_odds": required_odds,
             "odds": odds_value, "est_return": est_return, "profit": profit,
-            "is_gamiri": profit < 0,
+            "is_gamiri": profit < 0, "status": status,
         })
 
     return rows, total_bet

@@ -41,7 +41,12 @@ from tickets import (
 )
 from ui_helpers import load_css, memo_ui
 import ml_ui
-from gami_prompt import GAMI_ODDS_TICKET_TYPES, build_gami_free_prompt
+from gami_prompt import (
+    DEFAULT_MIN_RETURN_RATIO,
+    GAMI_ODDS_TICKET_TYPES,
+    MIN_RETURN_RATIO_OPTIONS,
+    build_gami_free_prompt,
+)
 from model.live_predict import PLACE_NAMES, load_reference_data, predict_race
 from model.shutuba_model import format_for_prompt as format_shutuba_model_for_prompt
 from model.shutuba_model import load_adopted_model, predict_shutuba
@@ -424,8 +429,8 @@ def build_full_ai_betting_prompt(race_id, max_budget, plan_blocks=None, use_full
     return "\n".join(sections)
 
 
-def build_gami_betting_prompt(race_id, budget, use_full_budget=False):
-    """Step1〜3の評価と現在オッズから、ガミが出ない買い方を組ませるプロンプト。AI予測がなければNone。"""
+def build_gami_betting_prompt(race_id, budget, use_full_budget=False, min_return_ratio=DEFAULT_MIN_RETURN_RATIO):
+    """Step1〜3の評価と現在オッズから、的中率を優先した買い方を組ませるプロンプト。AI予測がなければNone。"""
     prediction = st.session_state.get("ml_prediction")
     if prediction is None:
         return None
@@ -433,7 +438,7 @@ def build_gami_betting_prompt(race_id, budget, use_full_budget=False):
         odds_table = scraper.scrape_realtime_odds(race_id, GAMI_ODDS_TICKET_TYPES)
     return build_gami_free_prompt(
         race_id, st.session_state.race_info, prediction, st.session_state.race_volatility,
-        odds_table, budget, use_full_budget,
+        odds_table, budget, use_full_budget, min_return_ratio=min_return_ratio,
     )
 
 
@@ -446,7 +451,7 @@ def run_full_ai_betting_analysis(race_id, max_budget, prompt):
 
     reports = {}
     for ai_name, ask_func in targets:
-        with st.spinner(f"{ai_name} がAI評価と現在オッズからガミの出ない買い方を検討中..."):
+        with st.spinner(f"{ai_name} がAI評価と現在オッズから買い方を検討中..."):
             response = ask_func(prompt)
         reports[ai_name] = response
 
@@ -1674,7 +1679,8 @@ with tab_ai, st.container(key="panel_ai"):
     with ai_left:
         st.caption(
             "各馬の能力評価はStep1〜3の機械学習モデルに任せ、AIにはその評価と現在オッズを渡して、"
-            "どの買い目が的中しても払戻が購入合計を下回らない（ガミが出ない）券種・組み合わせ・金額配分を組ませます。"
+            "的中率を優先しながら、的中時の損失を許容範囲に抑える券種・組み合わせ・金額配分を組ませます。"
+            "オッズの発表前は、モデルの確率から推定したオッズで暫定の買い目を組みます。"
         )
         with st.expander("買い方プラン（任意）", icon=":material/tune:", expanded=False):
             render_bet_plan_selector()
@@ -1698,14 +1704,24 @@ with tab_ai, st.container(key="panel_ai"):
             key="full_ai_use_full_budget",
             disabled=bool(plan_blocks),
         )
+        min_return_ratio = st.select_slider(
+            "的中時の最低回収率",
+            options=sorted(MIN_RETURN_RATIO_OPTIONS),
+            value=DEFAULT_MIN_RETURN_RATIO,
+            format_func=lambda ratio: f"{ratio:.0%}",
+            key="full_ai_min_return_ratio",
+            help="どの買い目が的中しても、払戻が購入合計のこの割合を下回らないようにします。"
+                 "100%はガミを許しません。下げると低オッズの買い目を残しやすくなりますが、"
+                 "的中しても損をする場合が増えます。",
+        )
 
-        # ガミ回避の提案では、買い方プランの見積合計を予算として使う（券種・点数はガミ回避を優先してAIが決める）
+        # 提案では、買い方プランの見積合計を予算として使う（券種・点数はAIが決める）
         gami_budget = int(plan_total) if plan_blocks else int(full_max_budget)
         if plan_blocks:
             st.caption(f":material/check: 買い方プランの見積合計{plan_total}円を予算にします。")
 
         if st.button("AIに買い方を提案させる", type="primary", icon=":material/auto_awesome:",
-                     use_container_width=True, help="ガミが出ない券種・組み合わせ・金額配分をAIが組みます。"):
+                     use_container_width=True, help="的中率を優先した券種・組み合わせ・金額配分をAIが組みます。"):
             if ai_choice == "ルールベース (AI不使用)":
                 rule_result = run_rule_based_analysis(
                     st.session_state.all_horse_data,
@@ -1731,8 +1747,8 @@ with tab_ai, st.container(key="panel_ai"):
                 st.error("Gemini APIキーがありません")
             elif ai_choice in ["ChatGPT", "両方で比較"] and not API_KEY_OPENAI:
                 st.error("OpenAI APIキーがありません")
-            elif (gami_prompt := build_gami_betting_prompt(race_id, gami_budget, use_full_budget)) is None:
-                st.error("Step1〜3のAI予測が出ていないため、ガミ回避の買い方を組めません。")
+            elif (gami_prompt := build_gami_betting_prompt(race_id, gami_budget, use_full_budget, min_return_ratio)) is None:
+                st.error("Step1〜3のAI予測が出ていないため、買い方を組めません。")
             else:
                 st.session_state.full_ai_reports = run_full_ai_betting_analysis(race_id, gami_budget, gami_prompt)
                 for model_name, response in st.session_state.full_ai_reports.items():
@@ -1748,7 +1764,7 @@ with tab_ai, st.container(key="panel_ai"):
         if st.button("プロンプトを出力", icon=":material/content_copy:",
                      use_container_width=True, key="generate_shareable_prompt",
                      help="APIを使わず、上のボタンと同じプロンプトをテキストで出力します。任意のAIチャットに貼り付けて使えます。"):
-            shareable_prompt = build_gami_betting_prompt(race_id, gami_budget, use_full_budget)
+            shareable_prompt = build_gami_betting_prompt(race_id, gami_budget, use_full_budget, min_return_ratio)
             if shareable_prompt is None:
                 st.error("Step1〜3のAI予測が出ていないため、プロンプトを作れません。")
             else:
@@ -1793,6 +1809,7 @@ with tab_ai, st.container(key="panel_ai"):
             st.caption(
                 "現在のオッズを取得し、買い目のどれかが的中しても購入合計額を下回ってしまう"
                 "「ガミリ」が起きていないかを購入前にチェックします。"
+                "オッズの発表前は、必要オッズだけを表示します。"
             )
             gamiri_target_models = [
                 model_name for model_name, pred in st.session_state.latest_predictions.items()
@@ -1809,9 +1826,10 @@ with tab_ai, st.container(key="panel_ai"):
                     ticket_types_needed = sorted({b.get("type", "") for b in target_bets if b.get("type")})
                     with st.spinner("最新オッズを取得中..."):
                         odds_data = scraper.scrape_realtime_odds(race_id, ticket_types_needed)
-                    rows, total_bet = check_gamiri(target_bets, odds_data)
+                    rows, total_bet = check_gamiri(target_bets, odds_data, min_return_ratio)
                     st.session_state.gamiri_check_result = {
                         "model": gamiri_model, "race_id": race_id, "rows": rows, "total_bet": total_bet,
+                        "min_return_ratio": min_return_ratio,
                     }
 
                 gamiri_result = st.session_state.get("gamiri_check_result")
@@ -1823,28 +1841,38 @@ with tab_ai, st.container(key="panel_ai"):
                     else:
                         df_rows = pd.DataFrame(rows)
                         display_df = df_rows.rename(columns={
-                            "type": "券種", "combo": "組み合わせ", "amount": "購入額",
+                            "type": "券種", "combo": "組み合わせ", "amount": "購入額", "required_odds": "必要オッズ",
                             "odds": "現在オッズ", "est_return": "的中時の推定払戻", "profit": "購入合計との損益",
-                        }).copy()
-                        display_df["判定"] = df_rows["is_gamiri"].map(
-                            lambda x: "ガミリ" if x is True else ("問題なし" if x is False else "オッズ取得不可")
+                            "status": "判定",
+                        }).drop(columns=["is_gamiri"])
+                        st.dataframe(display_df, use_container_width=True, hide_index=True)
+                        checked_ratio = gamiri_result["min_return_ratio"]
+                        st.caption(
+                            f"購入合計: {total_bet}円（ワイド・複勝は最低オッズで保守的に計算しています）。"
+                            f"必要オッズは、的中時に購入合計の{checked_ratio:.0%}以上が戻る倍率です。"
                         )
-                        st.dataframe(display_df.drop(columns=["is_gamiri"]), use_container_width=True, hide_index=True)
-                        st.caption(f"購入合計: {total_bet}円（ワイド・複勝は最低オッズで保守的に計算しています）")
 
-                        gamiri_rows = df_rows[df_rows["is_gamiri"] == True]
-                        not_found_rows = df_rows[df_rows["is_gamiri"].isna()]
-                        if not gamiri_rows.empty:
+                        status_counts = df_rows["status"].value_counts()
+                        over_limit = int(status_counts.get("ガミ", 0))
+                        tolerated = int(status_counts.get("ガミ（許容内）", 0))
+                        no_odds = int(status_counts.get("オッズ未発表", 0))
+                        if over_limit:
                             st.warning(
-                                f"{len(gamiri_rows)}点で、的中しても購入合計{total_bet}円を下回る「ガミリ」の"
-                                "可能性があります。配分金額の見直しをおすすめします。",
+                                f"{over_limit}点で、的中時の払戻が購入合計{total_bet}円の{checked_ratio:.0%}を下回る可能性があります。"
+                                "配分金額の見直しをおすすめします。",
                                 icon=":material/warning:",
                             )
-                        elif not_found_rows.empty:
+                        if tolerated:
+                            st.info(f"{tolerated}点は的中するとガミになりますが、許容範囲内です。", icon=":material/info:")
+                        if no_odds:
+                            st.info(
+                                f"{no_odds}点はオッズが未発表のため、判定を保留しています。"
+                                "発売が始まったら再チェックするか、必要オッズと見比べてください。",
+                                icon=":material/schedule:",
+                            )
+                        if not (over_limit or tolerated or no_odds):
                             st.success("現在のオッズでは、どの買い目が的中しても購入合計を下回らない見込みです。",
                                        icon=":material/check_circle:")
-                        if not not_found_rows.empty:
-                            st.caption(f"{len(not_found_rows)}点はオッズが取得できませんでした（発売前・対象外の可能性があります）。")
 
 with tab_chat:
     # 会話はパネルの中だけでスクロールし、入力欄はパネルのすぐ下に置く
