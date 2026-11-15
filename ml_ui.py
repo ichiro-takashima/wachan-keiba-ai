@@ -141,6 +141,104 @@ def render_top_horse_cards(pred_df, top_n=5, win_prob_method="blend"):
                 st.caption(":material/warning: 過去走データなし")
 
 
+AFFINITY_HELP = (
+    "推定勝率は相性モデル（血統・戦績・馬体重から算出。オッズ・人気は使いません）の値で、全頭の合計が100%です。"
+    "血統相性・戦績相性は出走馬の中での偏差値（50が平均）。馬体重影響は、馬体重の情報で勝率が何ポイント動いたか。"
+    "期待値は 推定勝率×単勝オッズ（1.0超で妙味あり）。"
+)
+
+
+def _weight_effect_text(value):
+    if pd.isna(value):
+        return "-"
+    return f"{value:+.1f}pt"
+
+
+def render_affinity_cards(result, top_n=5):
+    """相性モデルの上位馬をカードで表示する。"""
+    pred = result["predictions"]
+    if result.get("weight_missing"):
+        st.caption(":material/info: 馬体重が未発表のため、馬体重なしで学習したモデルで計算しています。")
+    if result.get("pedigree_missing"):
+        st.caption(f":material/info: 血統が取得できなかった馬が{result['pedigree_missing']}頭います（血統相性は平均扱い）。")
+    top = pred.head(top_n)
+    cols = st.columns(len(top)) if len(top) else []
+    for col, (_, row) in zip(cols, top.iterrows()):
+        with col.container(border=True):
+            mark = row["印"]
+            st.markdown(f"**{mark} {MARK_LABELS.get(mark, '')}**　{_horse_label(row)}")
+            st.caption(f"{row['騎手']} / {_fmt_odds(row['オッズ'])}"
+                       + (f"（{int(row['人気'])}人気）" if pd.notna(row["人気"]) else ""))
+            st.metric("推定勝率", _fmt_pct(row["推定勝率"]), help=AFFINITY_HELP)
+            grade = row["期待値ランク"]
+            ev_text = "-" if pd.isna(row["期待値"]) else f"{row['期待値']:.2f}"
+            st.markdown(
+                f"血統 **{row['血統相性']:.0f}**・戦績 **{row['戦績相性']:.0f}** "
+                f":{GRADE_COLORS.get(grade, 'gray')}-badge[期待値 {grade}（{ev_text}）]"
+            )
+            st.caption(f"馬体重 {row['馬体重']}（影響 {_weight_effect_text(row['馬体重影響'])}）")
+            if row["根拠"]:
+                st.caption("・".join(row["根拠"]))
+            if row.get("過去走数", 1) == 0:
+                st.caption(":material/warning: 中央での過去走なし（血統中心の評価）")
+
+
+def render_affinity_table(result, height="auto"):
+    """相性モデルの全頭の表。"""
+    display = result["predictions"].copy()
+    display["推定勝率"] = display["推定勝率"] * 100
+    display["期待値"] = display["期待値"].round(2)
+    display["馬体重影響"] = display["馬体重影響"].map(_weight_effect_text)
+    display["根拠"] = display["根拠"].map(lambda r: "・".join(r))
+    win_max = max(float(display["推定勝率"].max()), 1.0)
+    st.dataframe(
+        display, width="stretch", height=height, hide_index=True,
+        column_config={
+            "推定勝率": probability_bar("推定勝率", max_value=win_max),
+            "血統相性": st.column_config.ProgressColumn("血統相性", format="%d", min_value=20, max_value=80),
+            "戦績相性": st.column_config.ProgressColumn("戦績相性", format="%d", min_value=20, max_value=80),
+        },
+    )
+
+
+def render_affinity_model_info(metrics):
+    """相性モデルの検証成績・要素別の影響・馬体重の増減と成績。"""
+    if not metrics:
+        st.caption("検証成績がありません。")
+        return
+    pick, pop = metrics.get("勝率1位馬", {}), metrics.get("1番人気(参考)", {})
+    scores = metrics.get("テスト成績", {})
+    st.caption(
+        f"学習 {metrics.get('学習レース数', '?')}レース（{' 〜 '.join(metrics.get('学習期間', []))}）、"
+        f"別期間 {metrics.get('テストレース数', '?')}レース（{' 〜 '.join(metrics.get('テスト期間', []))}）で検証。"
+        f"血統の取得率 {metrics.get('血統の取得率', 0):.0%}。"
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.metric("勝率1位馬の単勝的中率", _fmt_pct(pick.get("単勝的中率")),
+              delta=f"{(pick.get('単勝的中率', 0) - pop.get('単勝的中率', 0)) * 100:+.1f}pt",
+              help="矢印は1番人気を買い続けた場合との差（参考）")
+    c2.metric("単勝回収率", f"{pick.get('単勝回収率', 0)}%",
+              delta=f"{pick.get('単勝回収率', 0) - pop.get('単勝回収率', 0):+.1f}pt")
+    c3.metric("AUC(1着)", f"{scores.get('AUC(1着)', 0):.3f}")
+
+    shares = metrics.get("要素別の影響度(%)")
+    if shares:
+        st.caption("勝率の判断に効いている要素の割合(%)")
+        st.bar_chart(pd.Series(shares), horizontal=True)
+    ablation = metrics.get("要素を外したときの成績")
+    if ablation:
+        st.caption("要素を1つずつ外して学習し直したときのテスト成績（対数尤度が増える・AUCが下がるほど、その要素が効いている）")
+        st.dataframe(pd.DataFrame(ablation), width="stretch", hide_index=True)
+    weight = metrics.get("馬体重の増減と成績")
+    if weight:
+        st.caption("馬体重の増減とテスト期間の実際の成績。「モデルの馬体重寄与」は馬体重の情報が勝率(対数オッズ)をどちらへ動かしたかの平均。")
+        st.dataframe(pd.DataFrame(weight), width="stretch", hide_index=True)
+    calib = metrics.get("勝率の当てはまり")
+    if calib:
+        st.caption("予測勝率と実際の勝率（近いほど、勝率の数字をそのまま信用できる）")
+        st.dataframe(pd.DataFrame(calib), width="stretch", hide_index=True)
+
+
 # ---------------------------------------------------------------- Step3
 
 def build_ticket_suggestions(pred_df, volatility_level=None):

@@ -679,8 +679,8 @@ def _load_jockey_daily():
     return jockey_daily
 
 
-def predict_shutuba(bundle, race_id, race_info, shutuba_df, all_horse_data, race_date):
-    """出馬表の各馬の3着以内確率を返す(馬番・馬名・3着内確率・根拠)。"""
+def build_entry_features(jockey_daily, race_id, race_info, shutuba_df, all_horse_data, race_date):
+    """予想用: 出馬表から (entries, 特徴量候補すべて, 馬名) を作る。取消などで馬番が空の行は除く。"""
     from model.live_predict import parse_race_conditions
 
     if shutuba_df is None or shutuba_df.empty:
@@ -710,8 +710,7 @@ def predict_shutuba(bundle, race_id, race_info, shutuba_df, all_horse_data, race
     entries = entries[_num(entries["馬番"]).notna()]
     feats = base_features(entries)
 
-    daily = bundle["jockey_daily"]
-    daily = daily[daily["日付"] < race_date]
+    daily = jockey_daily[jockey_daily["日付"] < race_date]
     jockey_totals = daily.groupby("騎手")[["騎乗", "1着", "3着内"]].sum()
     jockeys = shutuba_df.loc[entries.index, "騎手"].map(clean_jockey) if "騎手" in shutuba_df else pd.Series("", index=entries.index)
     stats = jockey_totals.reindex(jockeys.to_numpy())
@@ -725,6 +724,13 @@ def predict_shutuba(bundle, race_id, race_info, shutuba_df, all_horse_data, race
     names = shutuba_df.loc[entries.index, "馬名"].map(clean_horse_name)
     feats = feats.join(entry_history_features(feats, [results_by_name.get(name) for name in names], race_date))
     feats = add_race_relative_features(feats, entries["race_id"])
+    return entries, feats, names
+
+
+def predict_shutuba(bundle, race_id, race_info, shutuba_df, all_horse_data, race_date):
+    """出馬表の各馬の3着以内確率を返す(馬番・馬名・3着内確率・根拠)。"""
+    entries, feats, names = build_entry_features(
+        bundle["jockey_daily"], race_id, race_info, shutuba_df, all_horse_data, race_date)
 
     booster = bundle["booster"]
     x = feats[booster.feature_name()].apply(pd.to_numeric, errors="coerce")

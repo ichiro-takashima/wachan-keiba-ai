@@ -84,6 +84,17 @@ def save_race_html_binary(race_id, base_dir=DATA_DIR):
     return {"ok": True, "path": output_path, "skipped": False}
 
 
+def _apply_encoding(response):
+    """サーバーが宣言した文字コードを優先し、宣言がない場合のみEUC-JPとみなす。
+
+    netkeibaはEUC-JPからUTF-8に移行済みのため、固定でEUC-JPを指定すると文字化けする。
+    """
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "charset=" not in content_type:
+        response.encoding = "euc-jp"
+    return response
+
+
 def load_race_html_text(race_id, base_dir=DATA_DIR):
     race_html_dir = ensure_data_directories(base_dir)
     output_path = race_html_dir / f"{race_id}.html"
@@ -91,7 +102,7 @@ def load_race_html_text(race_id, base_dir=DATA_DIR):
         return None
 
     content = output_path.read_bytes()
-    for encoding in ("euc-jp", "cp932", "utf-8"):
+    for encoding in ("utf-8", "euc-jp", "cp932"):
         try:
             return content.decode(encoding)
         except UnicodeDecodeError:
@@ -232,7 +243,7 @@ def scrape_horse_ped(horse_id):
     try:
         time.sleep(1)
         response = session.get(url, headers=HEADERS, timeout=10)
-        response.encoding = "euc-jp"
+        _apply_encoding(response)
         soup = BeautifulSoup(response.text, "html.parser")
 
         try:
@@ -275,7 +286,7 @@ def scrape_race_results_dedicated(horse_id):
     try:
         time.sleep(1)
         response = session.get(url, headers=HEADERS, timeout=10)
-        response.encoding = "euc-jp"
+        _apply_encoding(response)
         soup = BeautifulSoup(response.text, "html.parser")
 
         dfs = pd.read_html(io.StringIO(response.text))
@@ -299,7 +310,7 @@ def get_horse_ids_from_race(race_id):
     try:
         time.sleep(1)
         res = session.get(url, headers=HEADERS, timeout=10)
-        res.encoding = "euc-jp"
+        _apply_encoding(res)
         soup = BeautifulSoup(res.text, "html.parser")
 
         horse_list = []
@@ -325,7 +336,7 @@ def get_horse_ids_from_race(race_id):
         # データベースにない場合は出馬表から
         url_future = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
         res_future = session.get(url_future, headers=HEADERS, timeout=10)
-        res_future.encoding = "euc-jp"
+        _apply_encoding(res_future)
         soup_future = BeautifulSoup(res_future.text, "html.parser")
         horse_ids = []
         for link in soup_future.find_all("a", href=True):
@@ -581,7 +592,7 @@ def scrape_payouts(race_id):
     try:
         time.sleep(1)
         response = session.get(url, headers=HEADERS, timeout=10)
-        response.encoding = "euc-jp"
+        _apply_encoding(response)
         soup = BeautifulSoup(response.text, "html.parser")
         payouts = _extract_payouts_from_soup(soup)
         
@@ -589,7 +600,7 @@ def scrape_payouts(race_id):
             url_fallback = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
             time.sleep(1)
             response_fb = session.get(url_fallback, headers=HEADERS, timeout=10)
-            response_fb.encoding = "euc-jp"
+            _apply_encoding(response_fb)
             soup_fb = BeautifulSoup(response_fb.text, "html.parser")
             payouts = _extract_payouts_from_soup(soup_fb)
             
@@ -721,7 +732,7 @@ def scrape_race_result_page(race_id):
             fallback_url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
             time.sleep(1)
             res2 = session.get(fallback_url, headers=HEADERS, timeout=10)
-            res2.encoding = "euc-jp"
+            _apply_encoding(res2)
             soup2 = BeautifulSoup(res2.text, "html.parser")
             payouts = _extract_payouts_from_soup(soup2)
             if payouts:
@@ -790,7 +801,7 @@ def scrape_race_info(race_id):
     url_shutuba = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     try:
         res = session.get(url_shutuba, headers=HEADERS, timeout=10)
-        res.encoding = "euc-jp"
+        _apply_encoding(res)
         soup = BeautifulSoup(res.text, "html.parser")
         
         race_info = _extract_race_info_from_soup(soup, race_id)
@@ -803,7 +814,7 @@ def scrape_race_info(race_id):
     url_db = f"https://db.netkeiba.com/race/{race_id}/"
     try:
         res = session.get(url_db, headers=HEADERS, timeout=10)
-        res.encoding = "euc-jp"
+        _apply_encoding(res)
         soup = BeautifulSoup(res.text, "html.parser")
         
         dl = soup.find("dl", class_="racedata")
@@ -834,7 +845,7 @@ def scrape_race_info(race_id):
     url_db = f"https://db.netkeiba.com/race/{race_id}/"
     try:
         res = session.get(url_db, headers=HEADERS, timeout=10)
-        res.encoding = "euc-jp"
+        _apply_encoding(res)
         soup = BeautifulSoup(res.text, "html.parser")
 
         dl = soup.find("dl", class_="racedata")
@@ -855,7 +866,7 @@ def get_race_date(race_id):
     url = f"https://db.netkeiba.com/race/{race_id}/"
     try:
         res = session.get(url, headers=HEADERS, timeout=10)
-        res.encoding = "euc-jp"
+        _apply_encoding(res)
         soup = BeautifulSoup(res.text, "html.parser")
         match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", soup.title.text)
         if match: return f"{match.group(1)}/{match.group(2).zfill(2)}/{match.group(3).zfill(2)}"
@@ -993,7 +1004,7 @@ def scrape_past_top3_trend(race_id, years=5):
             try:
                 time.sleep(0.7)
                 res = session.get(fallback_url.replace(race_id, hist_race_id), headers=HEADERS, timeout=12)
-                res.encoding = "euc-jp"
+                _apply_encoding(res)
                 dfs = pd.read_html(io.StringIO(res.text))
                 if not dfs:
                     continue

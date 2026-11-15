@@ -47,6 +47,7 @@ from gami_prompt import (
     MIN_RETURN_RATIO_OPTIONS,
     build_gami_free_prompt,
 )
+from model import affinity_model
 from model.live_predict import PLACE_NAMES, load_reference_data, predict_race
 from model.shutuba_model import format_for_prompt as format_shutuba_model_for_prompt
 from model.shutuba_model import (
@@ -69,6 +70,11 @@ def _load_ml_reference():
 @st.cache_resource(show_spinner="学習済みモデル（収集レース）を読み込み中...")
 def _load_shutuba_model():
     return load_adopted_model()
+
+
+@st.cache_resource(show_spinner="相性モデル（血統・戦績・馬体重）を読み込み中...")
+def _load_affinity_model():
+    return affinity_model.load_model()
 
 
 @st.cache_resource(show_spinner=False)
@@ -476,6 +482,14 @@ def build_full_ai_betting_prompt(race_id, max_budget, plan_blocks=None, use_full
     )
     if shutuba_model_prompt:
         sections.extend(["", shutuba_model_prompt])
+
+    affinity_bundle = _load_affinity_model()
+    affinity_prompt = affinity_model.format_for_prompt(
+        st.session_state.get("affinity_prediction"),
+        affinity_bundle["metrics"] if affinity_bundle else None,
+    )
+    if affinity_prompt:
+        sections.extend(["", affinity_prompt])
 
     # 画面のStep1〜3（適用モデル・AI推奨馬ランキング・推奨買い目と資金配分）も同じ内容を渡す
     steps_prompt = ml_ui.format_steps_for_prompt(
@@ -1637,6 +1651,31 @@ if st.session_state.get("shutuba_model_key") != shutuba_model_key:
     st.session_state.shutuba_model_key = shutuba_model_key
 shutuba_model_prediction = st.session_state.get("shutuba_model_prediction")
 
+# --- 相性モデル（血統・戦績・馬体重から勝率を算出。オッズ・人気は使わない） ---
+# 馬体重が出馬表に出ていれば馬体重ありのモデル、未発表なら馬体重なしで学習したモデルを使う。
+affinity_bundle = _load_affinity_model()
+affinity_key = (current_race_id, str(prediction_date), id(st.session_state.all_horse_data),
+                _shutuba_has_body_weight(shutuba_df_view), affinity_bundle is not None)
+if st.session_state.get("affinity_key") != affinity_key:
+    st.session_state.affinity_prediction = None
+    st.session_state.affinity_error = None
+    if affinity_bundle is None:
+        st.session_state.affinity_error = "相性モデルが未学習です（python -m model.affinity_model で学習してください）。"
+    else:
+        try:
+            with st.spinner("相性モデルで勝率を計算中..."):
+                st.session_state.affinity_prediction = affinity_model.predict(
+                    affinity_bundle, current_race_id, r_info, shutuba_df_view,
+                    st.session_state.all_horse_data, pd.Timestamp(prediction_date),
+                )
+        except Exception as e:
+            st.session_state.affinity_error = f"相性モデルで予測できませんでした: {e}"
+    st.session_state.affinity_key = affinity_key
+affinity_prediction = st.session_state.get("affinity_prediction")
+# 買い目・資金配分は相性モデルの勝率を優先し、使えないときは従来のAI予測を使う
+ticket_predictions = (affinity_prediction["predictions"] if affinity_prediction is not None
+                      else (ml_prediction["predictions"] if ml_prediction is not None else None))
+
 # 【Step 1】レース概況・適用モデル（バッジ1行 + 注記1行）
 ml_ui.render_race_overview(r_info, ml_prediction, volatility)
 
@@ -1648,11 +1687,14 @@ tab_predict, tab_entries, tab_history, tab_tickets, tab_ai, tab_chat, tab_result
 ], key="race_view_tabs")
 
 with tab_predict, st.container(key="panel_predict"):
-    if ml_prediction is None:
+    if affinity_prediction is not None:
+        # 【Step 2】相性モデル（血統・戦績・馬体重）の推奨馬ランキング（上位5頭）
+        ml_ui.render_affinity_cards(affinity_prediction)
+    elif ml_prediction is None:
         st.warning(f"AIモデルでの予測ができませんでした: {st.session_state.get('ml_prediction_error')}",
                    icon=":material/warning:")
     else:
-        # 【Step 2】AI推奨馬ランキング（上位5頭）
+        st.caption(f":material/info: {st.session_state.get('affinity_error')} 従来のAI予測を表示しています。")
         ml_ui.render_top_horse_cards(ml_prediction["predictions"], win_prob_method=ml_prediction["win_prob_method"])
 
     horse_numbers = _horse_number_lookup(shutuba_df_view)
@@ -1668,17 +1710,24 @@ with tab_predict, st.container(key="panel_predict"):
         info_cols[0].success("ダート1400m以上の優秀種牡馬産駒（プラス材料）: " + " / ".join(strong_sire_horses),
                              icon=":material/genetics:")
     with info_cols[1].popover("モデルの根拠", icon=":material/insights:", use_container_width=True):
-        if ml_prediction is not None:
+        if affinity_prediction is not None:
+            ml_ui.render_affinity_model_info(affinity_bundle["metrics"])
+        elif ml_prediction is not None:
             ml_ui.render_feature_importance(ml_prediction["model_key"])
         else:
             st.caption("予測モデルが利用できません。")
 
 with tab_entries, st.container(key="panel_entries"):
-    entry_views = ["AI予測（全頭）", "出馬表モデル", "出馬表", "荒れ具合と推奨点数"]
+    entry_views = ["相性モデル（全頭）", "AI予測（全頭）", "出馬表モデル", "出馬表", "荒れ具合と推奨点数"]
     entry_view = st.segmented_control(
         "表示する表", entry_views, default=entry_views[0], key="entries_view", label_visibility="collapsed",
     ) or entry_views[0]
-    if entry_view == "AI予測（全頭）":
+    if entry_view == "相性モデル（全頭）":
+        if affinity_prediction is not None:
+            ml_ui.render_affinity_table(affinity_prediction)
+        else:
+            st.caption(st.session_state.get("affinity_error") or "相性モデルが利用できません。")
+    elif entry_view == "AI予測（全頭）":
         if ml_prediction is not None:
             ml_ui.render_prediction_table(ml_prediction["predictions"])
         else:
@@ -1764,15 +1813,15 @@ with tab_history, st.container(key="panel_history"):
                     st.write("戦績データがありません。")
 
 with tab_tickets, st.container(key="panel_tickets"):
-    if ml_prediction is None:
+    if ticket_predictions is None:
         st.caption("予測モデルが利用できないため、買い目を作れません。")
     else:
         # 【Step 3】馬券戦略・買い目（左）+ 資金配分シミュレータ（右）
         ticket_left, ticket_right = st.columns(2)
         with ticket_left:
-            ml_ui.render_ticket_strategy(ml_prediction["predictions"], volatility)
+            ml_ui.render_ticket_strategy(ticket_predictions, volatility)
         with ticket_right:
-            ml_ui.render_budget_simulator(ml_prediction["predictions"])
+            ml_ui.render_budget_simulator(ticket_predictions)
 
 with tab_ai, st.container(key="panel_ai"):
     ai_left, ai_right = st.columns([1, 2])
