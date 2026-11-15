@@ -448,6 +448,14 @@ def render_shutuba_model(result, metrics, error=None, height="auto"):
 
     if result.get("odds_missing"):
         st.warning("オッズが未発表のため、オッズ・人気なしで計算しています（精度が下がります）。", icon=":material/warning:")
+    if result.get("weight_missing"):
+        st.warning("馬体重が未発表のまま「馬体重を使う」モデルで計算しています（参考値）。"
+                   "サイドバーで馬体重を「使わない」にすると、馬体重なしで学習したモデルで予想します。",
+                   icon=":material/warning:")
+    if result.get("features"):
+        st.caption(f"説明変数 {len(result['features'])}個"
+                   + ("" if "体重" in result["features"] else "（馬体重なし）")
+                   + "：" + "、".join(result["features"]))
     if metrics:
         with st.popover("検証成績・重視する情報", icon=":material/insights:"):
             render_model_score_cards(metrics)

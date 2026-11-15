@@ -49,7 +49,14 @@ from gami_prompt import (
 )
 from model.live_predict import PLACE_NAMES, load_reference_data, predict_race
 from model.shutuba_model import format_for_prompt as format_shutuba_model_for_prompt
-from model.shutuba_model import load_adopted_model, predict_shutuba
+from model.shutuba_model import (
+    FEATURE_DISPLAY_NAMES as SHUTUBA_FEATURE_DISPLAY_NAMES,
+    WEIGHT_FEATURES as SHUTUBA_WEIGHT_FEATURES,
+    load_adopted_model,
+    load_model_for_features,
+    predict_shutuba,
+    train_model_for_features,
+)
 
 load_css("style.css")
 
@@ -62,6 +69,87 @@ def _load_ml_reference():
 @st.cache_resource(show_spinner="学習済みモデル（収集レース）を読み込み中...")
 def _load_shutuba_model():
     return load_adopted_model()
+
+
+@st.cache_resource(show_spinner=False)
+def _load_shutuba_variant(features):
+    """選んだ説明変数(ソート済みタプル)のモデル。採用済みモデルと同じ組み合わせならそれを返し、未学習なら None。"""
+    return load_model_for_features(list(features), _load_shutuba_model())
+
+
+SHUTUBA_USE_WEIGHT_OPTIONS = ["使う", "使わない"]
+
+
+def _shutuba_has_body_weight(shutuba_df):
+    if shutuba_df is None or "馬体重" not in shutuba_df.columns:
+        return False
+    return shutuba_df["馬体重"].astype(str).str.contains(r"\d{3}").any()
+
+
+def _reset_shutuba_feature_checks(features):
+    for name in features:
+        st.session_state[f"shutuba_feat_{name}"] = True
+
+
+def _shutuba_feature_controls(container, adopted_bundle, shutuba_df, race_id):
+    """出馬表モデルの説明変数を選ぶウィジェット(サイドバー)。選んだ特徴量のリストを返す。
+
+    チェックボックスは採用済みモデルが使っている説明変数(馬体重以外)。馬体重はラジオボタンで別に選ぶ。
+    """
+    base_features = list(adopted_bundle["booster"].feature_name())
+    check_features = [c for c in base_features if c not in SHUTUBA_WEIGHT_FEATURES]
+
+    # レースが変わったら、馬体重が発表済みかどうかで「使う/使わない」の初期値を決め直す
+    has_weight = _shutuba_has_body_weight(shutuba_df)
+    if st.session_state.get("shutuba_use_weight_race") != race_id:
+        st.session_state.shutuba_use_weight = SHUTUBA_USE_WEIGHT_OPTIONS[0 if has_weight else 1]
+        st.session_state.shutuba_use_weight_race = race_id
+
+    use_weight = container.radio(
+        "出馬表モデル: 馬体重", SHUTUBA_USE_WEIGHT_OPTIONS, key="shutuba_use_weight", horizontal=True,
+        help="馬体重(体重・前走からの増減)を説明変数に使うか。当日の発走前まで発表されないため、"
+             "未発表のときは「使わない」にすると馬体重なしで学習したモデルで予想します。",
+    ) == SHUTUBA_USE_WEIGHT_OPTIONS[0]
+    if use_weight and not has_weight:
+        container.caption(":material/warning: 出馬表に馬体重がありません（未発表）。「使わない」を推奨します。")
+
+    with container.popover("出馬表モデルの説明変数", icon=":material/tune:", use_container_width=True):
+        st.caption("チェックした説明変数で学習したモデルで3着以内確率を出します。"
+                   "初めて選ぶ組み合わせは学習が必要です（1〜数分。学習したモデルは保存され、次回から即時）。")
+        st.button("すべて選択に戻す", on_click=_reset_shutuba_feature_checks, args=(check_features,),
+                  icon=":material/restart_alt:")
+        cols = st.columns(2)
+        selected = []
+        for i, name in enumerate(check_features):
+            key = f"shutuba_feat_{name}"
+            st.session_state.setdefault(key, True)
+            display = SHUTUBA_FEATURE_DISPLAY_NAMES.get(name, name)
+            if cols[i % 2].checkbox(name, key=key, help=display if display != name else None):
+                selected.append(name)
+
+    if use_weight:
+        selected += [c for c in SHUTUBA_WEIGHT_FEATURES if c not in selected]
+    features = [c for c in base_features + SHUTUBA_WEIGHT_FEATURES if c in set(selected)]
+    features = list(dict.fromkeys(features))
+
+    if not features:
+        container.warning("出馬表モデルの説明変数を1つ以上選んでください。", icon=":material/warning:")
+        return features
+    n_label = f"{len(features)}/{len(base_features)}個の説明変数"
+    if _load_shutuba_variant(tuple(sorted(features))) is None:
+        container.caption(f":material/info: {n_label}（この組み合わせは未学習）")
+        if container.button("この説明変数で学習", icon=":material/model_training:", use_container_width=True,
+                            type="primary"):
+            try:
+                with st.spinner("選んだ説明変数で出馬表モデルを学習・検証中...（1〜数分かかります）"):
+                    train_model_for_features(features)
+                _load_shutuba_variant.clear()
+                st.rerun()
+            except Exception as e:
+                container.error(f"学習できませんでした: {e}", icon=":material/error:")
+    elif set(features) != set(base_features):
+        container.caption(f":material/check: {n_label}（選び直したモデルで予想）")
+    return features
 
 
 @st.cache_data(ttl=600, show_spinner="開催レース一覧を取得中...")
@@ -382,10 +470,9 @@ def build_full_ai_betting_prompt(race_id, max_budget, plan_blocks=None, use_full
 
     sections.extend(["", "【出馬表】", _df_to_prompt_table(shutuba_df, max_rows=24, max_cols=14)])
 
-    shutuba_model = _load_shutuba_model()
     shutuba_model_prompt = format_shutuba_model_for_prompt(
         st.session_state.get("shutuba_model_prediction"),
-        shutuba_model["metrics"] if shutuba_model else None,
+        st.session_state.get("shutuba_model_metrics"),
     )
     if shutuba_model_prompt:
         sections.extend(["", shutuba_model_prompt])
@@ -1516,11 +1603,24 @@ if st.session_state.get("ml_prediction_key") != ml_cache_key:
 ml_prediction = st.session_state.get("ml_prediction")
 
 # --- 収集レースで学習した出馬表モデル（検証に合格して採用されたもの）による3着以内確率 ---
-shutuba_model = _load_shutuba_model()
-shutuba_model_key = (current_race_id, str(prediction_date), id(st.session_state.all_horse_data))
+# 説明変数はサイドバーで選び直せる（馬体重は当日発表のため、使う/使わないを個別に選ぶ）。
+# 採用済みモデルと違う組み合わせは、その組み合わせで学習したモデル（data/models/shutuba_variants）を使う。
+adopted_shutuba_model = _load_shutuba_model()
+shutuba_model = None
+shutuba_selected_features = []
+if adopted_shutuba_model is not None:
+    shutuba_selected_features = _shutuba_feature_controls(
+        sidebar_settings, adopted_shutuba_model, shutuba_df_view, current_race_id)
+    shutuba_model = _load_shutuba_variant(tuple(sorted(shutuba_selected_features)))
+st.session_state.shutuba_model_metrics = shutuba_model["metrics"] if shutuba_model else None
+shutuba_model_key = (current_race_id, str(prediction_date), id(st.session_state.all_horse_data),
+                     tuple(sorted(shutuba_selected_features)), shutuba_model is not None)
 if st.session_state.get("shutuba_model_key") != shutuba_model_key:
     st.session_state.shutuba_model_prediction = None
     st.session_state.shutuba_model_error = None
+    if adopted_shutuba_model is not None and shutuba_model is None:
+        st.session_state.shutuba_model_error = (
+            "選んだ説明変数のモデルはまだ学習されていません。サイドバーの「この説明変数で学習」を押してください。")
     if shutuba_model is not None:
         try:
             with st.spinner("出馬表モデルで予測中..."):

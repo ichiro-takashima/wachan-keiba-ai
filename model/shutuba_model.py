@@ -14,6 +14,7 @@
     python -m model.shutuba_model            # データ作成 → 学習 → テスト検証 → 合格なら採用
     python -m model.shutuba_model --force    # 検証結果に関わらず採用
     python -m model.shutuba_model --rebuild  # HTMLの解析をやり直す(キャッシュCSVを作り直す)
+    python -m model.shutuba_model --no-weight  # 馬体重なしモデルを前もって学習(アプリで選んだときも学習される)
 """
 import argparse
 import json
@@ -35,6 +36,8 @@ MODEL_PATH = MODEL_DIR / "shutuba_model.txt"  # 検証に合格した(アプリ�
 CANDIDATE_PATH = MODEL_DIR / "shutuba_model.candidate.txt"  # 直近に学習したモデル(不合格でも残す)
 METRICS_PATH = MODEL_DIR / "shutuba_model.metrics.json"
 JOCKEY_STATS_PATH = MODEL_DIR / "shutuba_jockey_daily.csv"
+# アプリで説明変数を選び直したときに学習するモデル(特徴量の組み合わせごとに1つ保存して使い回す)
+VARIANT_DIR = MODEL_DIR / "shutuba_variants"
 
 HISTORY_WINDOW = 5
 
@@ -67,10 +70,19 @@ FEATURE_GROUPS = {
 }
 ALL_FEATURE_COLUMNS = BASE_FEATURE_COLUMNS + [c for cols in FEATURE_GROUPS.values() for c in cols]
 
-# 学習・予想に使う特徴量(比較の結果、採用するグループ)。
-ADOPTED_GROUPS = list(FEATURE_GROUPS)
-FEATURE_COLUMNS = BASE_FEATURE_COLUMNS + [c for g in ADOPTED_GROUPS for c in FEATURE_GROUPS[g]]
+# 候補のうち、効いていない(ノイズ)と判定して学習・予想に使わない特徴量。
+# python -m model.shutuba_feature_selection の結果(data/models/shutuba_feature_selection.json)を反映する。
+# 外した7個は、値そのものより派生させた特徴量(斤量_対平均・クラス変化・前走着順率など)の方が効いていたもの。
+# 派生特徴量の計算には引き続き使うので、特徴量表(feats)には残る。
+DROPPED_FEATURES = ["斤量", "馬場", "クラス", "騎手騎乗数", "騎手3着内率", "前走着順", "前走人気"]
+assert not set(DROPPED_FEATURES) - set(ALL_FEATURE_COLUMNS)
+
+# 学習・予想に使う特徴量。
+FEATURE_COLUMNS = [c for c in ALL_FEATURE_COLUMNS if c not in DROPPED_FEATURES]
 assert not POST_RACE_COLUMNS & set(ALL_FEATURE_COLUMNS)
+
+# 馬体重の特徴量。当日発表(発走の約1時間前)のため、未発表でも予想できるようアプリで個別に外せる。
+WEIGHT_FEATURES = ["体重", "体重変化"]
 
 FEATURE_DISPLAY_NAMES = {
     "単勝オッズ": "単勝オッズ", "市場確率": "オッズから見た勝率", "人気比": "人気(頭数比)",
@@ -518,11 +530,12 @@ def fit_model(x, y, dates, train_mask, seed=42):
     return model, best_iter
 
 
-def train_and_validate(rebuild=False, force=False):
+def _fit_and_evaluate(df, x_all, features):
+    """features で学習(train)→テスト期間で検証し、(モデル, 指標) を返す。"""
     from sklearn.metrics import log_loss, roc_auc_score
 
-    df, x = build_training_table(rebuild=rebuild)
-    x = x[FEATURE_COLUMNS]
+    features = list(features)
+    x = x_all[features]
     is_train = (df["split"] == "train").to_numpy()
     y = df["top3"]
     train_dates = df.loc[is_train, "_date"]
@@ -541,9 +554,8 @@ def train_and_validate(rebuild=False, force=False):
 
     # 採用基準: 3着以内の当てやすさ(AUC)と、1位予想馬の複勝回収率の両方で1番人気買いに負けないこと
     passed = bool(auc >= baseline_auc and model_stats["複勝回収率"] >= baseline_stats["複勝回収率"])
-    adopted = passed or force
 
-    importance = pd.Series(model.booster_.feature_importance("gain"), index=FEATURE_COLUMNS)
+    importance = pd.Series(model.booster_.feature_importance("gain"), index=features)
     metrics = {
         "学習レース数": int(df.loc[is_train, "race_id"].nunique()),
         "テストレース数": int(test["race_id"].nunique()),
@@ -556,23 +568,94 @@ def train_and_validate(rebuild=False, force=False):
         "モデル1位馬": model_stats,
         "1番人気": baseline_stats,
         "検証合格": passed,
-        "採用": adopted,
-        "採用理由": "検証合格" if passed else ("--force 指定" if force else "1番人気買いを上回れなかったため不採用"),
-        "特徴量": FEATURE_COLUMNS,
+        "採用": None,  # 呼び出し側で決める
+        "採用理由": None,
+        "特徴量": features,
         "除外した結果系の列": sorted(POST_RACE_COLUMNS),
         "特徴量重要度(gain%)": (importance / importance.sum() * 100).round(1).sort_values(ascending=False).to_dict(),
     }
+    return model, metrics
+
+
+def _save_jockey_stats():
+    all_rows = pd.concat([load_collected_rows("train"), load_collected_rows("test")], ignore_index=True)
+    jockey_daily_table(all_rows).to_csv(JOCKEY_STATS_PATH, index=False, encoding="utf-8-sig")
+
+
+def train_and_validate(rebuild=False, force=False):
+    df, x = build_training_table(rebuild=rebuild)
+    model, metrics = _fit_and_evaluate(df, x, FEATURE_COLUMNS)
+    passed = metrics["検証合格"]
+    adopted = passed or force
+    metrics["採用"] = adopted
+    metrics["採用理由"] = "検証合格" if passed else ("--force 指定" if force else "1番人気買いを上回れなかったため不採用")
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     model.booster_.save_model(str(CANDIDATE_PATH))
     if adopted:
         model.booster_.save_model(str(MODEL_PATH))
-        all_rows = pd.concat([load_collected_rows("train"), load_collected_rows("test")], ignore_index=True)
-        jockey_daily_table(all_rows).to_csv(JOCKEY_STATS_PATH, index=False, encoding="utf-8-sig")
+        _save_jockey_stats()
         METRICS_PATH.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     else:
         CANDIDATE_PATH.with_suffix(".metrics.json").write_text(
             json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+    return metrics
+
+
+# ---- 説明変数を選び直したモデル(アプリの「出馬表モデル」で選んで学習・予想する)
+
+_TRAINING_TABLE = None  # 同じプロセスで何度も学習するとき、特徴量表を作り直さない
+
+
+def _variant_paths(features):
+    import hashlib
+
+    key = hashlib.sha1("|".join(sorted(features)).encode("utf-8")).hexdigest()[:12]
+    return VARIANT_DIR / f"{key}.txt", VARIANT_DIR / f"{key}.metrics.json"
+
+
+def load_model_for_features(features, base_bundle=None):
+    """選んだ説明変数で学習済みのモデル(load_adopted_model と同じ形)を返す。未学習なら None。
+
+    採用済みモデルと同じ組み合わせなら base_bundle をそのまま返す。
+    """
+    import lightgbm as lgb
+
+    features = list(features)
+    if base_bundle is not None and set(features) == set(base_bundle["booster"].feature_name()):
+        return base_bundle
+    model_path, metrics_path = _variant_paths(features)
+    if not model_path.exists():
+        return None
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.exists() else {}
+    jockey_daily = base_bundle["jockey_daily"] if base_bundle is not None else _load_jockey_daily()
+    return {"booster": lgb.Booster(model_file=str(model_path)), "metrics": metrics, "jockey_daily": jockey_daily}
+
+
+def train_model_for_features(features):
+    """選んだ説明変数でモデルを学習・テスト期間で検証し、VARIANT_DIR に保存して指標を返す。
+
+    採用基準による選別はしない(選んだ組み合わせのモデルを必ず保存し、検証成績は画面に出す)。
+    """
+    global _TRAINING_TABLE
+
+    selected = set(features)
+    features = [c for c in ALL_FEATURE_COLUMNS if c in selected]
+    if not features:
+        raise ValueError("説明変数を1つ以上選んでください。")
+    if _TRAINING_TABLE is None:
+        _TRAINING_TABLE = build_training_table()
+    df, x = _TRAINING_TABLE
+    model, metrics = _fit_and_evaluate(df, x, features)
+    metrics["採用"] = True
+    metrics["採用理由"] = "アプリで選んだ説明変数で学習" + ("" if metrics["検証合格"] else "(1番人気買いは上回れず)")
+
+    model_path, metrics_path = _variant_paths(features)
+    VARIANT_DIR.mkdir(parents=True, exist_ok=True)
+    model.booster_.save_model(str(model_path))
+    metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+    if not JOCKEY_STATS_PATH.exists():
+        _save_jockey_stats()
     return metrics
 
 
@@ -585,11 +668,15 @@ def load_adopted_model():
     import lightgbm as lgb
 
     metrics = json.loads(METRICS_PATH.read_text(encoding="utf-8")) if METRICS_PATH.exists() else {}
+    return {"booster": lgb.Booster(model_file=str(MODEL_PATH)), "metrics": metrics, "jockey_daily": _load_jockey_daily()}
+
+
+def _load_jockey_daily():
     jockey_daily = pd.DataFrame(columns=["騎手", "日付", "騎乗", "1着", "3着内"])
     if JOCKEY_STATS_PATH.exists():
         jockey_daily = pd.read_csv(JOCKEY_STATS_PATH, encoding="utf-8-sig")
         jockey_daily["日付"] = pd.to_datetime(jockey_daily["日付"], errors="coerce")
-    return {"booster": lgb.Booster(model_file=str(MODEL_PATH)), "metrics": metrics, "jockey_daily": jockey_daily}
+    return jockey_daily
 
 
 def predict_shutuba(bundle, race_id, race_info, shutuba_df, all_horse_data, race_date):
@@ -658,7 +745,13 @@ def predict_shutuba(bundle, race_id, race_info, shutuba_df, all_horse_data, race
     }, index=entries.index)
     out = out.sort_values("3着内確率", ascending=False).reset_index(drop=True)
     out.insert(0, "順位", range(1, len(out) + 1))
-    return {"predictions": out, "odds_missing": bool(feats["単勝オッズ"].isna().all())}
+    return {
+        "predictions": out,
+        "odds_missing": bool(feats["単勝オッズ"].isna().all()),
+        # 馬体重を使うモデルなのに出馬表に馬体重がない(未発表)とき。確率は参考値になる。
+        "weight_missing": bool("体重" in booster.feature_name() and feats["体重"].isna().all()),
+        "features": list(booster.feature_name()),
+    }
 
 
 def format_for_prompt(result, metrics):
@@ -676,6 +769,10 @@ def format_for_prompt(result, metrics):
         )
     if result.get("odds_missing"):
         lines.append("※オッズ未発表のため、オッズ・人気なしで計算した参考値です。")
+    if result.get("weight_missing"):
+        lines.append("※馬体重が未発表のため、馬体重なしで計算した参考値です。")
+    elif result.get("features") and "体重" not in result["features"]:
+        lines.append("※馬体重を使わないモデルで計算しています。")
     lines.append("順位|馬番|馬名|3着内確率|主な根拠")
     for _, r in pred.iterrows():
         lines.append(f"{r['順位']}|{r['馬番']}|{r['馬名']}|{r['3着内確率']:.1%}|{r['根拠']}")
@@ -687,7 +784,16 @@ def main():
     parser = argparse.ArgumentParser(description="収集したレースで出馬表モデルを学習し、テスト期間で検証する")
     parser.add_argument("--rebuild", action="store_true", help="HTMLの解析をやり直す")
     parser.add_argument("--force", action="store_true", help="検証結果に関わらずアプリで使うモデルとして採用する")
+    parser.add_argument("--no-weight", action="store_true",
+                        help="採用済みモデルから馬体重(体重・体重変化)を外したモデルを学習し、アプリ用に保存する")
     args = parser.parse_args()
+
+    if args.no_weight:
+        bundle = load_adopted_model()
+        base = bundle["booster"].feature_name() if bundle else FEATURE_COLUMNS
+        metrics = train_model_for_features([c for c in base if c not in WEIGHT_FEATURES])
+        print(json.dumps({k: v for k, v in metrics.items() if k != "特徴量重要度(gain%)"}, ensure_ascii=False, indent=2))
+        return
 
     metrics = train_and_validate(rebuild=args.rebuild, force=args.force)
     print(json.dumps({k: v for k, v in metrics.items() if k not in ("特徴量", "特徴量重要度(gain%)")},
