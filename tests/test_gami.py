@@ -3,17 +3,23 @@
 実行: python -m unittest tests.test_gami -v
 """
 import unittest
+from itertools import combinations, permutations
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
 import scraper
 from gami_prompt import (
+    MAX_PLACE_HORSES,
+    PAYOUT_RATE,
+    _hit_probability,
     allocate_with_floor,
     build_candidate_plans,
     build_gami_free_prompt,
     finish_distribution,
     format_plans,
+    merge_model_views,
+    plan_race,
 )
 from tickets import check_gamiri
 
@@ -116,15 +122,12 @@ class CandidatePlansTest(unittest.TestCase):
         self.assertTrue(all(p["estimated"] for p in built))
         self.assertIn("推定", format_plans(plans, 0.8))
 
-    def test_multi_point_plans_come_first_then_by_hit_rate(self):
-        plans = [p for p in build_candidate_plans(_pred_df(), "堅い", {}, 3000, 1.0) if p["bets"]]
-        multi = [p for p in plans if len(p["bets"]) >= 3]
-        few = [p for p in plans if len(p["bets"]) < 3]
-        self.assertTrue(multi and few)
-        self.assertEqual(plans, multi + few)
-        for group in (multi, few):
-            rates = [p["hit_prob"] for p in group]
-            self.assertEqual(rates, sorted(rates, reverse=True))
+    def test_plans_are_sorted_by_score_and_all_buildable(self):
+        plans = build_candidate_plans(_pred_df(), "堅い", {}, 3000, 1.0)
+        self.assertTrue(plans)
+        self.assertTrue(all(p["bets"] for p in plans))  # 組めないプランは出さない
+        scores = [p["score"] for p in plans]
+        self.assertEqual(scores, sorted(scores, reverse=True))
 
     def test_plans_reduced_to_the_same_bets_are_merged(self):
         # 上位馬の複勝が低オッズだと「複勝 上位3頭」は1点まで削られ「複勝◎1点」と同じになる
@@ -159,6 +162,183 @@ class CandidatePlansTest(unittest.TestCase):
         prompt = build_gami_free_prompt("202605050311", {"name": "R"}, prediction, None, {}, 1000, model_metrics={"auc": float("nan")})
         self.assertIn("推定オッズ", prompt)
         self.assertIn("オッズ未発表は見送りの理由にしない", prompt)
+
+
+def _race(live_wins, aff_wins=None):
+    """出馬表モデル(live)と相性モデル(affinity)の予測表。live は3着内確率の順に並べる。"""
+    n = len(live_wins)
+    live = pd.DataFrame({
+        "馬番": range(1, n + 1), "馬名": [f"馬{i}" for i in range(1, n + 1)],
+        "推定勝率": live_wins, "3着内確率": [min(w * 2.5, 0.9) for w in live_wins],
+    }).sort_values("3着内確率", ascending=False, kind="stable").reset_index(drop=True)
+    aff = None
+    if aff_wins is not None:
+        aff = pd.DataFrame({"馬番": range(1, n + 1), "馬名": [f"馬{i}" for i in range(1, n + 1)], "推定勝率": aff_wins})
+    return live, aff
+
+
+def _market_odds(live):
+    """live の勝率を市場の評価とみなした、全券種の現在オッズ(払戻率込み)。"""
+    dist = finish_distribution(live)
+    horses = [int(h) for h in live["馬番"]]
+    combos = {
+        "単勝": [str(h) for h in horses], "複勝": [str(h) for h in horses],
+        "馬連": [f"{a}-{b}" for a, b in combinations(sorted(horses), 2)],
+        "ワイド": [f"{a}-{b}" for a, b in combinations(sorted(horses), 2)],
+        "馬単": [f"{a}-{b}" for a, b in permutations(horses, 2)],
+        "3連複": ["-".join(map(str, c)) for c in combinations(sorted(horses), 3)],
+    }
+    table = {}
+    for t_type, keys in combos.items():
+        table[t_type] = {}
+        for key in keys:
+            p = _hit_probability(dist, t_type, key)
+            if p > 0:
+                table[t_type][key] = {"odds": max(round(PAYOUT_RATE[t_type] / p, 1), 1.1)}
+    return table
+
+
+# 1位が抜けていない・混戦でもない(どのパターンにも当たらない)出馬表モデルの勝率
+FLAT_WINS = [0.22, 0.19, 0.16, 0.13, 0.10, 0.08, 0.07, 0.05]
+# 8番(出馬表モデル8位・単勝13倍前後)を、相性モデルだけが1位に評価している
+LONGSHOT_AFF = [0.16, 0.13, 0.12, 0.10, 0.09, 0.05, 0.05, 0.30]
+STRONG_WINS = [0.45, 0.15, 0.10, 0.08, 0.07, 0.06, 0.05, 0.04]
+CLOSE_WINS = [0.15, 0.14, 0.13, 0.12, 0.12, 0.12, 0.11, 0.11]
+
+
+def _scenario(name):
+    """(situation, plans)。A〜D とパターンなしのダミーレース。"""
+    if name == "A":
+        live, aff = _race([0.20, 0.18, 0.15, 0.13, 0.11, 0.09, 0.08, 0.06], LONGSHOT_AFF)
+        return plan_race(live, "標準", _market_odds(live), 3000, 1.0, aff)
+    if name == "B":
+        live, aff = _race(STRONG_WINS, STRONG_WINS)
+        return plan_race(live, "標準", _market_odds(live), 3000, 1.0, aff)
+    if name == "C":
+        live, aff = _race(CLOSE_WINS, CLOSE_WINS)
+        return plan_race(live, "標準", _market_odds(live), 3000, 1.0, aff)
+    if name == "D":
+        # 1強(B)にも当たるが、予算500円で馬連・ワイドが低オッズなので3点買いはトリガミ確定 → D が優先
+        live, aff = _race(STRONG_WINS, STRONG_WINS)
+        odds = {"単勝": {"1": {"odds": 2.5}, "2": {"odds": 4.0}, "3": {"odds": 6.0}},
+                "馬連": {f"{a}-{b}": {"odds": 2.0} for a, b in combinations(range(1, 9), 2)},
+                "ワイド": {f"{a}-{b}": {"odds": 1.8} for a, b in combinations(range(1, 9), 2)}}
+        return plan_race(live, "標準", odds, 500, 1.0, aff)
+    live, aff = _race(FLAT_WINS, FLAT_WINS)
+    return plan_race(live, "標準", _market_odds(live), 3000, 1.0, aff)
+
+
+SCENARIOS = ["A", "B", "C", "D", "none"]
+
+
+class RaceSituationPlanTest(unittest.TestCase):
+    def test_pattern_A_puts_longshot_bets_first(self):
+        situation, plans = _scenario("A")
+        self.assertEqual(situation["pattern"], "A")
+        self.assertEqual(situation["horse"], 8)
+        top = plans[0]
+        self.assertEqual(top["type_tag"], "血統穴馬狙い")
+        self.assertIn(top["bets"][0]["type"], {"単勝", "複勝", "ワイド"})
+        self.assertTrue(all("8" in b["combo"].split("-") for b in top["bets"]))
+        self.assertIn(8, situation["gaps"]["馬番"].tolist())
+
+    def test_pattern_B_puts_axis_bets_first(self):
+        situation, plans = _scenario("B")
+        self.assertEqual(situation["pattern"], "B")
+        self.assertEqual(plans[0]["type_tag"], "1強軸流し")
+        self.assertIn(plans[0]["bets"][0]["type"], {"馬連", "馬単", "3連複"})
+        self.assertTrue(all("1" in b["combo"].split("-") for b in plans[0]["bets"]))
+
+    def test_pattern_C_puts_box_bets_first(self):
+        situation, plans = _scenario("C")
+        self.assertEqual(situation["pattern"], "C")
+        self.assertEqual(plans[0]["type_tag"], "混戦BOX")
+        self.assertIn(plans[0]["bets"][0]["type"], {"ワイド", "馬連"})
+        self.assertIn("BOX", plans[0]["name"])
+
+    def test_pattern_D_wins_over_B_and_puts_pinpoint_bets_first(self):
+        situation, plans = _scenario("D")
+        self.assertEqual(situation["pattern"], "D")
+        self.assertIn("B", situation["matched"])  # B にも当たっているが D が優先
+        self.assertEqual(plans[0]["type_tag"], "少額ピンポイント")
+        self.assertIn(plans[0]["bets"][0]["type"], {"単勝", "ワイド"})
+        self.assertLessEqual(len(plans[0]["bets"]), 2)
+        self.assertLessEqual(plans[0]["total"], 500)
+
+    def test_no_pattern_uses_existing_plans_only(self):
+        situation, plans = _scenario("none")
+        self.assertIsNone(situation["pattern"])
+        self.assertTrue(plans)
+        self.assertTrue(all(p["pattern"] is None and p["type_tag"] is None for p in plans))
+
+    def test_never_more_than_two_place_horses(self):
+        for name in SCENARIOS:
+            for plan in _scenario(name)[1]:
+                with self.subTest(scenario=name, plan=plan["name"]):
+                    self.assertLessEqual(sum(b["type"] == "複勝" for b in plan["bets"]), MAX_PLACE_HORSES)
+
+    def test_every_plan_returns_at_least_the_stake(self):
+        live, aff = _race(FLAT_WINS, LONGSHOT_AFF)
+        runs = [_scenario(name)[1] for name in SCENARIOS]
+        # 画面で低い回収率を指定しても100%未満のプランは出さない
+        runs.append(build_candidate_plans(live, "標準", _market_odds(live), 1000, 0.6, aff))
+        runs.append(build_candidate_plans(live, "標準", {}, 1000, 0.6, aff))
+        for plans in runs:
+            self.assertTrue(plans)
+            for plan in plans:
+                self.assertGreaterEqual(plan["min_return_ratio"], 1.0)
+                for b in plan["bets"]:
+                    self.assertGreaterEqual(b["amount"] * b["odds"], plan["total"] - 1e-6, plan["name"])
+
+    def test_top_plans_are_not_all_the_same_ticket_type(self):
+        for name in SCENARIOS:
+            plans = _scenario(name)[1]
+            top_types = [p["bets"][0]["type"] for p in plans[:3]]
+            with self.subTest(scenario=name, top=top_types):
+                self.assertGreaterEqual(len(set(top_types)), 2)
+                self.assertTrue(all(top_types.count(t) <= 2 for t in top_types))
+
+    def test_scores_use_expected_value_with_odds_and_hit_rate_without(self):
+        self.assertEqual(_scenario("B")[0]["score_basis"], "期待値")
+        live, aff = _race(STRONG_WINS, STRONG_WINS)
+        situation, plans = plan_race(live, "標準", {}, 3000, 1.0, aff)
+        self.assertEqual(situation["score_basis"], "的中率")
+        self.assertEqual(situation["pattern"], "B")
+        self.assertEqual(plans[0]["type_tag"], "1強軸流し")
+
+    def test_missing_odds_and_one_sided_horses_do_not_break(self):
+        live, aff = _race(FLAT_WINS, LONGSHOT_AFF)
+        live["オッズ"] = float("nan")
+        aff = aff[aff["馬番"] != 3]  # 相性モデルにいない馬
+        aff = pd.concat([aff, pd.DataFrame({"馬番": [99], "馬名": ["出馬表にいない馬"], "推定勝率": [0.01]})])
+        situation, plans = plan_race(live, "標準", {}, 3000, 1.0, aff)
+        self.assertTrue(plans)
+        view = situation["view"]
+        self.assertTrue(pd.isna(view.loc[view["馬番"] == 3, "相性勝率"]).all())
+        self.assertAlmostEqual(float(view.loc[view["馬番"] == 3, "期待値用勝率"].iloc[0]), 0.16)
+        # オッズがないので単勝10倍の条件は使えないが、順位差(8位→1位)で A と判定できる
+        self.assertEqual(situation["pattern"], "A")
+
+    def test_expected_value_uses_average_of_both_models(self):
+        live, aff = _race(FLAT_WINS, LONGSHOT_AFF)
+        view = merge_model_views(live, aff)
+        row = view[view["馬番"] == 8].iloc[0]
+        self.assertAlmostEqual(row["期待値用勝率"], (0.05 + 0.30) / 2)
+        self.assertEqual(row["順位差"], 7)
+
+    def test_prompt_contains_type_tag_evidence_and_gaps(self):
+        live, aff = _race([0.20, 0.18, 0.15, 0.13, 0.11, 0.09, 0.08, 0.06], LONGSHOT_AFF)
+        df = live.assign(印="", 騎手="", オッズ=float("nan"), 人気=float("nan"), 期待値=float("nan"),
+                         期待値ランク="-", 根拠=[[]] * 8)
+        prediction = {"predictions": df, "model_label": "m", "model_key": "global", "fallback_reason": None,
+                      "conditions": {"surface": "芝", "distance": 1600, "going": "良"}}
+        prompt = build_gami_free_prompt("202605050311", {"name": "R"}, prediction, None, _market_odds(live), 3000,
+                                        affinity={"predictions": aff})
+        self.assertIn("TYPE: 血統穴馬狙い", prompt)
+        self.assertIn("【2モデルの評価ギャップ】", prompt)
+        self.assertIn("8|馬8|8位", prompt)
+        self.assertIn("なぜこの券種を先頭にしたのか", prompt)
+        self.assertIn("[TYPE: 血統穴馬狙い]", prompt)
 
 
 if __name__ == "__main__":

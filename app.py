@@ -73,8 +73,8 @@ def _load_shutuba_model():
 
 
 @st.cache_resource(show_spinner="相性モデル（血統・戦績・馬体重）を読み込み中...")
-def _load_affinity_model():
-    return affinity_model.load_model()
+def _load_affinity_model(mode=affinity_model.DEFAULT_MODE):
+    return affinity_model.load_model(mode)
 
 
 @st.cache_resource(show_spinner=False)
@@ -483,7 +483,7 @@ def build_full_ai_betting_prompt(race_id, max_budget, plan_blocks=None, use_full
     if shutuba_model_prompt:
         sections.extend(["", shutuba_model_prompt])
 
-    affinity_bundle = _load_affinity_model()
+    affinity_bundle = _load_affinity_model(st.session_state.get("affinity_mode", affinity_model.DEFAULT_MODE))
     affinity_prompt = affinity_model.format_for_prompt(
         st.session_state.get("affinity_prediction"),
         affinity_bundle["metrics"] if affinity_bundle else None,
@@ -531,7 +531,8 @@ def build_full_ai_betting_prompt(race_id, max_budget, plan_blocks=None, use_full
 
 
 def build_gami_betting_prompt(race_id, budget, use_full_budget=False, min_return_ratio=DEFAULT_MIN_RETURN_RATIO):
-    """Step1〜3の評価と現在オッズから、的中率を優先した買い方を組ませるプロンプト。AI予測がなければNone。"""
+    """Step1〜3の評価・相性モデルの評価と現在オッズから、レース状況に合った買い方を組ませるプロンプト。
+    AI予測(出馬表モデル)がなければNone。相性モデルの予測はなくても組める。"""
     prediction = st.session_state.get("ml_prediction")
     if prediction is None:
         return None
@@ -540,6 +541,7 @@ def build_gami_betting_prompt(race_id, budget, use_full_budget=False, min_return
     return build_gami_free_prompt(
         race_id, st.session_state.race_info, prediction, st.session_state.race_volatility,
         odds_table, budget, use_full_budget, min_return_ratio=min_return_ratio,
+        affinity=st.session_state.get("affinity_prediction"),
     )
 
 
@@ -1653,14 +1655,20 @@ shutuba_model_prediction = st.session_state.get("shutuba_model_prediction")
 
 # --- 相性モデル（血統・戦績・馬体重から勝率を算出。オッズ・人気は使わない） ---
 # 馬体重が出馬表に出ていれば馬体重ありのモデル、未発表なら馬体重なしで学習したモデルを使う。
-affinity_bundle = _load_affinity_model()
+# 予想モード（回収率重視 / 標準 / 確実性重視）は血統の使い方だけが違う3つのモデル。
+affinity_mode = sidebar_settings.segmented_control(
+    "相性モデル: 予想モード", list(affinity_model.MODES), default=affinity_model.DEFAULT_MODE, key="affinity_mode",
+    help="  \n".join(f"・{name}: {spec['説明']}" for name, spec in affinity_model.MODES.items()),
+) or affinity_model.DEFAULT_MODE
+affinity_bundle = _load_affinity_model(affinity_mode)
 affinity_key = (current_race_id, str(prediction_date), id(st.session_state.all_horse_data),
-                _shutuba_has_body_weight(shutuba_df_view), affinity_bundle is not None)
+                _shutuba_has_body_weight(shutuba_df_view), affinity_bundle is not None, affinity_mode)
 if st.session_state.get("affinity_key") != affinity_key:
     st.session_state.affinity_prediction = None
     st.session_state.affinity_error = None
     if affinity_bundle is None:
-        st.session_state.affinity_error = "相性モデルが未学習です（python -m model.affinity_model で学習してください）。"
+        st.session_state.affinity_error = (f"相性モデル（{affinity_mode}）が未学習です"
+                                           "（python -m model.affinity_model で学習してください）。")
     else:
         try:
             with st.spinner("相性モデルで勝率を計算中..."):
@@ -1859,9 +1867,8 @@ with tab_ai, st.container(key="panel_ai"):
             value=DEFAULT_MIN_RETURN_RATIO,
             format_func=lambda ratio: f"{ratio:.0%}",
             key="full_ai_min_return_ratio",
-            help="どの買い目が的中しても、払戻が購入合計のこの割合を下回らないようにします。"
-                 "100%はガミを許しません。下げると低オッズの買い目を残しやすくなりますが、"
-                 "的中しても損をする場合が増えます。",
+            help="ガミチェックで、払戻が購入合計のこの割合を下回る買い目をガミと判定します。"
+                 "AIへの候補プランはこの設定によらず、常に100%（的中すれば損をしない）で組みます。",
         )
 
         # 提案では、買い方プランの見積合計を予算として使う（券種・点数はAIが決める）

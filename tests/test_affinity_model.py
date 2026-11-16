@@ -46,6 +46,75 @@ class PriorSumsTest(unittest.TestCase):
         self.assertAlmostEqual(weight.loc[2, "体重変化率"], -10 / 500)
 
 
+class PedigreeAptitudeTest(unittest.TestCase):
+    def _sire_runs(self, current_horse_rows):
+        # 父S1: 芝(0)は 10戦0好走、ダート(1)は 10戦10好走 → 全体50%、ダート適性はプラス・芝適性はマイナス
+        rows = []
+        for i in range(10):
+            rows.append([f"t{i}", "2024-01-01", 9, 10, 1600, 0, 5, 0, 2.0, 480, 0, "S1", "B1"])
+            rows.append([f"d{i}", "2024-01-01", 1, 10, 1600, 1, 5, 0, 0.0, 480, 0, "S1", "B1"])
+        return _runs(rows + current_horse_rows)
+
+    def test_aptitude_is_relative_to_sires_own_level(self):
+        runs = self._sire_runs([
+            ["X", "2024-02-01", np.nan, 10, 1600, 1, 5, 0, np.nan, 480, 0, "S1", "B1"],  # ダート
+            ["Y", "2024-02-01", np.nan, 10, 1600, 0, 5, 0, np.nan, 480, 0, "S1", "B1"],  # 芝
+        ])
+        ped = am.pedigree_features(runs)
+        dirt, turf = ped.iloc[-2], ped.iloc[-1]
+        self.assertGreater(dirt["血統_父_芝ダ_適性"], 0)
+        self.assertLess(turf["血統_父_芝ダ_適性"], 0)
+        # 実力(全体成績)は条件によらず同じ
+        self.assertAlmostEqual(dirt["血統_父_全体_3着内率"], turf["血統_父_全体_3着内率"])
+
+    def _experienced_horse(self, current_row):
+        # 馬X: ダート1600m・東京(5)・良を3走したあと、current_row を走る
+        past = [["X", f"2024-01-{d}", 5, 10, 1600, 1, 5, 0, 1.0, 480, 0, "S1", "B1"] for d in (10, 20, 30)]
+        return am.pedigree_features(self._sire_runs(past + [current_row])).iloc[-1]
+
+    def test_experienced_horse_in_same_conditions_uses_no_pedigree(self):
+        cur = self._experienced_horse(["X", "2024-02-10", np.nan, 10, 1600, 1, 5, 0, np.nan, 480, 0, "S1", "B1"])
+        self.assertTrue(cur.isna().all(), cur[cur.notna()].to_dict())
+
+    def test_experienced_horse_uses_only_untried_aptitudes(self):
+        # 初めての距離帯(2400m)・初めての競馬場(阪神=9)。芝ダ・馬場状態は経験済み
+        cur = self._experienced_horse(["X", "2024-02-10", np.nan, 10, 2400, 1, 9, 0, np.nan, 480, 0, "S1", "B1"])
+        self.assertTrue(np.isnan(cur["血統_父_全体_3着内率"]))  # 実力はキャリアの浅い馬だけ
+        self.assertTrue(np.isnan(cur["血統_父_芝ダ_適性"]))
+        self.assertTrue(np.isnan(cur["血統_父_馬場状態_適性"]))
+        self.assertFalse(np.isnan(cur["血統_父_距離帯_適性"]))
+        self.assertFalse(np.isnan(cur["血統_父_競馬場_適性"]))
+
+    def test_weighted_style_uses_pedigree_for_everyone_with_decaying_weight(self):
+        past = [["X", f"2024-01-{d}", 5, 10, 1600, 1, 5, 0, 1.0, 480, 0, "S1", "B1"] for d in (10, 20, 30)]
+        runs = self._sire_runs(past + [["X", "2024-02-10", np.nan, 10, 1600, 1, 5, 0, np.nan, 480, 0, "S1", "B1"]])
+        cur = am.pedigree_features(runs, style="weighted").iloc[-1]
+        self.assertEqual(set(cur.index), set(am.PEDIGREE_FEATURES_BY_STYLE["weighted"]) - {"血統_父_距離帯_適性_対平均"})
+        self.assertFalse(np.isnan(cur["血統_父_全体_3着内率"]))  # 経験十分でも使う
+        # ダートを3回走っている → 効きは 3/(3+3) = 0.5
+        self.assertAlmostEqual(cur["血統_父_芝ダ_適性_未経験"], cur["血統_父_芝ダ_適性"] * 0.5)
+
+    def test_none_style_has_no_pedigree_columns(self):
+        runs = self._sire_runs([["X", "2024-02-01", np.nan, 10, 1600, 1, 5, 0, np.nan, 480, 0, "S1", "B1"]])
+        self.assertEqual(am.pedigree_features(runs, style="none").shape[1], 0)
+        self.assertFalse(set(am.feature_columns("none")) & set(am.PEDIGREE_FEATURES))
+        self.assertEqual(set(am.feature_columns("gated")) & set(am.PEDIGREE_FEATURES),
+                         set(am.PEDIGREE_FEATURES_BY_STYLE["gated"]))
+
+    def test_experience_segment(self):
+        runs = _runs([
+            ["A", "2024-01-01", 1, 10, 1600, 0, 5, 0, 0, 480, 0, None, None],
+            ["A", "2024-02-01", 1, 10, 1600, 0, 5, 0, 0, 480, 0, None, None],
+            ["A", "2024-03-01", 1, 10, 1600, 0, 5, 0, 0, 480, 0, None, None],
+            ["A", "2024-04-01", np.nan, 10, 1600, 1, 5, 0, np.nan, 480, 0, None, None],  # 初ダート
+            ["A", "2024-04-01", np.nan, 10, 1600, 0, 5, 0, np.nan, 480, 0, None, None],  # 同条件4戦目
+        ])
+        seg = am.experience_segment(runs)
+        self.assertEqual(seg.iloc[0], am.SEGMENTS[0])
+        self.assertEqual(seg.iloc[3], am.SEGMENTS[1])
+        self.assertEqual(seg.iloc[4], am.SEGMENTS[2])
+
+
 class RaceSoftmaxTest(unittest.TestCase):
     def test_sums_to_one_per_race(self):
         q = am.race_softmax([0.1, 0.3, 0.05, 0.5, 0.2], pd.Series(["r1", "r1", "r1", "r2", "r2"]), 0.9)

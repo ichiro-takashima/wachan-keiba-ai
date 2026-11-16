@@ -157,6 +157,8 @@ def _weight_effect_text(value):
 def render_affinity_cards(result, top_n=5):
     """相性モデルの上位馬をカードで表示する。"""
     pred = result["predictions"]
+    if result.get("mode"):
+        st.caption(f":material/tune: 予想モード: {result['mode']}")
     if result.get("weight_missing"):
         st.caption(":material/info: 馬体重が未発表のため、馬体重なしで学習したモデルで計算しています。")
     if result.get("pedigree_missing"):
@@ -179,6 +181,8 @@ def render_affinity_cards(result, top_n=5):
             st.caption(f"馬体重 {row['馬体重']}（影響 {_weight_effect_text(row['馬体重影響'])}）")
             if row["根拠"]:
                 st.caption("・".join(row["根拠"]))
+            for note in row.get("血統の得意・苦手") or []:
+                st.caption(f":{'green' if '得意' in note else 'red'}[{note}]")
             if row.get("過去走数", 1) == 0:
                 st.caption(":material/warning: 中央での過去走なし（血統中心の評価）")
 
@@ -190,6 +194,8 @@ def render_affinity_table(result, height="auto"):
     display["期待値"] = display["期待値"].round(2)
     display["馬体重影響"] = display["馬体重影響"].map(_weight_effect_text)
     display["根拠"] = display["根拠"].map(lambda r: "・".join(r))
+    if "血統の得意・苦手" in display.columns:
+        display["血統の得意・苦手"] = display["血統の得意・苦手"].map(lambda r: "・".join(r or []))
     win_max = max(float(display["推定勝率"].max()), 1.0)
     st.dataframe(
         display, width="stretch", height=height, hide_index=True,
@@ -208,6 +214,8 @@ def render_affinity_model_info(metrics):
         return
     pick, pop = metrics.get("勝率1位馬", {}), metrics.get("1番人気(参考)", {})
     scores = metrics.get("テスト成績", {})
+    if metrics.get("予想モード"):
+        st.markdown(f"**予想モード: {metrics['予想モード']}**　{metrics.get('モードの説明', '')}")
     st.caption(
         f"学習 {metrics.get('学習レース数', '?')}レース（{' 〜 '.join(metrics.get('学習期間', []))}）、"
         f"別期間 {metrics.get('テストレース数', '?')}レース（{' 〜 '.join(metrics.get('テスト期間', []))}）で検証。"
